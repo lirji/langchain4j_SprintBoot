@@ -1,0 +1,206 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: langchain4j-demo
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: PT2S
+      lettuce:
+        shutdown-timeout: PT0S
+
+# 不要在 langchain4j.* 下加任何 chat-model / streaming-chat-model / embedding-model 配置块，
+# 否则 LangChain4j starter 会和 LlmConfig 各创建一份 Bean → 启动冲突。
+# 全部 LLM/Embedding 配置都走 app.llm.* 由 LlmConfig 统一装配。
+
+app:
+  llm:
+    # ollama | openai | anthropic | gemini | deepseek
+    # 切 provider 只影响 chat/streaming-chat 模型；embedding（向量库维度相关）始终用 Ollama。
+    provider: ollama
+    ollama:
+      base-url: http://localhost:11434
+      model-name: llama3.1
+      # RAG 用 embedding；切换 chat provider 不影响这里
+      embedding-model-name: nomic-embed-text
+      temperature: 0.7
+      timeout: PT60S
+      log-requests: true
+      log-responses: true
+    openai:
+      # 默认走 OpenAI 官方端点，留空即可；如果走代理/兼容端点，填 base-url
+      base-url:
+      api-key: ${OPENAI_API_KEY:}
+      model-name: gpt-4o-mini
+      temperature: 0.7
+      timeout: PT60S
+      log-requests: false
+      log-responses: false
+    anthropic:
+      api-key: ${ANTHROPIC_API_KEY:}
+      # 常见可选：claude-haiku-4-5 / claude-sonnet-4-6 / claude-opus-4-7
+      model-name: claude-haiku-4-5
+      temperature: 0.7
+      timeout: PT60S
+      log-requests: false
+      log-responses: false
+    gemini:
+      api-key: ${GOOGLE_AI_GEMINI_API_KEY:}
+      # 常见可选：gemini-2.0-flash / gemini-1.5-flash / gemini-1.5-pro
+      model-name: gemini-2.0-flash
+      temperature: 0.7
+      timeout: PT60S
+      log-requests: false
+      log-responses: false
+    deepseek:
+      # DeepSeek 走 OpenAI-compatible 协议
+      base-url: https://api.deepseek.com/v1
+      api-key: ${DEEPSEEK_API_KEY:sk-8add789dcbc04bfa99d9ba54b57c8ebe}
+      # deepseek-chat（V3）/ deepseek-reasoner（R1）
+      model-name: deepseek-chat
+      temperature: 0.7
+      timeout: PT60S
+      log-requests: false
+      log-responses: false
+
+  assistant:
+    # 主 Assistant 的 system prompt 可调参数；模板在 ai/Assistant.java 的 @SystemMessage 里。
+    # 改这里不用动 Java，重启即生效。改完用 /eval/run 看 passRate 漂移。
+    language: "中文"
+    tone: "简洁，1–2 句话答完，必要时再展开"
+    # 互斥的 3 种情况；之前一份"没检索到就说『资料里没有提到』"无差别套用，
+    # 被 eval 钉出来回归（即便用户直接给信息也被加这种免责前言），所以严格分 case。
+    citation-policy: |-
+      引用与来源处理（按以下情况分别处理，互斥）：
+        1) 如果系统检索到了文档片段并用于回答，必须用 [doc=文件名#片段号] 形式标注来源。
+        2) 如果用户的问题明确指向文档/知识库（含『文档』『手册』『文献』『资料里』『根据上述材料』等线索），
+           但没有检索到相关内容，回复『未在文档中找到相关内容』。
+        3) 其他情况（用户在本轮提供了信息、闲聊、工具调用、定义性问题等），
+           直接根据用户问题与已有上下文作答 —— 不要加『资料里没有提到 X』之类的免责前言，也不要声明检索状态。
+    # 灰度/临时指令位。默认空字符串。例如做 A/B 时填 "本轮请用 markdown 列表组织答案"
+    extra: ""
+
+  memory:
+    # in-memory | redis
+    store: in-memory
+    # messages | tokens | summary
+    # - messages: 按消息数滑窗
+    # - tokens: 按 token 数滑窗（OpenAi tokenizer 近似计数）
+    # - summary: 超过 max-messages 时把旧消息 LLM 摘要成单条 SystemMessage
+    window-mode: messages
+    max-messages: 20
+    max-tokens: 2000
+    tokenizer-model: gpt-4o-mini
+    summary:
+      # summary 模式下保留多少条最近消息不被压缩
+      keep-recent: 6
+    redis:
+      key-prefix: "chat:mem:"
+      ttl: PT24H
+  reflexion:
+    # 加权聚合分 < threshold 触发改进；最多 max-attempts 次额外改进（首次生成不计）
+    threshold: 0.75
+    max-attempts: 2
+    # Critic 3 维加权权重。不需要归一化，会用总和当分母。
+    # 默认偏重 correctness + completeness（不出错+答全），clarity 次之。
+    weights:
+      correctness: 0.4
+      completeness: 0.4
+      clarity: 0.2
+  mcp:
+    enabled: false
+    # stdio | http
+    transport: stdio
+    stdio:
+      # 例如：npx -y @modelcontextprotocol/server-filesystem /path/to/dir
+      command:
+        - npx
+        - "-y"
+        - "@modelcontextprotocol/server-everything"
+    http:
+      url: http://localhost:3001/mcp
+    log-events: true
+  rag:
+    documents-dir: ./documents
+    # 召回截断（rerank 关闭时直接作为返回数；rerank 开启时由 reranker 作为最终 top-k）
+    top-k: 5
+    rerank:
+      # 关闭则普通向量检索；开启则在 EmbeddingStore 召回 candidate-size 条后再排
+      enabled: false
+      candidate-size: 20
+      # llm（本地 Ollama 当 reranker，慢但零依赖）| jina（云 API，快+多语言，需 api-key）
+      type: llm
+      jina:
+        api-key: ${JINA_API_KEY:}
+        model-name: jina-reranker-v2-base-multilingual
+    hybrid:
+      # 开启后 vector + 关键词 token-overlap 两路并联检索，DefaultContentAggregator RRF 融合
+      enabled: false
+      # simple（按字 + 标点切，零依赖）| hanlp（自带词典，中文召回明显更好）
+      tokenizer: simple
+    # in-memory | pgvector | milvus | chroma | qdrant | doris
+    store: in-memory
+    pgvector:
+      host: localhost
+      port: 5432
+      database: postgres
+      user: postgres
+      password: postgres
+      table: document_embeddings
+      create-table: true
+      use-index: true
+      index-list-size: 100
+      # VECTOR (默认) | HYBRID — HYBRID 走 PGVector 原生向量+全文 RRF 融合
+      search-mode: VECTOR
+      text-search-config: simple
+      rrf-k: 60
+    milvus:
+      host: localhost
+      port: 19530
+      collection: document_embeddings
+      # FLAT | IVF_FLAT | HNSW | ...
+      index-type: FLAT
+      # COSINE | L2 | IP
+      metric-type: COSINE
+      username:
+      password:
+    chroma:
+      base-url: http://localhost:8000
+      collection: document_embeddings
+      # 留空则用 chroma v1 API；v2 (chroma >= 0.7) 需要填 tenant / database
+      tenant:
+      database:
+    qdrant:
+      host: localhost
+      port: 6334
+      collection: document_embeddings
+      api-key:
+      use-tls: false
+    doris:
+      jdbc-url: jdbc:mysql://localhost:9030/demo
+      user: root
+      password:
+      table: document_embeddings
+      # cosine | l2
+      metric: cosine
+      create-table: true
+      buckets: 4
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+
+logging:
+  level:
+    dev.langchain4j: INFO
+    com.lrj: DEBUG
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [%thread] [%X{traceId:-}] %-5level %logger{36} - %msg%n"
