@@ -56,7 +56,9 @@ app:
     deepseek:
       # DeepSeek 走 OpenAI-compatible 协议
       base-url: https://api.deepseek.com/v1
-      api-key: ${DEEPSEEK_API_KEY:sk-8add789dcbc04bfa99d9ba54b57c8ebe}
+      # 安全提醒：之前这里有过 hardcode 的 key（sk-8add...），已轮换 + 改为空 fallback
+      # 部署时务必走环境变量 / K8s Secret / Vault，绝不要把真 key 写回 yml
+      api-key: ${DEEPSEEK_API_KEY:}
       # deepseek-chat（V3）/ deepseek-reasoner（R1）
       model-name: deepseek-chat
       temperature: 0.7
@@ -111,6 +113,21 @@ app:
            直接根据用户问题与已有上下文作答 —— 不要加『资料里没有提到 X』之类的免责前言，也不要声明检索状态。
     # 灰度/临时指令位。默认空字符串。例如做 A/B 时填 "本轮请用 markdown 列表组织答案"
     extra: ""
+    # 按 provider 部分覆盖。key 是 app.llm.provider 的值；任何字段为 null/缺失就 fallback 到上面的默认。
+    # 启动时根据 app.llm.provider 解析成 ResolvedAssistantStyle Bean，运行时不变。
+    # 例（全部注释起来，默认所有 provider 共享上面的默认值；按需打开）：
+    overrides: {}
+    #   anthropic:
+    #     tone: "简洁，1–2 句；分组事实时用 <fact>...</fact> XML 标签，Claude 对结构化标签更敏感"
+    #   gemini:
+    #     # Gemini 触发工具不积极，专门给一句诱导
+    #     extra: "如果有可用工具能直接给答案，立刻调用；不要先猜再决定"
+    #   ollama:
+    #     # Ollama 小模型，要求更明确的指令
+    #     tone: "简洁，每句独立成段，避免长复合句；最多 3 句"
+    #   deepseek:
+    #     # DeepSeek 中文强，可以让风格更口语
+    #     tone: "口语化，像跟同事讲技术，必要时用类比；2–3 句话"
 
   memory:
     # in-memory | redis
@@ -129,6 +146,17 @@ app:
     redis:
       key-prefix: "chat:mem:"
       ttl: PT24H
+  eval:
+    # /eval/run 第一次被调时是否自动跑一次 /rag/ingest（之后不再重复）。
+    # 默认关 —— 不想被 eval 误改向量库。开了能避免「RAG case 召回空 → 假 fail」浪费排查。
+    auto-ingest: false
+
+  query-router:
+    # 开了之后 /chat/auto 走 classify → 分流到 Assistant(走RAG) 或 BareAssistant(跳过RAG)。
+    # 默认关 —— classifier 多 1 次 LLM call，要明确权衡 token 成本才开。
+    # 适合：embedding 走云 API（按 token 计费）+ 主对话用大模型 + 大量非 RAG 流量 的生产场景。
+    enabled: false
+
   reflexion:
     # 加权聚合分 < threshold 触发改进；最多 max-attempts 次额外改进（首次生成不计）
     threshold: 0.75

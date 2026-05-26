@@ -7,7 +7,8 @@ import com.lrj.langchain4j.ai.extract.Ticket;
 import com.lrj.langchain4j.ai.mcp.McpAssistant;
 import com.lrj.langchain4j.ai.multiagent.MultiAgentService;
 import com.lrj.langchain4j.ai.reflexion.ReflexiveService;
-import com.lrj.langchain4j.config.AssistantProperties;
+import com.lrj.langchain4j.ai.routing.QueryRouterService;
+import com.lrj.langchain4j.config.ResolvedAssistantStyle;
 import com.lrj.langchain4j.rag.RagIngestionService;
 import org.springframework.beans.factory.ObjectProvider;
 import dev.langchain4j.service.TokenStream;
@@ -30,22 +31,24 @@ public class ChatController {
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
     private final Assistant assistant;
-    private final AssistantProperties assistantProps;
+    private final ResolvedAssistantStyle assistantProps;
     private final RagIngestionService ragIngestionService;
     private final CategoryChatService categoryChatService;
     private final Extractor extractor;
     private final ReflexiveService reflexiveService;
     private final MultiAgentService multiAgentService;
     private final ObjectProvider<McpAssistant> mcpAssistantProvider;
+    private final ObjectProvider<QueryRouterService> queryRouterProvider;
 
     public ChatController(Assistant assistant,
-                          AssistantProperties assistantProps,
+                          ResolvedAssistantStyle assistantProps,
                           RagIngestionService ragIngestionService,
                           CategoryChatService categoryChatService,
                           Extractor extractor,
                           ReflexiveService reflexiveService,
                           MultiAgentService multiAgentService,
-                          ObjectProvider<McpAssistant> mcpAssistantProvider) {
+                          ObjectProvider<McpAssistant> mcpAssistantProvider,
+                          ObjectProvider<QueryRouterService> queryRouterProvider) {
         this.assistant = assistant;
         this.assistantProps = assistantProps;
         this.ragIngestionService = ragIngestionService;
@@ -54,6 +57,7 @@ public class ChatController {
         this.reflexiveService = reflexiveService;
         this.multiAgentService = multiAgentService;
         this.mcpAssistantProvider = mcpAssistantProvider;
+        this.queryRouterProvider = queryRouterProvider;
     }
 
     @PostMapping("/chat")
@@ -140,6 +144,20 @@ public class ChatController {
             return Map.of("error", "MCP not enabled. Set app.mcp.enabled=true and configure the transport.");
         }
         return Map.of("reply", assistant.chat(body.getOrDefault("message", "")));
+    }
+
+    /**
+     * Query routing：classifier 把 query 分到 RAG / TOOL / CHAT，分别走 Assistant 或 BareAssistant。
+     * 需要 {@code app.query-router.enabled=true} 才装配，否则返回 503。
+     */
+    @PostMapping("/chat/auto")
+    public Object chatAuto(@RequestParam(defaultValue = "default") String chatId,
+                           @RequestBody Map<String, String> body) {
+        QueryRouterService router = queryRouterProvider.getIfAvailable();
+        if (router == null) {
+            return Map.of("error", "Query router not enabled. Set app.query-router.enabled=true.");
+        }
+        return router.route(chatId, body.getOrDefault("message", ""));
     }
 
     @GetMapping("/health")

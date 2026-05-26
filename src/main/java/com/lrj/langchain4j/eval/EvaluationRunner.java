@@ -8,10 +8,12 @@ import com.lrj.langchain4j.ai.extract.Extractor;
 import com.lrj.langchain4j.ai.extract.Ticket;
 import com.lrj.langchain4j.ai.multiagent.MultiAgentService;
 import com.lrj.langchain4j.ai.reflexion.ReflexiveService;
-import com.lrj.langchain4j.config.AssistantProperties;
+import com.lrj.langchain4j.config.ResolvedAssistantStyle;
+import com.lrj.langchain4j.rag.RagIngestionService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
@@ -22,6 +24,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 @Service
@@ -31,20 +34,26 @@ public class EvaluationRunner {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final Assistant assistant;
-    private final AssistantProperties assistantProps;
+    private final ResolvedAssistantStyle assistantProps;
     private final Judge judge;
     private final Extractor extractor;
     private final MultiAgentService multiAgentService;
     private final ReflexiveService reflexiveService;
     private final Executor evalExecutor;
+    private final RagIngestionService ragIngestionService;
+    private final boolean autoIngest;
+    /** Lazy 一次性 ingest 标记 —— 第一次 run 时触发，之后不重复。 */
+    private final AtomicBoolean ingested = new AtomicBoolean(false);
 
     public EvaluationRunner(Assistant assistant,
-                            AssistantProperties assistantProps,
+                            ResolvedAssistantStyle assistantProps,
                             Judge judge,
                             Extractor extractor,
                             MultiAgentService multiAgentService,
                             ReflexiveService reflexiveService,
-                            @Qualifier("evalExecutor") Executor evalExecutor) {
+                            @Qualifier("evalExecutor") Executor evalExecutor,
+                            RagIngestionService ragIngestionService,
+                            @Value("${app.eval.auto-ingest:false}") boolean autoIngest) {
         this.assistant = assistant;
         this.assistantProps = assistantProps;
         this.judge = judge;
@@ -52,6 +61,8 @@ public class EvaluationRunner {
         this.multiAgentService = multiAgentService;
         this.reflexiveService = reflexiveService;
         this.evalExecutor = evalExecutor;
+        this.ragIngestionService = ragIngestionService;
+        this.autoIngest = autoIngest;
     }
 
     public EvalResult.Summary runDefault() throws IOException {
@@ -68,6 +79,17 @@ public class EvaluationRunner {
 
     public EvalResult.Summary run(List<EvalCase> cases, int runs) {
         if (runs < 1) throw new IllegalArgumentException("runs must be >= 1, got " + runs);
+
+        // Lazy 一次性 ingest —— 第一次 run 时触发，避免 RAG case 召回空导致假 fail。
+        // 用 compareAndSet 保证并发触发也只跑一次；ingest 失败也记下，不再重试（不阻塞主流程）。
+        if (autoIngest && ingested.compareAndSet(false, true)) {
+            try {
+                int n = ragIngestionService.ingestFromConfiguredDir();
+                log.info("auto-ingested {} documents before first eval run", n);
+            } catch (Exception e) {
+                log.warn("auto-ingest failed; RAG cases may return empty results", e);
+            }
+        }
 
         long totalStart = System.currentTimeMillis();
         String today = LocalDate.now().toString();
@@ -173,13 +195,18 @@ public class EvaluationRunner {
     }
 
     /**
-     * Multi-agent 输出三段：plan 任务数 + 子任务列表 + finalAnswer。
-     * 这样 mustInclude 既能查"tasks: 3"（验证拆分粒度），也能查 finalAnswer 内容。
+     * Multi-agent 输出三段：plan 任务数 + 子任务列表（含 deps 标注） + finalAnswer。
+     * mustInclude 可以查 "tasks: 3"（拆分粒度）、"[deps: t1]"（验证 DAG 用对）、finalAnswer 内容。
      */
     private String invokeMultiAgent(EvalCase c) {
         MultiAgentService.Run run = multiAgentService.run(c.question());
         String taskList = run.plan().tasks().stream()
-                .map(t -> "  - " + t.id() + ": " + t.description())
+                .map(t -> {
+                    String depsTag = t.effectiveDependsOn().isEmpty()
+                            ? ""
+                            : " [deps: " + String.join(",", t.effectiveDependsOn()) + "]";
+                    return "  - " + t.id() + depsTag + ": " + t.description();
+                })
                 .collect(Collectors.joining("\n"));
         return "tasks: " + run.plan().tasks().size() + "\n"
                 + taskList + "\n"
