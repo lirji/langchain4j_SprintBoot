@@ -20,6 +20,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.time.Duration;
 
+/**
+ * 问答记忆系统配置
+ */
 @Configuration
 public class ChatMemoryConfig {
 
@@ -29,6 +32,7 @@ public class ChatMemoryConfig {
     @ConditionalOnProperty(name = "app.memory.store", havingValue = "in-memory", matchIfMissing = true)
     public ChatMemoryStore inMemoryChatMemoryStore() {
         log.info("ChatMemoryStore: in-memory (volatile)");
+        // langchain4j 提供的会话记忆存储
         return new InMemoryChatMemoryStore();
     }
 

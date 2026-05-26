@@ -1,0 +1,15 @@
+// markdownlint 配置：放过对中文项目过严的规则，保留真正的语法/结构检查
+{
+  "config": {
+    // MD013 行长：中文宽字符 + 表格让 80 char 限制不现实
+    "line-length": false,
+    // MD024 重复标题：本项目多个章节都有 `### 教训`/`### 改动文件` 等同名 sibling
+    //                 sub-section（章节独立），是有意的导航结构
+    "no-duplicate-heading": false,
+    // MD060 表格列对齐风格：cosmetic，不影响渲染
+    "table-column-style": false,
+    // MD029 ordered list 编号：允许 "9. 10. 11." 这种延续上一段编号的写法
+    //                           （比如总结里 prompt + 生产 takeaway 续写）
+    "ol-prefix": false
+  }
+}

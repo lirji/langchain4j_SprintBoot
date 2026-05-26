@@ -113,7 +113,7 @@ app:
 
 ### 踩的两个隐藏 bug
 
-**Bug 1：HTTP client SPI 冲突**
+#### Bug 1：HTTP client SPI 冲突
 
 第一次启动报：
 
@@ -135,7 +135,7 @@ public static void main(String[] args) {
 }
 ```
 
-**Bug 2：Ollama starter 与 Spring Boot 3.3.5 不兼容**
+#### Bug 2：Ollama starter 与 Spring Boot 3.3.5 不兼容
 
 修了 Bug 1 之后启动又挂：
 
@@ -1193,7 +1193,7 @@ public EmbeddingModel embeddingModel(EmbeddingProperties props) {
 
 **(1) 重试**：所有 chat / embedding builder 加 `.maxRetries(p.getMaxRetries())`，默认 3。覆盖 429 限流 / 5xx / 超时的自动退避。
 
-- 4 个 chat *Props + 2 个 embedding *Props 都加 `maxRetries` 字段
+- 4 个 chat `*Props` + 2 个 embedding `*Props` 都加 `maxRetries` 字段
 - 按 provider 独立配（vLLM 跑稳了可降到 1，云 API 保 3）
 
 **(2) 健康检查**：自定义 Actuator HealthIndicator + K8s 集成。

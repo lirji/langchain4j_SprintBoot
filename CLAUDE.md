@@ -83,12 +83,14 @@ documents/                                 RAG 文档目录（.txt/.md/.pdf 等�
 前置条件：
 
 1. 本机起 Ollama，并拉模型：
+
    ```bash
    ollama pull llama3.1
    ollama pull nomic-embed-text
    ```
 
 2. （如需 PGVector）起一个 pgvector 容器：
+
    ```bash
    docker run -d --name pgvector -p 5432:5432 \
      -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16
@@ -256,6 +258,7 @@ curl -X POST 'localhost:8080/chat/category?chatId=u1&category=manual' \
 主 `Assistant` 的 system prompt 拆成 5 段（# Role / # Language & Style / # Tool Use / # Citation / # Safety）+ 1 段灰度位（# Extra），定义在 `ai/Assistant.java` 的 `SYSTEM_PROMPT` 常量里。其中 4 个段落（语言、语气、引用策略、灰度指令）用 `{{var}}` 占位，由 `AssistantProperties`（`app.assistant.*`）提供默认值，`ChatController` 每次调用时透传 —— **改 prompt 不用动 Java**。
 
 `app.assistant.*` 配置：
+
 | key | 默认 | 作用 |
 | --- | --- | --- |
 | `language` | `中文` | 回答语言 |
@@ -321,6 +324,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - 与 `rerank` 可同时开：fan-out 召回多路 → ReRanker 收口
 - 需要 `DocumentMirror`（内存镜像）保存被切片后的 segments；超大语料请换 Lucene/ES
 - 切换示例：
+
   ```bash
   mvn spring-boot:run -Dspring-boot.run.arguments=\
     "--app.memory.store=redis,--app.rag.rerank.enabled=true,--app.rag.rerank.candidate-size=20"
