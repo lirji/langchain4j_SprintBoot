@@ -22,8 +22,9 @@
 - [11. Multi-run + 跨 endpoint dispatch + 并行加速](#11-multi-run--跨-endpoint-dispatch--并行加速)
 - [12. Round d：RAG 引用格式强化（ContentInjector + 闭环）](#12-round-drag-引用格式强化contentinjector--闭环)
 - [13. Round g：Synthesizer 编织 not 拼接](#13-round-gsynthesizer-编织-not-拼接)
-- [14. 设计原则总览（跨章节的反复模式）](#14-设计原则总览跨章节的反复模式)
-- [15. 未做完的：f 以及为什么暂缓](#15-未做完的f-以及为什么暂缓)
+- [14. Round h：vLLM 接入 + 生产 hardening（含一个 silent bug）](#14-round-hvllm-接入--生产-hardening含一个-silent-bug)
+- [15. 设计原则总览（跨章节的反复模式）](#15-设计原则总览跨章节的反复模式)
+- [16. 未做完的：剩 4 条生产 hardening + f](#16-未做完的剩-4-条生产-hardening--f)
 
 ---
 
@@ -1081,17 +1082,195 @@ tasks: 3
 
 ---
 
-## 14. 设计原则总览（跨章节的反复模式）
+## 14. Round h：vLLM 接入 + 生产 hardening（含一个 silent bug）
+
+### 起因
+用户要把项目从本地 demo 推到生产：Ollama 单进程没 HA、吞吐瓶颈，要换成 vLLM 跑 K8s 集群里。一开始问"能换吗"，确认是生产场景后场景变成**全套生产化**：vLLM chat + bge-m3 embedding + 重试 + 健康检查 + Prometheus/Grafana。
+
+### 关键决策
+
+**vLLM 用 OpenAI-compat 路径，零新依赖**。vLLM 默认就暴露 OpenAI 兼容的 `/v1/chat/completions` 和 `/v1/embeddings`。所以：
+- chat 复用 `OpenAiChatModel.builder()`，跟 DeepSeek 同一条 case（只是 base-url 不同）
+- embedding 复用 `OpenAiEmbeddingModel.builder()`
+- `vllmDefaults()` 跟 `deepseekDefaults()` 一个 pattern，只改 base-url 默认值
+
+更大的洞察：**OpenAI-compatible 已经是 LLM 推理服务的事实标准**。一个 `OpenAiCompatProps` 类 + base-url 切换就能接 OpenAI / DeepSeek / vLLM / SGLang / TGI / LM Studio / Groq / Together / Fireworks 等等。提供商之间换是 yml 改 base-url 的事，不是代码工程。
+
+**Embedding 跟 chat 完全解耦**。原来 embedding 硬编码在 `LlmConfig.embeddingModel()`，跟 Ollama 绑死。抽出独立的 `EmbeddingModelConfig`：
+- `app.embedding.provider` 单一开关（`ollama` / `openai-compat`）
+- 这样可以 chat 走 vLLM-A，embedding 走 vLLM-B（不同 K8s deployment），两边互不影响
+- bge-m3 (1024 维) ≠ nomic-embed-text (768 维)，**切 embedding = 必须重建持久化向量库**，3 处告警（Java doc / yml / CLAUDE.md）
+
+### 改动文件
+- `pom.xml`（已有 `langchain4j-open-ai` 复用，无新依赖）
+- `config/LlmConfig.java` —— 加 `vllm` case + `vllmDefaults()`，移除 `embeddingModel` Bean，移除 `OllamaProps.embeddingModelName`
+- `config/EmbeddingModelConfig.java`（新建）—— 独立 switch + 两种 provider 实现
+- `application.yml` —— 加 `app.llm.vllm.*` + `app.embedding.*` 两个块，删旧 `embedding-model-name`
+- 文档：CLAUDE.md 加 vllm 行 + Embedding switch 节 + K8s 部署示例
+
+### 关键代码
+
+```java
+// LlmConfig.java —— OpenAiCompatProps 工厂模式让 vllm 跟 deepseek 同源
+static OpenAiCompatProps vllmDefaults() {
+    OpenAiCompatProps p = new OpenAiCompatProps();
+    p.baseUrl = "http://vllm-chat.default.svc.cluster.local:8000/v1";  // K8s service DNS
+    p.apiKey = "EMPTY";  // vLLM 默认不校验，给非空占位
+    return p;
+}
+```
+
+```java
+// EmbeddingModelConfig.java —— 跟 chat provider 完全解耦
+@Bean
+public EmbeddingModel embeddingModel(EmbeddingProperties props) {
+    return switch (normalize(props.getProvider())) {
+        case "ollama" -> buildOllama(props.getOllama());
+        case "openai-compat" -> buildOpenAiCompat(props.getOpenaiCompat());
+        default -> throw ...;
+    };
+}
+```
+
+### 生产 hardening：重试 + 健康检查 + Prometheus
+
+按 ROI 选了三件做：
+
+**(1) 重试**：所有 chat / embedding builder 加 `.maxRetries(p.getMaxRetries())`，默认 3。覆盖 429 限流 / 5xx / 超时的自动退避。
+- 4 个 chat *Props + 2 个 embedding *Props 都加 `maxRetries` 字段
+- 按 provider 独立配（vLLM 跑稳了可降到 1，云 API 保 3）
+
+**(2) 健康检查**：自定义 Actuator HealthIndicator + K8s 集成。
+- `LlmHealthIndicator` + `EmbeddingHealthIndicator`：对当前 provider base-url 做 **1s TCP 探测**
+- **不发 LLM 请求** —— 不烧 token，不需要 api-key 有效，1s 内有结果，适合 K8s readinessProbe
+- yml 配 `management.endpoint.health.group.readiness.include=readinessState,llm,embedding`，让 readiness 聚合所有
+- `show-details: always` + `show-components: always` —— 生产 K8s actuator 通常只对内网开放，让 probe 能看到 per-component 详情
+- 需要 `management.health.probes.enabled=true`（K8s 部署模式默认开启，本地启动要显式打开，不然 `readinessState` 找不到）
+
+**(3) Prometheus + Grafana**：scrape 配置 + 7 panel dashboard
+- `MetricsChatModelListener` 已写了 4 个 OTel GenAI 风格指标：`gen_ai.client.requests` / `operation.duration` / `token.usage` / `errors`
+- `docs/grafana-dashboard.json`：req rate / p50p95p99 latency / token spend / error by type / health stat / per-provider bar
+- `docs/observability.md`：scrape 配置 + 部署示例 + K8s probe yml
+
+### 关键代码（health probe）
+
+```java
+// LlmHealthIndicator.java —— TCP 1s 探测，共享给 EmbeddingHealthIndicator
+static Health probeTcp(String url, String... extraDetails) {
+    try {
+        URI uri = new URI(url);
+        String host = uri.getHost();
+        int port = uri.getPort();
+        if (port < 0) port = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+        long start = System.nanoTime();
+        try (Socket s = new Socket()) {
+            s.connect(new InetSocketAddress(host, port), 1000);  // 1s timeout
+        }
+        long ms = (System.nanoTime() - start) / 1_000_000;
+        return Health.up()
+            .withDetail("host", host).withDetail("port", port)
+            .withDetail("tcpConnectMs", ms).build();
+    } catch (Exception e) {
+        return Health.down().withDetail("url", url).withException(e).build();
+    }
+}
+```
+
+### 撞出来的 silent bug
+
+**`MetricsChatModelListener` 之前完全没在记录任何指标**。
+
+回溯：
+- `ObservabilityConfig` 注释写着 "starter scans and wires" —— LangChain4j Spring Boot starter 会扫 `ChatModelListener` Bean 自动灌到 auto-configured `ChatModel`
+- 但 **round-1（接 5 个 provider）把 ChatModel 改成 `LlmConfig` 手动建**，绕过了 starter 的自动装配
+- starter 的 listener 扫描机制不再触发
+- 没人发现因为代码层面没报错，metrics 静默丢失
+- 直到 hardening 时为了挂 Grafana 翻代码才意识到
+
+修法：`LlmConfig` 加构造器注入 `List<ChatModelListener>`，每个 chat builder 手动 `.listeners(listeners)`。
+
+```java
+@Configuration
+public class LlmConfig {
+    private final List<ChatModelListener> listeners;
+
+    public LlmConfig(List<ChatModelListener> listeners) {  // Spring 自动按类型注入整列
+        this.listeners = listeners;
+    }
+
+    private OpenAiChatModel buildOpenAiChat(...) {
+        return OpenAiChatModel.builder()
+            ...
+            .listeners(listeners)  // ← 不显式挂就一直丢
+            ...
+            .build();
+    }
+}
+```
+
+### 量化验证
+
+3 次 chat 调用之后：
+
+```
+gen_ai_client_requests_total{model="deepseek-chat",provider="OPEN_AI"} 3
+gen_ai_client_token_usage_total{type="input"}  3240
+gen_ai_client_token_usage_total{type="output"} 134
+gen_ai_client_operation_duration_seconds_sum  4.13
+gen_ai_client_operation_duration_seconds_max  1.52
+```
+
+`/actuator/health/readiness`：
+
+```json
+{
+  "status": "UP",
+  "components": {
+    "llm":       {"status": "UP", "details": {"host": "api.deepseek.com", "port": 443, "tcpConnectMs": 26}},
+    "embedding": {"status": "UP", "details": {"host": "localhost", "port": 11434, "tcpConnectMs": 0}},
+    "readinessState": {"status": "UP"}
+  }
+}
+```
+
+K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodSeconds=10 → vLLM 后端 30s 不通 pod 就退出 ready 状态。
+
+### 教训
+1. **"OpenAI-compatible 是事实标准"**：vLLM / SGLang / TGI / LM Studio / Groq / Together / Fireworks 全都暴露这个协议。`OpenAiCompatProps` + base-url 切换 = 几乎所有推理后端通吃。提前抽这个抽象是值的
+2. **Embedding 跟 chat 必须独立 switch**：原来硬编码 Ollama 是 demo 思维。生产里这两条链路完全独立 —— chat 慢 vs embedding 慢、可用性、QPS、模型选型都不一样，绑死会拖累其中一个
+3. **维度切换 = 必须重建向量库**：bge-m3(1024) ≠ nomic(768)，PGVector / Milvus 表已建的会拒插。3 处告警（Java doc / yml / CLAUDE.md）确保踩坑前看到
+4. **横切关注（cross-cutting concerns）每次重构都要 grep 验证**：listener 这种"无声 wire"的东西改装配链路时最容易丢。如果不是为了 dashboard 翻代码，这个 bug 能藏到第一次出生产事故才暴露
+5. **Health check 别真发 LLM**：TCP 探测够了 —— 烧 token / 触发限流 / 阻塞 probe 都不可接受。"模型能不能推理" 靠 `gen_ai_client_errors_total` 监控真实流量，不是 health check 的职责
+6. **`show-details: always` 在生产 K8s 是正确选择**：K8s probe 需要 per-component 详情判断哪个挂了；actuator 端口通常只对内网开放，details 不算安全风险
+7. **新加 health group 别忘 `probes.enabled=true`**：本地启动不会自动有 `readinessState`/`livenessState`，要显式开。K8s 部署模式自动开。我踩了一次（include readinessState → 启动失败"contributor does not exist"）
+
+### 改动文件汇总
+
+新建：
+- `config/EmbeddingModelConfig.java`
+- `observability/LlmHealthIndicator.java`
+- `observability/EmbeddingHealthIndicator.java`
+- `docs/grafana-dashboard.json`
+- `docs/observability.md`
+
+修改：
+- `config/LlmConfig.java`（加 vllm + listener 接线 + maxRetries）
+- `application.yml`（vllm + embedding + actuator group/probes）
+- `CLAUDE.md`（provider 表 / embedding switch 节 / observability 节 / health 节 / retry 节）
+
+---
+
+## 15. 设计原则总览（跨章节的反复模式）
 
 把这一路浮出来的几个反复出现的模式抽出来：
 
-### 14.1 Structured Output > 自由文本
+### 15.1 Structured Output > 自由文本
 
 任何时候模型要给 "结构化" 的东西，**用 record + `@Description`，不要 prompt 里写"请用 JSON"**。框架强制 JSON Schema，模型几乎不会跑偏。
 
 适用：Critic 评分、Extractor、Planner Plan、Judge Judgment。
 
-### 14.2 Few-shot 示范判断，不是格式
+### 15.2 Few-shot 示范判断，不是格式
 
 格式被 `@Description` 锁了，例子用来展示**判断**：
 - Extractor 例子展示「什么场景选 CRITICAL 而不是 HIGH」
@@ -1101,7 +1280,7 @@ tasks: 3
 
 **反例（anti-example）杠杆比正例还高**：明确「不要这样」+ 错误示范，模型更受教。Synthesizer 进一步演化出 **good + bad 配对**：bad answer 后面加一句"why it's bad"，把 anti-pattern 跟反例显式绑定。
 
-### 14.3 客观 vs 主观：规则匹配 + LLM 双层分工
+### 15.3 客观 vs 主观：规则匹配 + LLM 双层分工
 
 eval harness 的核心模式：
 - **客观字段**（covers / violates / 字符串包含）→ `String.contains` 规则匹配
@@ -1109,7 +1288,7 @@ eval harness 的核心模式：
 
 不混淆 = 不让 LLM 重复审已经验证过的、稳定的字段。Judge 的 prompt 也明令禁止重复审 MUST_*。
 
-### 14.4 LLM-as-judge 三要素
+### 15.4 LLM-as-judge 三要素
 
 要让 Judge 真正可用做对照实验：
 
@@ -1117,7 +1296,7 @@ eval harness 的核心模式：
 2. **注入 ground truth**：today（系统时钟）/ clock-tool（系统能力）/ judgeHint（领域规则）等 Judge 自己看 (Q, A) 没法知道的信息
 3. **限定 scope**：明令"不要重复判 MUST_*"、"`Default to 1.0` do not be stingy"，避免主观通胀扣分
 
-### 14.5 Bug 是 eval 钉出来的
+### 15.5 Bug 是 eval 钉出来的
 
 整个 session 至少 6 个 bug 是 eval 揭穿的：
 - `daysUntil` 用 `Period.getDays()` 算错（round b 实测发现）
@@ -1129,7 +1308,7 @@ eval harness 的核心模式：
 
 **eval 是 prompt 的回归告警器**。改任何 prompt 都要靠 eval 监控漂移，否则改了反而坏只能靠用户投诉发现。
 
-### 14.6 调一处看变化的工程化
+### 15.6 调一处看变化的工程化
 
 每改一处 prompt 都跑 eval：
 1. 改前 `curl -X POST /eval/run?runs=3` 拿 baseline
@@ -1139,14 +1318,16 @@ eval harness 的核心模式：
 
 **每次只动一个变量**——不然分数变了不知道是谁的功劳。
 
-### 14.7 Spring/LangChain4j 集成的踩坑模式
+### 15.7 Spring/LangChain4j 集成的踩坑模式
 
 - 多个同类型 Bean 共存：LangChain4j `@AiService` 不认 `@Primary`、`autowireCandidate=false`、`EXPLICIT` 模式会副作用关掉自动发现。**最后办法是不把第二个注册成 Bean**，从外部直接构造。
 - HTTP client SPI 冲突：classpath 有两套时 `HttpClientBuilderLoader` 抛 conflict，要 system property 显式锁定。
 - starter 与底层 Spring Boot 版本耦合：`langchain4j-ollama-spring-boot-starter@1.13.1` 需要 Spring Boot 3.4+，3.3.5 下 EmbeddingModel 自动装配挂。**自管比依赖 starter 自动装配可控**。
 - 自定义 `ContentInjector` 1.13 接口签名是 `ChatMessage` 不是 `UserMessage`，要 `instanceof UserMessage` 解包。
+- **Actuator readiness group 引用 `readinessState` 要先 `management.health.probes.enabled=true`**：K8s 部署模式默认开启，本地启动不开就抛 "contributor does not exist"。
+- **starter 接管的横切关注，绕过 starter 后会静默失效**：`MetricsChatModelListener` 之前靠 starter 自动 wire，我们改成手动建 ChatModel 后 listener 没人接管 —— metrics 静默丢了几个月。见 15.12。
 
-### 14.8 渐进式拆分
+### 15.8 渐进式拆分
 
 每个抽象都从「简单粗暴硬编码」起步，发现真的需要可配时再加：
 - AssistantProperties 起步只有 4 个字段（language / tone / citationPolicy / extra）
@@ -1155,7 +1336,7 @@ eval harness 的核心模式：
 
 避免提前抽象。
 
-### 14.9 prompt + backend 注入必须成对（来自 d）
+### 15.9 prompt + backend 注入必须成对（来自 d）
 
 很多 prompt 规则只有在 backend 配合的情况下才可能被模型遵守。典型例子：
 - citationPolicy 要求「按 `[doc=ID]` 引用」→ 必须 `ContentInjector` 把 ID 实际放到 prompt 里
@@ -1164,7 +1345,7 @@ eval harness 的核心模式：
 
 **单边动 prompt 是空许诺**。每条强约束都要问"backend 配套了吗？没配套的话模型怎么知道？"
 
-### 14.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
+### 15.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
 
 合成 / 整合 / 摘要类任务，模型默认会偷懒 → 直接拼接 worker 输出 / 罗列要点 / 用源 ID 当标题。光说"compose a coherent answer"是空话，必须：
 - **显式列出错误模式**（"不要用 Sub-task 1 当标题"、"不要 Based on the synthesis 前言"）
@@ -1173,11 +1354,34 @@ eval harness 的核心模式：
 
 更广义的模式：**模型默认行为是"安全但偷懒"。要它做高质量工作，必须显式禁止偷懒路径**。
 
+### 15.11 OpenAI-compatible 是 LLM 推理服务的事实标准（来自 h）
+
+vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Together / Fireworks / DeepSeek / Moonshot —— 全都暴露 OpenAI 兼容的 `/v1/chat/completions` 和 `/v1/embeddings`。一个 `OpenAiCompatProps` + base-url 切换就能接 N 家。新接一家通常是改一行 yml，不是工程任务。
+
+实现层面：本项目 6 个 chat provider 里有 3 个（openai / deepseek / vllm）都跑同一份 `buildOpenAiChat()` builder + `OpenAiCompatProps`，只是 `*Defaults()` 工厂的 base-url 不同。**早期就抽这个抽象**比每接一家写一套 Props/Builder 省 60% 代码。
+
+唯一例外：Anthropic（自己协议 `messages.create`）和 Google Gemini（自己 SDK 协议），这两家因为生态优势没投靠 OpenAI 协议，要独立 builder。
+
+### 15.12 横切关注每次重构都要 grep 验证（来自 h 的 silent bug）
+
+`MetricsChatModelListener` 在 round-1 后**默默失效了几个月**：
+- 它原本靠 LangChain4j Spring Boot starter 的扫描机制自动 wire 到 auto-configured `ChatModel`
+- round-1 把 ChatModel 改成 `LlmConfig` 手动建（为了多 provider 切换），绕过了 starter 的 wire
+- listener 没人接管 → metrics 静默不记录
+- 代码层面零报错，业务功能正常，没人察觉
+
+**横切关注（cross-cutting concerns）的本质特征**：失败时无声。包括：
+- listener / interceptor / aspect / filter
+- guardrail / output validator
+- 自动 wire 的可观测性组件
+
+**反制**：每次改装配链路（特别是绕过框架自动装配的时候），grep 一遍这些组件的注入点确认还在生效。或者写 integration test 验证 listener 触发计数。这次是为了挂 Grafana 翻代码才发现 —— 没有这个外部需求，bug 能藏到第一次生产事故。
+
 ---
 
-## 15. 未做完的：f 以及为什么暂缓
+## 16. 未做完的：剩 4 条生产 hardening + f
 
-主线 6 条（a/b/c/d/e/g）都做完了。剩 f 一个，外加一些 eval 工具链的运营级改进。
+主线 prompt 工程（a/b/c/d/e/g）都做完了。round h 把生产 hardening 的前 3 条（重试 / 健康检查 / Prometheus+Grafana）也做了。剩下：
 
 ### f. 跨 provider 不同默认 prompt
 
@@ -1190,6 +1394,18 @@ eval harness 的核心模式：
 **为什么暂缓**：目前生产只跑 DeepSeek，没有多 provider 路由需求。提前做就是 YAGNI。
 
 **触发条件**：真要在生产分 provider 路由时（或要做 provider 对比评测）再做。
+
+### 剩下 4 条生产 hardening
+
+| 项 | 状态 | 备注 |
+| --- | --- | --- |
+| 重试 | ✅ round h | 各 builder `.maxRetries(3)` |
+| 健康检查 | ✅ round h | TCP 探测 + K8s readiness group |
+| Prometheus + Grafana | ✅ round h | 4 指标 + 7 panel dashboard |
+| 熔断（Resilience4j） | ⏸ | 重试 + 健康检查已覆盖大部分场景，进阶才需要 |
+| API key → Vault / K8s Secret | ⏸ | yml 已用 `${ENV:default}` 占位，挂 K8s Secret 是部署侧的事，代码不动 |
+| 请求并发限流 | ⏸ | 看真实流量，目前没瓶颈 |
+| Provider fallback（主挂切备） | ⏸ | 需要路由层重构，复杂度高，等 SLA 要求 |
 
 ### 顺手没做的 eval 运营级改进
 
@@ -1219,9 +1435,11 @@ eval harness 的核心模式：
 
 | 维度 | 状态 |
 | --- | --- |
-| 支持 provider | ollama / openai / anthropic / gemini / deepseek |
+| 支持 chat provider | ollama / openai / anthropic / gemini / deepseek / **vllm**（生产推荐） |
 | 切换方式 | `app.llm.provider` 单一开关 |
-| API key | 环境变量 |
+| API key | 环境变量；vLLM 默认无校验给 `EMPTY` 占位 |
+| Embedding provider（独立） | `ollama`（默认本地）/ `openai-compat`（生产推荐，可走 vLLM/TEI/云 OpenAI） |
+| Embedding 维度切换 | 必须 drop 重建持久化向量库（InMemory 无所谓） |
 | 跨 provider prompt 适配 | 未做（共用同一份默认值） |
 
 ### Eval Harness 层
@@ -1237,11 +1455,24 @@ eval harness 的核心模式：
 | 最近实测（30 cases × 2 runs） | 59/60 (98.3%)，唯一 fail 是 `format-table` 测试设计 bug |
 | auto-ingest / CI 集成 | 未做 |
 
+### 生产 Hardening 层（round h）
+
+| 维度 | 状态 |
+| --- | --- |
+| 重试 | ✅ chat / embedding 各 builder `.maxRetries(3)`，按 provider 独立配 |
+| 健康检查 | ✅ `LlmHealthIndicator` + `EmbeddingHealthIndicator`，1s TCP 探测，0 LLM 成本 |
+| K8s readiness probe | ✅ `/actuator/health/readiness` 聚合 `readinessState + llm + embedding` |
+| Listener metrics | ✅ 4 个 `gen_ai.client.*` OTel 风格指标，**fixed silent bug** |
+| Prometheus scrape | ✅ `/actuator/prometheus` |
+| Grafana dashboard | ✅ `docs/grafana-dashboard.json`，7 panel |
+| 熔断 / Vault / 限流 / fallback | ⏸ 待真实流量诉求驱动 |
+| 运维文档 | ✅ `docs/observability.md` |
+
 ---
 
 ## 写在最后
 
-整个 session 的关键 takeaway：
+整个 session 走完了从 demo 脚手架到生产可用的全程，关键 takeaway：
 
 **Prompt 工程不是猜辞藻好不好，是工程化的迭代过程**：
 1. 拆出可调参数（@V）
@@ -1253,4 +1484,11 @@ eval harness 的核心模式：
 7. 强约束的 prompt 规则必须 backend 配合（注入 / 工具 / guardrail），单边动是空许诺
 8. 合成/整合类任务模型默认偷懒，必须 **显式列 anti-pattern + 配 bad answer 反例**
 
-最大的发现：**eval 不只是 prompt 工程的验证工具，它本身就是发现 prompt bug 的主力**。整个 session 至少 6 个 bug（Java 库用错、测试题面互斥、prompt 误套用、Assistant 算错、RAG minScore 太严、doc 写法不利于召回）都是 eval 钉出来的，不跑测根本发现不了。如果 eval 还没建到可信，prompt 工程就是凭感觉。
+**生产推 LLM 应用的隐性必修课**：
+9. OpenAI-compatible 是事实标准 —— 一次抽象 `OpenAiCompatProps` + base-url 就能接 vLLM/SGLang/Groq 等 N 家
+10. Chat 和 Embedding 必须独立 switch —— 生产里两条链路完全独立（性能、可用性、模型选型）
+11. 横切关注（listener / interceptor / aspect）每次重构都要 grep 验证 —— 这种"无声 wire"的东西改装配链路最容易丢
+12. Health check 别真发 LLM —— TCP 探测够了，烧 token 都不可接受
+13. 维度切换 = 必须重建持久化向量库 —— 高密度告警
+
+最大的发现：**eval 不只是 prompt 工程的验证工具，它本身就是发现 prompt bug 的主力**。整个 session 至少 7 个 bug（Java 库用错、测试题面互斥、prompt 误套用、Assistant 算错、RAG minScore 太严、doc 写法不利于召回、listener 静默失效）都是非业务流程发现的 —— 跑 eval / 翻代码做 hardening / 加 dashboard 才钉出来。如果 eval 和可观测性还没建到可信，prompt 工程和生产部署都是凭感觉。
