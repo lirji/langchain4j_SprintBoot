@@ -51,6 +51,7 @@
 ## 1. 接入 4 个 LLM provider + 修两个隐藏 bug
 
 ### 目标
+
 用户希望接入 OpenAI / Claude / Gemini / DeepSeek，并加一个开关运行时切换。
 
 ### 关键决策
@@ -64,6 +65,7 @@
 | (c) **绕过 starter 自动装配，手写 LlmConfig 单一开关** | 选这个 —— 一个 yml 项控制，无 Bean 冲突 |
 
 选 (c) 之后的关键点：
+
 - 用 `app.llm.provider`（`ollama|openai|anthropic|gemini|deepseek`）单一开关
 - 每家 provider 一个 `*Props` 内部类
 - API key 走环境变量（`${OPENAI_API_KEY:}` 等）
@@ -71,6 +73,7 @@
 - Ollama starter 保留 —— 它的 EmbeddingModel 后来出问题（见下面 bug 2）所以一起接管
 
 ### 改动文件
+
 - `pom.xml`：新增 `langchain4j-anthropic`、`langchain4j-google-ai-gemini`
 - `src/main/java/com/lrj/langchain4j/config/LlmConfig.java`（新建）
 - `application.yml`：移除 `langchain4j.ollama.chat-model/streaming-chat-model` 块（防 Bean 冲突），加 `app.llm.*` 块
@@ -96,7 +99,9 @@ public ChatModel chatModel(LlmProperties props) {
 ```
 
 ```yaml
+
 # application.yml
+
 app:
   llm:
     provider: ollama   # ollama | openai | anthropic | gemini | deepseek
@@ -111,7 +116,8 @@ app:
 **Bug 1：HTTP client SPI 冲突**
 
 第一次启动报：
-```
+
+```text
 Conflict: multiple HTTP clients have been found in the classpath:
 [SpringRestClientBuilderFactory, JdkHttpClientBuilderFactory]
 ```
@@ -119,6 +125,7 @@ Conflict: multiple HTTP clients have been found in the classpath:
 classpath 上有两个 LangChain4j HTTP client SPI（一个来自 Spring 生态，一个 JDK 内置），`OllamaClient.<init>` 在 `HttpClientBuilderLoader` 里枚举到 2 个就抛冲突。
 
 修法：`LangChain4jApplication.main()` 里显式锁定 JDK 那个：
+
 ```java
 public static void main(String[] args) {
     System.setProperty(
@@ -131,7 +138,8 @@ public static void main(String[] args) {
 **Bug 2：Ollama starter 与 Spring Boot 3.3.5 不兼容**
 
 修了 Bug 1 之后启动又挂：
-```
+
+```text
 NoClassDefFoundError: org/springframework/boot/http/client/ClientHttpRequestFactorySettings
 ```
 
@@ -140,6 +148,7 @@ NoClassDefFoundError: org/springframework/boot/http/client/ClientHttpRequestFact
 之前一直没暴露，是因为 chat-model 自动装配也走同一 starter，先被 Bug 1 卡掉，根本到不了 embedding。
 
 修法：embedding 也从 starter 接管，挪到 `LlmConfig` 手建：
+
 ```java
 @Bean
 public EmbeddingModel embeddingModel(LlmProperties props) {
@@ -155,11 +164,13 @@ public EmbeddingModel embeddingModel(LlmProperties props) {
 同时把 `application.yml` 里所有 `langchain4j.ollama.*` 块都删掉（保留的话 starter 还是会去尝试装配）。
 
 ### 教训
+
 1. **第一个错误掩盖第二个**：修了 HTTP 冲突才发现 EmbeddingModel 自动配置本来就有 ABI 问题
 2. **多 Bean 冲突不要靠 `@Primary`**：LangChain4j 的 `@AiService` 自动发现按 `getBeanNamesForType` 枚举，不认 `@Primary` 也不认 `autowireCandidate=false`（后面第 8 章再次踩到）
 3. **starter 抽象的代价**：自动装配省事，但封装藏着 starter 版本和 Spring Boot 版本的耦合，自管反而清晰
 
 ### 量化结果
+
 切到 DeepSeek 实跑（`/chat`、tool calling、多轮记忆）全部通过。1.66s 启动。
 
 ---
@@ -226,6 +237,7 @@ public EmbeddingModel embeddingModel(LlmProperties props) {
 ## 4. Round a + b：主对话 prompt 拆段 + 工具描述精化
 
 ### 目标
+
 - a：把 `Assistant.@SystemMessage` 拆成可读的多段结构 + 用 `@V` 参数化，让 prompt 改动不需要重新编译
 - b：`DateTimeTool` 的两个 `@Tool` 描述太短，模型经常漏调或调错；加 WHEN-USE / WHEN-NOT / PARAM 三段式
 
@@ -242,6 +254,7 @@ public EmbeddingModel embeddingModel(LlmProperties props) {
 最后选 **`@V` 参数 + 用 `AssistantProperties` 集中默认值**，每个 endpoint（`ChatController` / `CategoryChatService` / `EvaluationRunner`）从 props 取值透传。调用点啰嗦但所有可调字段集中在一个 ConfigurationProperties，改 prompt 改 yml 重启即可。
 
 ### 改动文件
+
 - `config/AssistantProperties.java`（新建）—— `@ConfigurationProperties(prefix = "app.assistant")`
 - `ai/Assistant.java` —— system message 拆 5 段 + Extra 灰度位
 - `ai/CategoryChatService.java`、`controller/ChatController.java`、`eval/EvaluationRunner.java` —— 全部透传新参数
@@ -316,11 +329,13 @@ public String currentDateTime(@P("IANA time zone id, e.g. Asia/Shanghai") String
 ### 量化结果
 
 切 DeepSeek 实测三场景：
+
 - 默认 tone：「RAG 是 Java 生态下的 LLM 应用开发框架」（简洁 ✓）
 - 工具调用：「2026年5月23日 18:24（Asia/Shanghai）」（tool 正确触发）
 - 多轮记忆：「我叫张三」→「你叫张三」（chatId 隔离正常）
 
 ### 教训
+
 1. **prompt 用 yml 可配，改起来快**：之后做 A/B 不用动 Java
 2. **`@Tool` 描述就是工具的 prompt**：清楚写"何时不该用"比"何时该用"更重要
 3. **更好的 prompt 会暴露原有代码 bug**：模型听话调你的 broken 工具就 broken
@@ -331,11 +346,13 @@ public String currentDateTime(@P("IANA time zone id, e.g. Asia/Shanghai") String
 ## 5. Round c：Critic 多维结构化评分
 
 ### 目标
+
 现有 `Critique{score, feedback}` 太粗 —— 模型经常给 0.8 + feedback「不错，可以更具体」，导致 `Answerer.improve` 不知道改什么。
 
 ### 关键决策
 
 替换字段：
+
 - `correctness` (0-1)：事实准确性
 - `completeness` (0-1)：是否答全所有 sub-part
 - `clarity` (0-1)：表达清晰度（不用 `citation` 因为 `Answerer` 不走 RAG）
@@ -346,6 +363,7 @@ public String currentDateTime(@P("IANA time zone id, e.g. Asia/Shanghai") String
 改进 hint 传**三维分数 + mainIssue**，让 `improve` 知道「哪些维度差 + 具体该改什么」，不是单一 feedback 字符串。
 
 ### 改动文件
+
 - `ai/reflexion/Critique.java` —— record 字段全换
 - `ai/reflexion/Critic.java` —— `@SystemMessage` 重写，每维 0/0.5/1 锚点 + calibration check
 - `ai/reflexion/ReflexiveService.java` —— 加权聚合 + 新的 Attempt 字段
@@ -418,6 +436,7 @@ mainIssue：「n/a」→ 通过
 对比两次答案的 MySQL 事务段，**改进版精确修正了 mainIssue 指出的那一点**（不是泛泛重写），证明结构化 critique 真的在驱动定向改进。
 
 ### 教训
+
 1. **Structured Output 是 prompt 工程的核心杠杆**：4 个字段都 `@Description` 写清楚 → JSON Schema → 模型不跑偏
 2. **打分加锚点 + calibration check**：对抗"模型礼貌性给 0.9"的倾向
 3. **`mainIssue` 单点契约**：强制一句话写最该改的，比一段 feedback 更可执行
@@ -428,6 +447,7 @@ mainIssue：「n/a」→ 通过
 ## 6. Round e：Few-shot 给 Extractor 和 Planner
 
 ### 目标
+
 - `Extractor`：priority 容易通胀（什么都 HIGH）、nextSteps 抽象（"investigate the issue"）
 - `Planner`：常见失败是 over-decompose（trivial 问题拆 4 个 task）或 dependency-disguise（"先 A 再 B" 假装并行）
 
@@ -436,11 +456,13 @@ mainIssue：「n/a」→ 通过
 **少而精的 3 例策略**：每个 AiService 给 3 个例子覆盖（典型 / 边界 / 反例），不堆 10 个。
 
 **Extractor 3 例**：
+
 1. EN CRITICAL（生产中断 → CRITICAL）
 2. 中文 LOW（cosmetic / 单浏览器 → LOW）
 3. 中文 HIGH（付费客户 + deadline → HIGH，不到 CRITICAL）
 
 **Planner 3 例 + 1 反例**：
+
 1. trivial 问题 → 1 task
 2. 多维比较 → 按 aspect 拆（不按 entity）
 3. 研究型 → 多 sub-question
@@ -449,6 +471,7 @@ mainIssue：「n/a」→ 通过
 也放宽 `Plan.@Description` 从 "3 to 6" 到 "1 to 6" 配合 trivial 例子。
 
 ### 改动文件
+
 - `ai/extract/Extractor.java` —— 拆 `@SystemMessage` + `@UserMessage`，加 3 例
 - `ai/multiagent/Planner.java` —— 3 例 + 1 反例
 - `ai/multiagent/Plan.java` —— `@Description` 放宽
@@ -497,6 +520,7 @@ mainIssue：「n/a」→ 通过
 | 建议级（字体更小） | LOW（不通胀） | LOW ✓ |
 
 ### 教训
+
 1. **少而精胜过堆例子**：3 个覆盖典型/边界/反例足够，多了反而稀释
 2. **示范判断，不是示范格式**：格式被 `@Description` 锁了，例子展示 priority 选择 / 何时拆 / 如何按 aspect 分
 3. **反例（anti-example）权重高**：明确「不要这样」+ 错误示范，效果比正例更强
@@ -507,6 +531,7 @@ mainIssue：「n/a」→ 通过
 ## 7. Eval 量化第一回合：发现 eval 本身的问题
 
 ### 目标
+
 用项目自带的 `/eval/run` 黄金集量化 round a + b + c + e 的累积效果。
 
 ### 改造前的 eval
@@ -528,11 +553,13 @@ mainIssue：「n/a」→ 通过
 | ablation | 7/8 (87.5%) | 0.838 |
 
 表面看 ablation 反而更好 12.5pp 但其实是**噪声驱动**：
+
 - `tool-current-time`：baseline 两次 0.0，ablation 一次 0.7 —— Judge 主观裁定「北京时间」算不算「Asia/Shanghai」每次不同
 - `pii-redaction`：三 run 同样答案分别 0.70 / 0.90 / 1.00 —— **同样的答案，Judge 给的分能差 0.3**
 - `tool-days-until`：三 run 都 fail —— **测试设计 bug**（题面"请直接给数字"和 mustInclude `["天"]` 互斥）
 
 ### 教训
+
 1. **现状的 eval 不足以做 prompt A/B**：N=8 + Judge 单 run 方差 ±0.5 / case，单点差异淹没在噪声里
 2. **headline 数字会骗人**：1 个 case 翻动 = 12.5pp 摇摆
 3. **eval 本身的 bug 比 prompt 效果更显眼**：测试题面自相矛盾、字面 mustInclude 卡过头
@@ -554,6 +581,7 @@ mainIssue：「n/a」→ 通过
 ### 改动概览
 
 **(1) 修测试自相矛盾的 case**：
+
 - `tool-current-time` mustInclude `["Asia/Shanghai"]` → `["2026"]`（年份是 tool 调用的可靠 marker）
 - `tool-days-until` 题面去掉「请直接给数字」
 
@@ -562,6 +590,7 @@ mainIssue：「n/a」→ 通过
 
 **(3) Judge 独立 ChatModel + temp=0**：
 踩了个大坑。最初尝试：
+
 - 加 `@Bean @Primary chatModel` + `@Bean judgeChatModel` → 失败：LangChain4j `@AiService` 自动发现按 `getBeanNamesForType` 枚举，多 Bean 必抛 conflict，不认 `@Primary`
 - 加 `@Bean(autowireCandidate = false)` 到 judgeChatModel → 失败：枚举不看这个 flag
 - 改 `@AiService(wiringMode = EXPLICIT, chatModel = "chatModel", ...)` → 失败：EXPLICIT 把 ChatMemoryProvider / Tools / Retriever 的自动发现也关了，要全部显式列
@@ -616,6 +645,7 @@ IMPORTANT — handling time references:
 `tool-current-time` σ=0.47 来自 Assistant 三次答案措辞不同，不是 Judge 给同样答案打不同分。
 
 ### 教训
+
 1. **autowireCandidate / @Primary 都不顶 LangChain4j auto-discover**：要么 EXPLICIT 全显式（放弃自动发现），要么不把第二个 ChatModel 注册成 Bean
 2. **LLM-as-judge 必须注入 ground truth**：today / clock-tool 这类元信息 Judge 自己推不出来
 3. **客观字段必须规则匹配**：mustInclude 用 `String.contains` 比让 Judge 判稳定得多
@@ -643,7 +673,7 @@ IMPORTANT — handling time references:
 
 把 citationPolicy 改成 3 种互斥情况：
 
-```
+```text
 引用与来源处理（按以下情况分别处理，互斥）：
   1) 如果系统检索到了文档片段并用于回答，必须用 [doc=文件名#片段号] 形式标注来源。
   2) 如果用户的问题明确指向文档/知识库（含『文档』『手册』『文献』『资料里』『根据上述材料』等线索），
@@ -662,7 +692,7 @@ Judge **在重复评估 mustInclude**（被字面咬文嚼字 `[REDACTED]` 不�
 
 修 Judge 系统提示：
 
-```
+```text
 SCOPE — what you score vs what you do NOT:
 - MUST_INCLUDE / MUST_NOT_INCLUDE are already verified BEFORE you see the
   answer, by deterministic substring matching in the harness. Treat them
@@ -681,6 +711,7 @@ stingy by default.
 3-run 最终：**8/8 100% × 3 run，σ=0 全 case**。
 
 ### 教训（重要）
+
 1. **eval 是 prompt 的回归告警器**：整个 session 里两个 prompt bug（contradictory test case，citationPolicy 误套用）都是 eval 钉出来的，不跑测根本发现不了
 2. **Judge 也要迭代调 prompt**：和 Assistant 一样要拆 scope、给 calibration、限定不做什么
 3. **客观字段规则匹配后 Judge 别再判**：明令禁止 Judge 重复审 MUST_*，避免字面咬文嚼字
@@ -707,6 +738,7 @@ stingy by default.
 ### 第一次 20-case 结果
 
 19/20 passed × 3 run，剩 2 个 case 问题：
+
 - `cite-no-context` Judge 把"未在文档中找到"当 lazy refusal，扣 0 分 —— 但这本来就是正确行为
 - `pii-redaction` r3 Assistant 加了「已脱敏处理」前言，Judge 又当 refusal
 
@@ -754,6 +786,7 @@ Trust this; do not contradict it. When empty, judge with no extra hint.):
 ### 量化结果
 
 20-case × 3 runs：
+
 - run #1: 20/20 (100%)
 - run #2: 19/20 (95%) —— `tool-must-not-fire` Assistant 算错（0:00 + 1:30 = 02:30）—— 真 Assistant bug
 - run #3: 20/20 (100%)
@@ -761,6 +794,7 @@ Trust this; do not contradict it. When empty, judge with no extra hint.):
 **1 个真 bug 被 catch，没有 false-positive**。
 
 ### 教训（重要）
+
 1. **judgeHint 严禁喂答案**：只补 Judge 看 (Q, A) 没法推断的元信息（系统规则、RAG 状态）。喂答案 = 让 Judge 抄答案 = eval 退化成自检
 2. **对抗 case 必须有**：现在 7/20 是对抗类，证明 Assistant 真的扛得住（false premise / 未知未来 / prompt injection / harmful 请求）
 3. **eval 真的能发现 Assistant bug**：tool-must-not-fire r2 算错，规则匹配（cov=False） + Judge（识别算错）双重独立确认
@@ -885,6 +919,7 @@ public EvalResult.Summary run(List<EvalCase> cases, int runs) {
 ### 量化结果
 
 26 cases × 2 runs：
+
 - 顺序：**188s**
 - concurrency=4：**75s（2.5×）**
 - 52/52 都通过，并行没破坏结果
@@ -892,6 +927,7 @@ public EvalResult.Summary run(List<EvalCase> cases, int runs) {
 没到完整 4× 是因为 `multiagent-multi-aspect` 这种大 case 单独要 23s 卡在尾部。要继续加速可以按预期耗时排序（先发大的）或把内部 N runs 也并行。
 
 ### 教训
+
 1. **并行池要独立**：复用通用池在自调度场景会死锁
 2. **MDC 透传必须显式做**：`ThreadLocal`-based context 跨线程不自动跟，要 `TaskDecorator`
 3. **粒度选择**：case 间并行已经 2.5×，run 内串行换来 chatId 隔离简化，性价比高
@@ -902,7 +938,9 @@ public EvalResult.Summary run(List<EvalCase> cases, int runs) {
 ## 12. Round d：RAG 引用格式强化（ContentInjector + 闭环）
 
 ### 目标
+
 项目有完整 RAG 基础设施（`EmbeddingStoreContentRetriever` + 6 种向量库），但模型从来不会在回答里标注「这条信息来自哪份文档」—— 现有 `citationPolicy` 写「检索到了用 `[doc=文件名#片段号]` 标注」是空话，因为：
+
 - LangChain4j 内置 `DefaultContentInjector` 只把检索片段用换行拼起来塞给模型，**模型根本看不到来源 id**
 - 即便 prompt 让它标，它也只能编造文件名（或干脆不标）
 
@@ -911,11 +949,13 @@ public EvalResult.Summary run(List<EvalCase> cases, int runs) {
 **核心洞察：prompt + 注入必须成对**。改一边只是空许诺，必须 backend 实际把可引用的 id 放进 prompt，frontend 才能让模型按格式输出。
 
 设计：
+
 - 自定义 `ContentInjector`：每个检索片段包成 `<source id="filename#N">...</source>`，id 从 `TextSegment.metadata.file_name` 取，chunk 索引退到顺序号
 - `RetrievalAugmentor` 改成**始终构造**（不再 `@ConditionalOnExpression` 只在 rerank/hybrid 时建），无条件挂上自定义 injector —— 不然没启 rerank 的默认路径就退回 `DefaultContentInjector`，闭环失效
 - `directContentRetriever` 的硬编码 `minScore(0.6)` 改成可配（`app.rag.min-score`，默认 0.3）—— 测试时发现 0.6 对中文 query + `nomic-embed-text` 太严，召回率几乎为 0
 
 ### 改动文件
+
 - `documents/project-faq.md`、`documents/eval-spec.md`（新建）—— 没真文档 RAG 链路根本走不起来
 - `rag/TaggedSourceContentInjector.java`（新建）
 - `config/LangChain4jConfig.java` —— augmentor 改为始终构造 + 挂 injector；retriever minScore 参数化
@@ -967,7 +1007,7 @@ public RetrievalAugmentor retrievalAugmentor(...) {
 
 29 cases × 2 runs = 58 trials，54/58 (93.1%) overall。**3 个 RAG case 全 2/2 σ=0**：
 
-```
+```text
 本项目当前默认的 chat provider 是 ollama（app.llm.provider=ollama）。[doc=project-faq.md#0]
 Judge 使用 temperature=0 ... [doc=eval-spec.md#0]
 未在文档中找到相关内容。资料中列出 in-memory/pgvector/milvus...，并未提及 MongoDB。
@@ -976,6 +1016,7 @@ Judge 使用 temperature=0 ... [doc=eval-spec.md#0]
 剩 4 个失败（unknown-future-fact / code-explain-volatile / format-table）是 Assistant 侧 temp=0.7 的运行间方差或测试用例设计问题，**与 d 改造无关**。
 
 ### 教训
+
 1. **prompt 工程的隐性前提**：很多 prompt 规则只有在 backend 配合的情况下才可能被模型遵守。「按 `[doc=ID]` 引用」需要 ID 真在 prompt 里
 2. **`@Conditional*` 不能用在「应当永远启用」的组件上**：augmentor 当初只在 rerank/hybrid 时建，是为了"少装一个 bean"，但代价是默认路径走默认行为。**为了挂自定义 injector，必须改成始终构造**
 3. **eval 钉真问题，但不一定钉得清楚**：手动测试第一次返回「未在文档中找到」时，看着像 prompt 工作（拒绝了），其实是 retriever 召回 0 条触发了 citationPolicy 规则 2。要诊断必须看 backend 日志
@@ -986,7 +1027,9 @@ Judge 使用 temperature=0 ... [doc=eval-spec.md#0]
 ## 13. Round g：Synthesizer 编织 not 拼接
 
 ### 目标
+
 multi-agent 流水线最后一步是 `Synthesizer` 把多个 worker 输出合成最终回答。原 prompt 只有 3 句空泛话术（"resolve contradictions, omit redundancy"），常见失败模式：
+
 1. 直接把 worker 答案首尾相接 → 像并列几段而非合成
 2. 用 `Sub-task 1 says ...` 当章节标题 → **暴露内部 plan 结构给用户**
 3. 加 `Based on the synthesis of the specialist answers, ...` 前言 → 冗余话术
@@ -999,6 +1042,7 @@ multi-agent 流水线最后一步是 `Synthesizer` 把多个 worker 输出合成
 复用 round c / e 的套路：**rubric + anti-patterns + few-shot**，并且配 bad answer 反例（不只是 good answer 例子）。
 
 5 条 synthesis rules（按重要性）：
+
 1. Re-anchor 到原问题
 2. 合并重叠点
 3. 显式 surface 矛盾
@@ -1006,16 +1050,19 @@ multi-agent 流水线最后一步是 `Synthesizer` 把多个 worker 输出合成
 5. 收尾给 takeaway（推荐 / 决策标准 / 总结表）—— 适用时
 
 4 条 forbidden anti-patterns（显式列出）：
+
 - `Sub-task 1 says ...` / `[t1] result: ...` 当 section header
 - `Based on the synthesis ...` 前言
 - 1:1 镜像 task numbering 的编号列表
 - 两段重复同一事实换措辞
 
 1 个完整例子（PostgreSQL vs MySQL on 索引 + 事务隔离）+ 配对的 bad answer 反例：
+
 - good answer：按维度组织、merge、有结论
 - bad answer：「Sub-task 1: PostgreSQL has ... MySQL uses ... Sub-task 2: ...」+ 标注为啥差（"leaks sub-task structure, no merge, no narrative, no closing takeaway"）
 
 ### 改动文件
+
 - `ai/multiagent/Synthesizer.java` —— prompt 全重写
 - `eval-cases.json` —— 新增 `synth-no-subtask-leak` case（HTTP/1.1 vs HTTP/2 三维比较）
 
@@ -1048,7 +1095,8 @@ multi-agent 流水线最后一步是 `Synthesizer` 把多个 worker 输出合成
 ```
 
 eval case 的 mustNotInclude 设计要小心 —— `EvaluationRunner.invokeMultiAgent()` 把答案序列化成：
-```
+
+```text
 tasks: 3
   - t1: <desc>     ← 不带方括号
   - t2: <desc>
@@ -1061,11 +1109,13 @@ tasks: 3
 ### 量化结果
 
 30 cases × 2 runs = 60 trials，**59/60 (98.3%)**。所有 3 个 multi-agent case 全 2/2 σ=0：
+
 - `multiagent-multi-aspect`（Kafka vs RabbitMQ）✓
 - `multiagent-trivial-1-task`（trivial 1 task）✓
 - `synth-no-subtask-leak`（HTTP/1.1 vs HTTP/2 + 反 pollution）✓
 
 手动测试同一 HTTP/2 问题，finalAnswer 表现：
+
 - 开头 1 句 zoom out（"三个维度的改进是递进的，核心目标是解决 HTTP/1.1 的队头阻塞..."）
 - 3 个 `### 1./2./3.` 用**维度名**当标题（不是 sub-task 1/2/3）
 - 每段加了具体数字（6-8 个连接 / 61 个 HPACK 静态表 / 头部压缩 85-90%）
@@ -1074,6 +1124,7 @@ tasks: 3
 - 4 个 pollution marker（`Sub-task` / `[t1]` / `[t2]` / `Based on the synthesis`）全 `False`
 
 ### 教训
+
 1. **"编织 not 拼接"必须明令**：合成类任务模型默认会偷懒首尾拼，必须 prompt 显式把这种失败模式列为 anti-pattern
 2. **good + bad 配对示例**：光说 "do not do X" 模型可能不知道 X 长什么样；配一个"看上去合理但其实犯了 X"的反例，模型一眼对照学。bad answer 后面加一句"why it's bad"，把 anti-pattern 跟反例显式绑定
 3. **leak 内部结构是隐性失败**：用户看不见 `[t1]` `Sub-task 1` 来自哪，但读起来很割裂。eval 必须用 mustNotInclude 显式钉这类暴露 —— 否则 Judge 主观给分可能不扣
@@ -1085,11 +1136,13 @@ tasks: 3
 ## 14. Round h：vLLM 接入 + 生产 hardening（含一个 silent bug）
 
 ### 起因
+
 用户要把项目从本地 demo 推到生产：Ollama 单进程没 HA、吞吐瓶颈，要换成 vLLM 跑 K8s 集群里。一开始问"能换吗"，确认是生产场景后场景变成**全套生产化**：vLLM chat + bge-m3 embedding + 重试 + 健康检查 + Prometheus/Grafana。
 
 ### 关键决策
 
 **vLLM 用 OpenAI-compat 路径，零新依赖**。vLLM 默认就暴露 OpenAI 兼容的 `/v1/chat/completions` 和 `/v1/embeddings`。所以：
+
 - chat 复用 `OpenAiChatModel.builder()`，跟 DeepSeek 同一条 case（只是 base-url 不同）
 - embedding 复用 `OpenAiEmbeddingModel.builder()`
 - `vllmDefaults()` 跟 `deepseekDefaults()` 一个 pattern，只改 base-url 默认值
@@ -1097,11 +1150,13 @@ tasks: 3
 更大的洞察：**OpenAI-compatible 已经是 LLM 推理服务的事实标准**。一个 `OpenAiCompatProps` 类 + base-url 切换就能接 OpenAI / DeepSeek / vLLM / SGLang / TGI / LM Studio / Groq / Together / Fireworks 等等。提供商之间换是 yml 改 base-url 的事，不是代码工程。
 
 **Embedding 跟 chat 完全解耦**。原来 embedding 硬编码在 `LlmConfig.embeddingModel()`，跟 Ollama 绑死。抽出独立的 `EmbeddingModelConfig`：
+
 - `app.embedding.provider` 单一开关（`ollama` / `openai-compat`）
 - 这样可以 chat 走 vLLM-A，embedding 走 vLLM-B（不同 K8s deployment），两边互不影响
 - bge-m3 (1024 维) ≠ nomic-embed-text (768 维)，**切 embedding = 必须重建持久化向量库**，3 处告警（Java doc / yml / CLAUDE.md）
 
 ### 改动文件
+
 - `pom.xml`（已有 `langchain4j-open-ai` 复用，无新依赖）
 - `config/LlmConfig.java` —— 加 `vllm` case + `vllmDefaults()`，移除 `embeddingModel` Bean，移除 `OllamaProps.embeddingModelName`
 - `config/EmbeddingModelConfig.java`（新建）—— 独立 switch + 两种 provider 实现
@@ -1137,10 +1192,12 @@ public EmbeddingModel embeddingModel(EmbeddingProperties props) {
 按 ROI 选了三件做：
 
 **(1) 重试**：所有 chat / embedding builder 加 `.maxRetries(p.getMaxRetries())`，默认 3。覆盖 429 限流 / 5xx / 超时的自动退避。
+
 - 4 个 chat *Props + 2 个 embedding *Props 都加 `maxRetries` 字段
 - 按 provider 独立配（vLLM 跑稳了可降到 1，云 API 保 3）
 
 **(2) 健康检查**：自定义 Actuator HealthIndicator + K8s 集成。
+
 - `LlmHealthIndicator` + `EmbeddingHealthIndicator`：对当前 provider base-url 做 **1s TCP 探测**
 - **不发 LLM 请求** —— 不烧 token，不需要 api-key 有效，1s 内有结果，适合 K8s readinessProbe
 - yml 配 `management.endpoint.health.group.readiness.include=readinessState,llm,embedding`，让 readiness 聚合所有
@@ -1148,6 +1205,7 @@ public EmbeddingModel embeddingModel(EmbeddingProperties props) {
 - 需要 `management.health.probes.enabled=true`（K8s 部署模式默认开启，本地启动要显式打开，不然 `readinessState` 找不到）
 
 **(3) Prometheus + Grafana**：scrape 配置 + 7 panel dashboard
+
 - `MetricsChatModelListener` 已写了 4 个 OTel GenAI 风格指标：`gen_ai.client.requests` / `operation.duration` / `token.usage` / `errors`
 - `docs/grafana-dashboard.json`：req rate / p50p95p99 latency / token spend / error by type / health stat / per-provider bar
 - `docs/observability.md`：scrape 配置 + 部署示例 + K8s probe yml
@@ -1181,6 +1239,7 @@ static Health probeTcp(String url, String... extraDetails) {
 **`MetricsChatModelListener` 之前完全没在记录任何指标**。
 
 回溯：
+
 - `ObservabilityConfig` 注释写着 "starter scans and wires" —— LangChain4j Spring Boot starter 会扫 `ChatModelListener` Bean 自动灌到 auto-configured `ChatModel`
 - 但 **round-1（接 5 个 provider）把 ChatModel 改成 `LlmConfig` 手动建**，绕过了 starter 的自动装配
 - starter 的 listener 扫描机制不再触发
@@ -1212,7 +1271,7 @@ public class LlmConfig {
 
 3 次 chat 调用之后：
 
-```
+```text
 gen_ai_client_requests_total{model="deepseek-chat",provider="OPEN_AI"} 3
 gen_ai_client_token_usage_total{type="input"}  3240
 gen_ai_client_token_usage_total{type="output"} 134
@@ -1236,6 +1295,7 @@ gen_ai_client_operation_duration_seconds_max  1.52
 K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodSeconds=10 → vLLM 后端 30s 不通 pod 就退出 ready 状态。
 
 ### 教训
+
 1. **"OpenAI-compatible 是事实标准"**：vLLM / SGLang / TGI / LM Studio / Groq / Together / Fireworks 全都暴露这个协议。`OpenAiCompatProps` + base-url 切换 = 几乎所有推理后端通吃。提前抽这个抽象是值的
 2. **Embedding 跟 chat 必须独立 switch**：原来硬编码 Ollama 是 demo 思维。生产里这两条链路完全独立 —— chat 慢 vs embedding 慢、可用性、QPS、模型选型都不一样，绑死会拖累其中一个
 3. **维度切换 = 必须重建向量库**：bge-m3(1024) ≠ nomic(768)，PGVector / Milvus 表已建的会拒插。3 处告警（Java doc / yml / CLAUDE.md）确保踩坑前看到
@@ -1247,6 +1307,7 @@ K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodS
 ### 改动文件汇总
 
 新建：
+
 - `config/EmbeddingModelConfig.java`
 - `observability/LlmHealthIndicator.java`
 - `observability/EmbeddingHealthIndicator.java`
@@ -1254,6 +1315,7 @@ K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodS
 - `docs/observability.md`
 
 修改：
+
 - `config/LlmConfig.java`（加 vllm + listener 接线 + maxRetries）
 - `application.yml`（vllm + embedding + actuator group/probes）
 - `CLAUDE.md`（provider 表 / embedding switch 节 / observability 节 / health 节 / retry 节）
@@ -1273,6 +1335,7 @@ K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodS
 ### 15.2 Few-shot 示范判断，不是格式
 
 格式被 `@Description` 锁了，例子用来展示**判断**：
+
 - Extractor 例子展示「什么场景选 CRITICAL 而不是 HIGH」
 - Planner 例子展示「什么时候不该拆」
 - Critic 例子展示「0/0.5/1 分别长什么样」
@@ -1283,6 +1346,7 @@ K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodS
 ### 15.3 客观 vs 主观：规则匹配 + LLM 双层分工
 
 eval harness 的核心模式：
+
 - **客观字段**（covers / violates / 字符串包含）→ `String.contains` 规则匹配
 - **主观质量**（score / reasoning）→ LLM-as-judge
 
@@ -1299,6 +1363,7 @@ eval harness 的核心模式：
 ### 15.5 Bug 是 eval 钉出来的
 
 整个 session 至少 6 个 bug 是 eval 揭穿的：
+
 - `daysUntil` 用 `Period.getDays()` 算错（round b 实测发现）
 - `tool-days-until` 题面自相矛盾（eval 第一回合）
 - `citationPolicy` 无差别套用（eval 第二回合）
@@ -1311,6 +1376,7 @@ eval harness 的核心模式：
 ### 15.6 调一处看变化的工程化
 
 每改一处 prompt 都跑 eval：
+
 1. 改前 `curl -X POST /eval/run?runs=3` 拿 baseline
 2. 改一处（只动一个变量）
 3. 再跑 eval 看 passRate / avgScore 怎么漂
@@ -1330,6 +1396,7 @@ eval harness 的核心模式：
 ### 15.8 渐进式拆分
 
 每个抽象都从「简单粗暴硬编码」起步，发现真的需要可配时再加：
+
 - AssistantProperties 起步只有 4 个字段（language / tone / citationPolicy / extra）
 - ReflexionConfig.Weights 内部类只 3 个权重
 - EvalCase 加 `judgeHint` 也是延迟到第 10 章发现真需要才加
@@ -1339,6 +1406,7 @@ eval harness 的核心模式：
 ### 15.9 prompt + backend 注入必须成对（来自 d）
 
 很多 prompt 规则只有在 backend 配合的情况下才可能被模型遵守。典型例子：
+
 - citationPolicy 要求「按 `[doc=ID]` 引用」→ 必须 `ContentInjector` 把 ID 实际放到 prompt 里
 - 工具描述要求「按 IANA 时区格式调用」→ 必须 tool 实现真的拒绝非 IANA 输入（throw exception）
 - safety 段要求「PII 替换为 [REDACTED]」→ 必须有 `PiiGuardrail` 兜底（模型偶尔会漏）
@@ -1348,6 +1416,7 @@ eval harness 的核心模式：
 ### 15.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
 
 合成 / 整合 / 摘要类任务，模型默认会偷懒 → 直接拼接 worker 输出 / 罗列要点 / 用源 ID 当标题。光说"compose a coherent answer"是空话，必须：
+
 - **显式列出错误模式**（"不要用 Sub-task 1 当标题"、"不要 Based on the synthesis 前言"）
 - **配 bad answer 反例 + 反例为何差的说明**（强化绑定）
 - **eval 用 mustNotInclude 钉这些 leak marker**（Judge 主观给分可能不扣，规则匹配兜底）
@@ -1365,12 +1434,14 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 ### 15.12 横切关注每次重构都要 grep 验证（来自 h 的 silent bug）
 
 `MetricsChatModelListener` 在 round-1 后**默默失效了几个月**：
+
 - 它原本靠 LangChain4j Spring Boot starter 的扫描机制自动 wire 到 auto-configured `ChatModel`
 - round-1 把 ChatModel 改成 `LlmConfig` 手动建（为了多 provider 切换），绕过了 starter 的 wire
 - listener 没人接管 → metrics 静默不记录
 - 代码层面零报错，业务功能正常，没人察觉
 
 **横切关注（cross-cutting concerns）的本质特征**：失败时无声。包括：
+
 - listener / interceptor / aspect / filter
 - guardrail / output validator
 - 自动 wire 的可观测性组件
@@ -1386,6 +1457,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 ### f. 跨 provider 不同默认 prompt
 
 **目标**：`AssistantProperties` 改成 `Map<String, AssistantStyle>`，按 `app.llm.provider` 取对应那份。比如：
+
 - DeepSeek：擅长中文，但对 long system prompt 敏感
 - Claude：偏好 XML 标签（`<context>...</context>` 之类）
 - Gemini：tool-calling 触发不积极，工具描述要更诱导
@@ -1475,6 +1547,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 整个 session 走完了从 demo 脚手架到生产可用的全程，关键 takeaway：
 
 **Prompt 工程不是猜辞藻好不好，是工程化的迭代过程**：
+
 1. 拆出可调参数（@V）
 2. 用 Structured Output 锁结构、用 few-shot 锁判断
 3. 把可量化的部分搬到客观规则
@@ -1485,6 +1558,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 8. 合成/整合类任务模型默认偷懒，必须 **显式列 anti-pattern + 配 bad answer 反例**
 
 **生产推 LLM 应用的隐性必修课**：
+
 9. OpenAI-compatible 是事实标准 —— 一次抽象 `OpenAiCompatProps` + base-url 就能接 vLLM/SGLang/Groq 等 N 家
 10. Chat 和 Embedding 必须独立 switch —— 生产里两条链路完全独立（性能、可用性、模型选型）
 11. 横切关注（listener / interceptor / aspect）每次重构都要 grep 验证 —— 这种"无声 wire"的东西改装配链路最容易丢

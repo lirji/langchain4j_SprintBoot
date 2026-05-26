@@ -49,6 +49,7 @@ scrape_configs:
 - `embedding`：对当前 `app.embedding.provider` 的 base-url 做 1s TCP 探测
 
 输出示例：
+
 ```json
 {
   "status": "UP",
@@ -69,6 +70,7 @@ scrape_configs:
 **TCP 探测的取舍**：只检查网络可达，不发 LLM 请求 → 不烧 token、不需要 api-key 有效、1s 内可结果，适合 K8s readiness/liveness probe。但不反映模型实际可推理能力（那个要靠 `gen_ai_client_errors_total` 监控）。
 
 K8s probe 配置示例：
+
 ```yaml
 readinessProbe:
   httpGet: {path: /actuator/health/readiness, port: 8080}
@@ -82,6 +84,7 @@ livenessProbe:
 ```
 
 要让自定义 indicator 进 readiness group，在 yml 配：
+
 ```yaml
 management:
   endpoint:

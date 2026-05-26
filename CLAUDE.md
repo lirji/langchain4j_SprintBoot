@@ -5,12 +5,14 @@
 ## 项目概览
 
 LangChain4j + Spring Boot + Ollama 脚手架，演示四大能力：
+
 - Chat + 多轮记忆（`ChatMemoryProvider` + `@MemoryId`，按 chatId 隔离会话）
 - RAG（`EmbeddingStoreContentRetriever` + 可切换的 EmbeddingStore）
 - Tools / Function Calling（`@Tool` 注解的 Spring Bean，自动被 `@AiService` 发现）
 - AI Services（声明式接口 `Assistant`，Spring 自动装配模型/记忆/检索/工具）
 
 并附带：
+
 - 流式响应（`TokenStream` + Spring MVC `SseEmitter`）
 - 向量库可切换（默认 in-memory；可切到 PGVector）
 
@@ -22,6 +24,7 @@ LangChain4j + Spring Boot + Ollama 脚手架，演示四大能力：
 - Maven
 
 关键依赖：
+
 - `langchain4j-spring-boot-starter`（`@AiService` 注解装配）
 - `langchain4j-ollama-spring-boot-starter`（只用来自动装配 `EmbeddingModel`；ChatModel/StreamingChatModel 由 `LlmConfig` 统一接管以支持多 provider 切换）
 - `langchain4j-open-ai` / `langchain4j-anthropic` / `langchain4j-google-ai-gemini`（OpenAI / DeepSeek / Claude / Gemini 的 ChatModel 实现，由 `LlmConfig` 直接构建，不走各自的 spring starter，避免自动装配冲突）
@@ -31,7 +34,7 @@ LangChain4j + Spring Boot + Ollama 脚手架，演示四大能力：
 
 ## 目录结构
 
-```
+```text
 src/main/
 ├── resources/application.yml
 └── java/com/lrj/langchain4j/
@@ -78,11 +81,13 @@ documents/                                 RAG 文档目录（.txt/.md/.pdf 等�
 ## 运行
 
 前置条件：
+
 1. 本机起 Ollama，并拉模型：
    ```bash
    ollama pull llama3.1
    ollama pull nomic-embed-text
    ```
+
 2. （如需 PGVector）起一个 pgvector 容器：
    ```bash
    docker run -d --name pgvector -p 5432:5432 \
@@ -90,6 +95,7 @@ documents/                                 RAG 文档目录（.txt/.md/.pdf 等�
    ```
 
 启动应用：
+
 ```bash
 mvn spring-boot:run
 ```
@@ -120,6 +126,7 @@ DEEPSEEK_API_KEY=sk-... mvn spring-boot:run -Dspring-boot.run.arguments=--app.ll
 ```
 
 注意：
+
 - **EmbeddingModel 由独立开关装配**（`app.embedding.provider`），跟 chat provider 完全解耦 —— 见下面 "切换 Embedding Provider" 节。切换 chat 不影响 RAG 已入库的向量。
 - `application.yml` 里**不要**再添加 `langchain4j.ollama.chat-model` / `langchain4j.<provider>.chat-model` 块，否则 LangChain4j starter 会和 `LlmConfig` 各创建一个 `ChatModel` Bean → 启动冲突。所有 chat/streaming 配置都走 `app.llm.<provider>.*`。
 - Tool calling 在 Gemini / DeepSeek-V3 上行为略有差异；`@AiService` 接口代码无需改。
@@ -132,6 +139,7 @@ DEEPSEEK_API_KEY=sk-... mvn spring-boot:run -Dspring-boot.run.arguments=--app.ll
 | `openai-compat` | **生产推荐**：vLLM 跑 embed / TEI / 云 OpenAI | `app.embedding.openai-compat.{base-url, api-key, model-name, timeout}`；推荐 `BAAI/bge-m3`（1024 维多语言） |
 
 **重要：换 embedding = 换向量维度 = 必须重建持久化向量库**。`nomic-embed-text`(768) → `bge-m3`(1024) 切换前要：
+
 1. drop 已有的 PGVector 表 / Milvus 集合 / Chroma collection / Doris 表
 2. 重启应用，让 starter 按新维度建表
 3. 重新 `POST /rag/ingest` 入库
@@ -139,6 +147,7 @@ DEEPSEEK_API_KEY=sk-... mvn spring-boot:run -Dspring-boot.run.arguments=--app.ll
 InMemoryEmbeddingStore 重启即丢，无所谓。
 
 vLLM 生产示例（同集群 chat + embedding 两个 deployment）：
+
 ```bash
 # chat
 kubectl run vllm-chat --image=vllm/vllm-openai:latest -- \
@@ -157,6 +166,7 @@ kubectl run vllm-embed --image=vllm/vllm-openai:latest -- \
 ```
 
 切换向量库（`app.rag.store` 可选 `in-memory | pgvector | milvus | chroma | qdrant | doris`）：
+
 ```bash
 # in-memory（默认）
 mvn spring-boot:run
@@ -199,6 +209,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | GET  | `/health`       | 健康检查 |
 
 示例：
+
 ```bash
 # 触发工具调用
 curl -X POST 'localhost:8080/chat?chatId=u1' \
@@ -253,6 +264,7 @@ curl -X POST 'localhost:8080/chat/category?chatId=u1&category=manual' \
 | `extra` | `""` | 灰度/A-B 试新指令的位置，例如 `"本轮请用 markdown 列表组织答案"` |
 
 实际调用：
+
 ```bash
 # 改 yml 后重启即生效
 curl -X POST 'localhost:8080/chat?chatId=u1' -H 'Content-Type: application/json' \
@@ -264,6 +276,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 ```
 
 调 prompt 的工程化流程：
+
 1. 在 `src/main/resources/eval/eval-cases.json` 准备覆盖典型场景的黄金集（happy + edge + 拒答 + 工具调用 + PII）
 2. 改前先 `curl -X POST localhost:8080/eval/run` 拿 baseline `passRate / averageScore`
 3. **每次只动一个变量**（`tone` / `citation-policy` / `extra` 之一，或换 provider）
@@ -272,6 +285,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 跨 provider 注意：DeepSeek 中文强但忽略长 system，Claude 偏好 XML 标签（`<context>...</context>`），Gemini tool-calling 触发不积极，Ollama 小模型要更明确的指令。如果需要分 provider 给不同默认值，扩展 `AssistantProperties` 为 `Map<String, AssistantStyle>`，按 `app.llm.provider` 取对应那份。
 
 其他 AiService 的 prompt 现状：
+
 - `Critic`：3 维评分 + 锚点 + mainIssue 契约（见下 Reflexion 节）
 - `Planner`、`Extractor`：已内置 3 例 few-shot + 反例，锚定常见失败（over-decompose / priority 通胀 / 拆错维度）。要扩例子直接改 `@SystemMessage` 字符串即可
 - `Synthesizer` / `Judge`：仍是硬编码简短 prompt，需要细化时按上面套路改
@@ -281,21 +295,25 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 ## 记忆与 Reranking
 
 **ChatMemoryStore** `app.memory.store`:
+
 - `in-memory`（默认）— `InMemoryChatMemoryStore`，重启即丢
 - `redis` — `RedisChatMemoryStore`，按 `chat:mem:<chatId>` 存 JSON、带 TTL；需要 Redis 可用，配置在 `spring.data.redis.*`
 
 **ChatMemory 滑窗** `app.memory.window-mode`:
+
 - `messages`（默认）— `MessageWindowChatMemory`，保留最近 `max-messages` 条
 - `tokens` — `TokenWindowChatMemory`，保留最近 `max-tokens` 个 token；用 `OpenAiTokenCountEstimator(tokenizer-model)` 近似计数（Ollama 没自带 tokenizer，OpenAI 估算偏差通常 10–15%）
 - `summary` — 自定义 `SummarizingChatMemory`：超过 `max-messages` 时，把旧消息（保留最近 `summary.keep-recent` 条之外的）用 LLM 压缩成单条 `SystemMessage`；每次压缩一次额外 LLM 调用
 
 **Reranking** `app.rag.rerank.enabled` + `type`:
+
 - `enabled=false`（默认）— 向量检索直接取 `app.rag.top-k` 条返回
 - `enabled=true, type=llm`（默认 type）— `OllamaLlmScoringModel`：用 ChatModel 给每对 (query, doc) 打 0–1 分，零外部依赖但慢（N 次 LLM 调用）
 - `enabled=true, type=jina` — `JinaScoringModel`：云 API，多语言（默认 `jina-reranker-v2-base-multilingual`），快且准；需 `JINA_API_KEY` 环境变量
 - 其他可选：`CohereScoringModel`、`langchain4j-onnx-scoring-*`（本地 ONNX 重排，速度好但要下载模型）
 
 **Hybrid Retrieval（通用）** `app.rag.hybrid.enabled` + `tokenizer`:
+
 - `enabled=false`（默认）— 只走向量检索
 - `enabled=true` — 同时跑向量检索 + `KeywordContentRetriever`（token-overlap），`DefaultQueryRouter` 路由两路，`DefaultContentAggregator` 用 RRF 融合
 - `tokenizer=simple`（默认）— 按字 + 标点切，零依赖，中文召回粗糙
@@ -309,6 +327,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
   ```
 
 **Reflexion** `app.reflexion.*`:
+
 - Critic 输出结构化 3 维评分：`correctness`（事实准确）/ `completeness`（答全）/ `clarity`（清晰），每维 0.0–1.0，加上一句 `mainIssue`（最该改的点）。维度 + 锚点定义在 `Critic.java` 的 `@SystemMessage` 里，改锚点 ≈ 改打分标准。
 - `threshold`（默认 0.75）— **加权聚合分**低于此值触发改进；越高越严
 - `weights.{correctness,completeness,clarity}`（默认 0.4/0.4/0.2）— 加权权重，不必归一化（用总和当分母）。比如想强压幻觉就把 correctness 调到 0.6；做面向终端用户的对话场景可以把 clarity 提到 0.4
@@ -317,10 +336,12 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - 调用 `/chat/reflexive` 时不共享主 Assistant 的 ChatMemory 与 RAG，是为了让反思迭代纯粹、可重复。要在反思里用 RAG，自己改 `Answerer` 走 `AiServices.builder().contentRetriever(...)`；同时把 `clarity` 改名为 `groundedness` / `citation` 并调权重。
 
 **PGVector Hybrid 检索** `app.rag.pgvector.search-mode`:
+
 - `VECTOR`（默认）— 纯向量
 - `HYBRID` — PGVector 原生向量 + `tsvector` 全文 RRF 融合（`rrf-k` 默认 60，`text-search-config` 默认 `simple`，中文建议改 `chinese` 或外部分词后再入库）
 
 **RAG 引用格式** `TaggedSourceContentInjector`:
+
 - LangChain4j 内置 `DefaultContentInjector` 只把检索片段用换行拼起来，模型看不到来源 id，没法按格式引用。
 - `TaggedSourceContentInjector` 把每个 Content 包成 `<source id="文件名#片段号">...</source>`，id 从 `TextSegment.metadata` 的 `file_name` 取，chunk 索引退到顺序号。
 - `LangChain4jConfig.retrievalAugmentor` 是**始终构造**的（不再 conditional on rerank/hybrid），目的就是无条件挂这个 injector —— 不然没启 rerank 的默认路径就走 `DefaultContentInjector`，引用格式契约失效。
@@ -330,6 +351,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 ## 多 Agent 协作 / Guardrails / 可观测性
 
 **Multi-Agent** `/chat/multi-agent`：
+
 - `Planner` 把问题拆 1–6 个独立子任务（结构化输出，内置 3 例 few-shot + 1 反例锚定粒度）
 - `Worker` 池（`multiAgentExecutor`，4–8 线程）并行执行
 - `Synthesizer` 编织（不是拼接）成最终答案；prompt 含 5 条 synthesis rules + 4 条 forbidden anti-patterns + 1 个完整对比例。明令禁止 `Sub-task 1/[t1]/Based on the synthesis...` 等暴露内部 plan 结构的措辞，要求按用户的 mental model 组织（aspect / 维度 / 步骤），结尾给出 takeaway
@@ -337,11 +359,13 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - 当前是**无依赖 fan-out**；要做 DAG 串行依赖请扩展 `Plan` 加 `dependencies` 字段并在 `MultiAgentService` 用拓扑序
 
 **Output Guardrails** `@OutputGuardrails(PiiGuardrail.class, maxRetries=2)`：
+
 - 已挂在 `Assistant.chat()`。检测 email / 中国手机号 / 身份证号；命中就 `reprompt` 让模型重写为 `[REDACTED]`
 - 流式 `chatStream` 暂未挂 guardrail（流式 guardrail 会缓冲整段，按需要再加）
 - 输入侧用 `@InputGuardrails(SomeInputGuardrail.class)` 同理
 
 **Observability**（详见 `docs/observability.md`）：
+
 - `LoggingChatModelListener` — 每次 LLM 调用打一行 `model / duration_ms / tokens_in/out/total`
 - `MetricsChatModelListener` — 自己写的最小实现（`langchain4j-micrometer` 还未发到 Maven Central），用 `MeterRegistry` 直接打点：`gen_ai.client.requests`（counter）、`gen_ai.client.operation.duration`（timer）、`gen_ai.client.token.usage`（counter，按 input/output 拆 tag）、`gen_ai.client.errors`
 - **listener 通过 `LlmConfig` 构造器注入 `List<ChatModelListener>` 灌到每个 chat builder**。之前注释说 "starter 自动 wire"，但项目改成手动建 ChatModel 后绕开了 starter，metrics 其实没记录 —— 这是 hardening 时修的 silent bug
@@ -350,12 +374,14 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - Grafana dashboard：`docs/grafana-dashboard.json` 提供 7 个 panel（req rate / latency p50p95p99 / token spend / error rate by type / etc），导入即用
 
 **Health Check**：
+
 - `LlmHealthIndicator` + `EmbeddingHealthIndicator` 自定义 Actuator indicator，对当前 provider 的 base-url 做 1s TCP 探测（不烧 token、不需要 api-key 有效）
 - 暴露在 `/actuator/health/llm` `/actuator/health/embedding` 单独可查
 - `management.endpoint.health.group.readiness.include=readinessState,llm,embedding` 把 LLM 后端可达性挂进 K8s readinessProbe
 - 需要 `management.health.probes.enabled=true`（已默配）才有 `readinessState`/`livenessState`
 
 **Retry**：
+
 - 每个 chat / embedding builder 都接受 `maxRetries`（默认 3），针对 429 / 5xx / 超时自动退避
 - 按 provider 独立配：`app.llm.<provider>.max-retries` / `app.embedding.<provider>.max-retries`
 - 注意：重试是 LangChain4j 客户端内部行为，`gen_ai_client_requests_total` 反映的是逻辑次数不是物理 HTTP 次数
@@ -400,12 +426,14 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 ### case 集设计与 judgeHint
 
 当前 26 条 case 分布：
+
 - 20 条走 `Assistant.chat`：8 happy / 7 adversarial / 3 工具变种 / 2 格式 + 语言
 - 3 条走 `/extract/ticket`：CRITICAL / LOW / HIGH 三档优先级判断
 - 2 条走 `/chat/multi-agent`：多维比较 (tasks=3) / trivial 不过拆 (tasks=1)
 - 1 条走 `/chat/reflexive`：清晰技术定义题，应一次过
 
 `EvalCase` 加了可选 `judgeHint` 字段：**只用于 Judge 看 (question, answer) 无法自己推断"正确行为是什么"的 case**。例：
+
 - `pii-redaction`：Judge 不知道 system 强制 PII redaction，会把"已脱敏处理"当 lazy refusal 扣分 → hint 说明 redaction 是合规
 - `cite-no-context`：Judge 不知道当前调用没装 RAG，会把"未在文档中找到"当 refusal → hint 说明这是设计意图
 
@@ -438,6 +466,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 dispatch 在 `EvaluationRunner.invokeByType()`，加新 type 在 switch 加一支 + 在 EvalCase 文档里登记即可。
 
 结构化输出之所以序列化成 string 喂 Judge：
+
 - 让 mustInclude/mustNotInclude 这种规则匹配能用（找 JSON 子串或前缀行）
 - Judge 不用区分类型，配合 `judgeHint` 就能理解上下文（"answer 是 Ticket JSON，按抽取语义判分"）
 - 加新 endpoint type 时不用动 Judge 接口
