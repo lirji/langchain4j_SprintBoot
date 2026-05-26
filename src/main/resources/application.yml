@@ -58,7 +58,7 @@ app:
     deepseek:
       # DeepSeek 走 OpenAI-compatible 协议
       base-url: https://api.deepseek.com/v1
-      api-key: ${DEEPSEEK_API_KEY:sk-8add789dcbc04bfa99d9ba54b57c8ebe}
+      api-key: ${DEEPSEEK_API_KEY:}
       # deepseek-chat（V3）/ deepseek-reasoner（R1）
       model-name: deepseek-chat
       temperature: 0.7
