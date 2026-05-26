@@ -1,0 +1,104 @@
+# Roadmap / 待完善项
+
+项目已经"够生产用"。下面这些是从"能跑"到"完善"的差距，按 ROI 分档。
+每条带工作量估计和**做不做的判断条件** —— 不是 todo 越多越好，是为了避免"觉得该做但没做"的隐性焦虑。
+
+最后更新：2026-05-27（round j 之后）。
+
+---
+
+## A. 真该做（短期内可能踩坑）
+
+**✅ 全部完成于 2026-05-27**。
+
+| 项 | 状态 | 落地说明 |
+| --- | --- | --- |
+| **核心 path 单元测试** | ✅ | 3 个测试类，18 个 case：`MultiAgentServiceTest`（拓扑排序 7 case）+ `AssistantPropertiesTest`（resolve 部分覆盖 6 case）+ `CaseAggregateTest`（统计聚合 5 case）。覆盖最容易回归的算法层 |
+| **Critic 独立 temp=0 ChatModel** | ✅ | `ReflexionConfig.critic()` 改成调 `LlmConfig.buildJudgeChatModel(props)`，复用 Judge 的 trick（不注册成 ChatModel Bean 避免冲突） |
+| **API key 安全化** | ✅ | `application.yml` 里 `DEEPSEEK_API_KEY:sk-...` hardcode 改成 `${DEEPSEEK_API_KEY:}` 空 fallback + 注释告警；**原 key 已轮换** |
+| **eval auto-ingest** | ✅ | 加 `app.eval.auto-ingest: false` yml 开关；`EvaluationRunner` 用 `AtomicBoolean` lazy 触发，第一次 `run` 时 ingest 一次，后续不重复 |
+
+---
+
+## B. 想做有意思（提升上限）
+
+| 项 | 说明 | ROI |
+| --- | --- | --- |
+| **History-aware retrieval** | 用对话历史改写 query 再检索（"那个第二项..."这种代词指向问题）。LangChain4j 有 `QueryTransformer` 接口可挂 | 多轮 RAG 对话质量直接提升一档 |
+| **Query expansion** | 一个 query 扩出 N 个相关 query 并行检索，结果 RRF 融合，提升召回 | 跟现有 hybrid retriever 思路一致，扩展 1 行即可 |
+| **Re-rank 默认开 + 跑一次 eval 对比** | 项目有 `OllamaLlmScoringModel` / `JinaScoringModel` 但默认关，从没量化过收益 | 30 分钟跑 eval 对比 rerank on/off，看 passRate 漂动 |
+| **跨 endpoint 的 stream response** | 现在只有 `/chat/stream` 是 SSE，multi-agent / reflexive / RAG 都是一次性 JSON。生产里多 agent 流要 30+ 秒，用户等不起 | 中（要给 MultiAgentService 加增量回调） |
+| **Chunking 策略优化** | 现在用默认 recursive 300/50，没尝试过 semantic chunking / parent-document retrieval | 中（要 ingest 完跑 eval 对比） |
+
+**做不做的判断条件**：B 看你下一步项目走向 —— 还在钻 prompt + RAG 就做"Re-rank 跑 eval 对比"（最快出价值），符合本项目反复推的"调一处看变化"方法论。
+
+---
+
+## C. 工程化 / 防御性（scale-up 才必要）
+
+| 项 | 触发条件 |
+| --- | --- |
+| 熔断（Resilience4j） | 真上线 vLLM 后偶发 5xx 频繁时 |
+| 限流 | 真有突发流量时 |
+| Provider fallback（主 vLLM 挂切云端） | SLA 要求 99.9%+ |
+| API key → Vault / K8s Secret | 跟运维流程对齐时 |
+| CI 集成（GitHub Actions 跑 eval） | repo 有协作者 + PR 流程时 |
+| Cost tracking dashboard（token → $） | 真开始烧云端 API 钱 |
+
+**做不做的判断条件**：C 是"等真正需要再加"的，提前做就是 YAGNI。每条触发条件明确，等到了再做就行。
+
+---
+
+## D. 现有 prompt 自身还能再调
+
+| 项 | 说明 |
+| --- | --- |
+| **大规模 case 集**（30 → 100+） | 现在大多稳定通过，Judge 信号比较弱。加 adversarial（多语言混合、长输入、模糊指令、刻意误导）让 Judge 真能扣分 |
+| **`format-table` case 设计 bug 修** | 早就发现的 mustInclude 跟模型偏好冲突（要 404 但模型偏给 400/401/403） |
+| **DAG eval 多 case** | 现在只 1 个 DAG case（多 case 才能验证拓扑算法各种形态），应该加菱形依赖、一对多依赖、3 层链 |
+| **few-shot 例子换成 production 数据** | 现有 Extractor / Planner 例子是手写，可以从真实业务案例里挑 3-5 个真实场景 |
+
+**做不做的判断条件**：D 适合 prompt 工程兴趣不减的时候做。当前 eval 信号在大部分 case 都是 1.0，扩 case 集是让 Judge 重新有"扣分空间"的最直接方式。
+
+---
+
+## E. 没做但故意不做（决定记录）
+
+| 项 | 为什么不做 |
+| --- | --- |
+| Web UI | 项目定位是脚手架不是产品，REST API 够了 |
+| 自动 prompt 优化 loop（用 eval 当 reward） | 研究性 > 工程性，没量产价值。学术项目可以试 |
+| 完整的 jailbreak / prompt injection guard | `PiiGuardrail` 够 demo；真要做要专门库（如 NVIDIA NeMo Guardrails / Guardrails AI） |
+| Trace store（统一 query routing + DAG + reflexion 的可视化）| 想做但优先级低，需要新加 trace 数据库 + 前端，工程量大于现有 observability 全套 |
+| OpenTelemetry distributed tracing | Spring Boot 3 内置 Micrometer Tracing 可以挂上，但目前 traceId in MDC 已经够本地调试 |
+| GraphQL endpoint | REST 满足所有用例，加 GraphQL 是 over-engineering |
+
+---
+
+## 推荐路径
+
+按"出现下面这个信号就做对应那个"的方式选：
+
+| 信号 | 该做 |
+| --- | --- |
+| 改 LlmConfig / 装配链时心里没底 | A 的"单元测试" |
+| 反思（`/chat/reflexive`）的 critic 分数对同样答案不稳 | A 的"Critic temp=0" |
+| Repo 准备给协作者 / 截图 / commit 时 | A 的"API key 安全" |
+| `/eval/run` 启动后第一次 RAG case 全 fail | A 的"auto-ingest" |
+| 想知道 rerank 到底值不值得开 | B 的"rerank 跑 eval" |
+| 用户在 multi-agent 等 30s 抱怨 | B 的"stream response" |
+| RAG 多轮对话用户用代词指代时回答跑偏 | B 的"history-aware retrieval" |
+| Eval passRate 总是 ~95-100%，没扣分空间 | D 的"大规模 case 集" |
+| 真上 vLLM 看到偶发 5xx | C 的"熔断" |
+| 真开始烧云端 API 钱 | C 的"cost dashboard" |
+
+没出现的信号就不做。
+
+---
+
+## 关联文档
+
+- 项目历史 → `PROMPT_JOURNEY.md`（看每一轮怎么做的）
+- 已完成的运营基建 → `docs/observability.md`
+- 问答 → `docs/qa.md`
+- 项目导航 → `CLAUDE.md`

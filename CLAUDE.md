@@ -2,6 +2,14 @@
 
 这份文档给在本仓库工作的 Claude Code 使用，描述项目的技术栈、结构、约定与常用命令。
 
+## 配套文档
+
+- `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
+- `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
+- `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
+- `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
+- `docs/grafana-dashboard.json` — 现成的 7 panel dashboard JSON
+
 ## 项目概览
 
 LangChain4j + Spring Boot + Ollama 脚手架，演示四大能力：
@@ -203,6 +211,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | POST | `/chat/reflexive` | Reflexion 自反思：body `{"message":"..."}`，返回最终答案 + 每轮 critique 的 trace |
 | POST | `/chat/multi-agent` | Planner 拆 → 多 Worker 并行 → Synthesizer 汇总；返回 plan + 每个 worker 输出 + final |
 | POST | `/chat/mcp` | 由 MCP server 的工具驱动的对话（需 `app.mcp.enabled=true`） |
+| POST | `/chat/auto` | LLM-as-router：classifier 分类成 RAG/TOOL/CHAT 分别走 Assistant 或 BareAssistant（需 `app.query-router.enabled=true`）；返回 `{decision, reply, classifyMs, answerMs}` |
 | POST | `/eval/run?runs=N` | 跑 `resources/eval/eval-cases.json` 黄金集，每 case 跑 N 次（默认 1）；返回 per-case avg/σ/passRate + 整体 |
 | POST | `/eval/run-cases?runs=N` | body 传 `EvalCase[]` 跑临时集（N 同上） |
 | GET  | `/actuator/health` | Spring Boot Actuator |
@@ -265,6 +274,7 @@ curl -X POST 'localhost:8080/chat/category?chatId=u1&category=manual' \
 | `tone` | `简洁，1–2 句话答完，必要时再展开` | 语气与详尽度 |
 | `citation-policy` | `用 [doc=文件名#片段号] 标注，没检索到就说"资料里没提到"` | RAG 引用规范 |
 | `extra` | `""` | 灰度/A-B 试新指令的位置，例如 `"本轮请用 markdown 列表组织答案"` |
+| `overrides.<provider>.{language,tone,citationPolicy,extra}` | 空 map | 按 provider 部分覆盖；null/缺失字段 fallback 到默认。启动时按 `app.llm.provider` 解析成 `ResolvedAssistantStyle` Bean |
 
 实际调用：
 
@@ -285,7 +295,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 3. **每次只动一个变量**（`tone` / `citation-policy` / `extra` 之一，或换 provider）
 4. 重跑 eval → 看分数 → 跌了就回滚
 
-跨 provider 注意：DeepSeek 中文强但忽略长 system，Claude 偏好 XML 标签（`<context>...</context>`），Gemini tool-calling 触发不积极，Ollama 小模型要更明确的指令。如果需要分 provider 给不同默认值，扩展 `AssistantProperties` 为 `Map<String, AssistantStyle>`，按 `app.llm.provider` 取对应那份。
+跨 provider 注意：DeepSeek 中文强但忽略长 system，Claude 偏好 XML 标签（`<context>...</context>`），Gemini tool-calling 触发不积极，Ollama 小模型要更明确的指令。**这种差异已通过 `app.assistant.overrides.<provider>.*` 支持** —— 启动时按当前 `app.llm.provider` 解析出 `ResolvedAssistantStyle`，所有调用方注入这个 Bean（不再直接用 `AssistantProperties`）。换 provider = 重启。
 
 其他 AiService 的 prompt 现状：
 
@@ -356,11 +366,12 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 **Multi-Agent** `/chat/multi-agent`：
 
-- `Planner` 把问题拆 1–6 个独立子任务（结构化输出，内置 3 例 few-shot + 1 反例锚定粒度）
-- `Worker` 池（`multiAgentExecutor`，4–8 线程）并行执行
+- `Planner` 把问题拆 1–6 个子任务（结构化输出，内置 3 例 few-shot + 2 反例锚定粒度 + 1 例 DAG 用法）；输出含 `dependsOn` 字段
+- **DAG 执行**：`MultiAgentService` 用 Kahn 拓扑排序分层，同层并行（`multiAgentExecutor`，4–8 线程），跨层等待上一层；环检测 → 降级 flat 全并行 + log 警告
+- `Worker` 接受 `(task, upstream)` 两参数：upstream 是上游任务输出拼成的 string，没有依赖时传空串
 - `Synthesizer` 编织（不是拼接）成最终答案；prompt 含 5 条 synthesis rules + 4 条 forbidden anti-patterns + 1 个完整对比例。明令禁止 `Sub-task 1/[t1]/Based on the synthesis...` 等暴露内部 plan 结构的措辞，要求按用户的 mental model 组织（aspect / 维度 / 步骤），结尾给出 takeaway
 - 子线程通过 `MdcCopyingTaskDecorator` 继承 `traceId`，日志能串起来
-- 当前是**无依赖 fan-out**；要做 DAG 串行依赖请扩展 `Plan` 加 `dependencies` 字段并在 `MultiAgentService` 用拓扑序
+- `dependsOn` **默认空**（flat 全并行）：仅当 sub-task 指令字面引用另一个 sub-task 输出时才填（"基于 t1 的结果..."）。普通多维度比较 / 独立研究题继续 flat —— 合成由 `Synthesizer` 统一处理
 
 **Output Guardrails** `@OutputGuardrails(PiiGuardrail.class, maxRetries=2)`：
 

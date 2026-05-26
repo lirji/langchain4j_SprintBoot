@@ -196,6 +196,15 @@
   },
 
   {
+    "id": "multiagent-dag",
+    "type": "multi-agent",
+    "question": "先列出 Java 21 引入的 3 个最重要的语言层面新特性（每个一两句话），然后基于其中对并发编程影响最大的那个，详细解释它的设计动机和典型使用方式。",
+    "mustInclude": ["[deps:", "tasks: 2"],
+    "mustNotInclude": [],
+    "judgeHint": "/chat/multi-agent DAG case。理想 plan 是 2 个 task：t1 列 3 个特性（无 deps）、t2 基于 t1 选 1 个详细展开（dependsOn=[t1]）。EvaluationRunner 序列化时 t2 的依赖会显示成 '[deps: t1]' —— mustInclude 钉这个字面表明 Planner 真的用了 DAG。finalAnswer 应该是先列出特性后聚焦深入解释，逻辑流畅，不是 3 个特性并列。如果模型把它拆 3 个 parallel task（每特性 1 task）或者强行 1 task 是粒度选错，可以扣分。"
+  },
+
+  {
     "id": "synth-no-subtask-leak",
     "type": "multi-agent",
     "question": "对比 HTTP/1.1 和 HTTP/2 在连接复用、头部压缩、多路复用三方面的差异",

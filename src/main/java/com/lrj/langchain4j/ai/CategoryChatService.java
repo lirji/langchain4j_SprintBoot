@@ -1,6 +1,6 @@
 package com.lrj.langchain4j.ai;
 
-import com.lrj.langchain4j.config.AssistantProperties;
+import com.lrj.langchain4j.config.ResolvedAssistantStyle;
 import com.lrj.langchain4j.rag.CategoryContext;
 import org.springframework.stereotype.Service;
 
@@ -15,9 +15,9 @@ import org.springframework.stereotype.Service;
 public class CategoryChatService {
 
     private final Assistant assistant;
-    private final AssistantProperties props;
+    private final ResolvedAssistantStyle props;
 
-    public CategoryChatService(Assistant assistant, AssistantProperties props) {
+    public CategoryChatService(Assistant assistant, ResolvedAssistantStyle props) {
         this.assistant = assistant;
         this.props = props;
     }

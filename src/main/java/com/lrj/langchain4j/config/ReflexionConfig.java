@@ -18,10 +18,19 @@ public class ReflexionConfig {
                 .build();
     }
 
+    /**
+     * Critic 走独立的 temp=0 ChatModel —— 跟 {@code Judge} / {@code QueryClassifier} 同思路。
+     * 评分需要对同一 (question, answer) 多次给出一致分数，否则 {@code ReflexiveService} 的
+     * threshold 比较会假触发/假通过反思迭代。
+     *
+     * <p>不注册成 ChatModel Bean，由 {@link LlmConfig#buildJudgeChatModel} 程序化构造，
+     * 避免和主 chatModel 类型冲突（详见 buildJudgeChatModel 的注释）。
+     */
     @Bean
-    public Critic critic(ChatModel chatModel) {
+    public Critic critic(LlmConfig llmConfig, LlmConfig.LlmProperties props) {
+        ChatModel criticModel = llmConfig.buildJudgeChatModel(props);
         return AiServices.builder(Critic.class)
-                .chatModel(chatModel)
+                .chatModel(criticModel)
                 .build();
     }
 

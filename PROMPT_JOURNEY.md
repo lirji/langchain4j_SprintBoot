@@ -23,8 +23,11 @@
 - [12. Round d：RAG 引用格式强化（ContentInjector + 闭环）](#12-round-drag-引用格式强化contentinjector--闭环)
 - [13. Round g：Synthesizer 编织 not 拼接](#13-round-gsynthesizer-编织-not-拼接)
 - [14. Round h：vLLM 接入 + 生产 hardening（含一个 silent bug）](#14-round-hvllm-接入--生产-hardening含一个-silent-bug)
-- [15. 设计原则总览（跨章节的反复模式）](#15-设计原则总览跨章节的反复模式)
-- [16. 未做完的：剩 4 条生产 hardening + f](#16-未做完的剩-4-条生产-hardening--f)
+- [15. Round i：Query routing —— LLM-as-router 跳过无谓的 RAG](#15-round-iquery-routing--llm-as-router-跳过无谓的-rag)
+- [16. Round j：Multi-agent DAG planner —— 有依赖时按拓扑序分层并行](#16-round-jmulti-agent-dag-planner--有依赖时按拓扑序分层并行)
+- [17. Round f：跨 provider 不同默认 prompt（覆盖 vs 替换）](#17-round-f跨-provider-不同默认-prompt覆盖-vs-替换)
+- [18. 设计原则总览（跨章节的反复模式）](#18-设计原则总览跨章节的反复模式)
+- [19. 未做完的：剩 4 条生产 hardening + eval 运营](#19-未做完的剩-4-条生产-hardening--eval-运营)
 
 ---
 
@@ -1322,17 +1325,306 @@ K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodS
 
 ---
 
-## 15. 设计原则总览（跨章节的反复模式）
+## 15. Round i：Query routing —— LLM-as-router 跳过无谓的 RAG
+
+### 起因
+
+Q1（见 `docs/qa.md`）整理了项目里"谁做决策"的地图，发现"绝大部分路由是代码 / 配置决定，LLM 只在 tool calling / Planner / RAG reranker 3 个地方决策"。当时挂了一条可拓展项：**Query routing —— 用 LLM 做一次轻量分类，决定该走 RAG 还是直接 chat 还是只调工具**。
+
+动机：每次 `/chat` 都强制走 RAG 检索 + tool 槽位都挂着，对"问几点"或"解释一下 DI"这类问题是浪费 —— embedding 跑一遍、retriever 召回几条无关结果、prompt 多塞几个工具描述。
+
+### 关键决策
+
+- **3 档分类** `RAG | TOOL | CHAT` —— 简单粗暴，TOOL 和 CHAT 都走"无 RAG"路径，区分这两档主要是给运维看 metrics
+- **Classifier 走独立 `temp=0` ChatModel** —— 跟 Judge 同思路，同一 query 多次分类应给同样的答案，否则路由会随机分流到不同后端
+- **新 `BareAssistant`（不挂 RetrievalAugmentor）+ 主 Assistant 不动** —— 比 ThreadLocal 标志位简单。两个 AiService 共享同一 chatMemoryProvider，会话连续性保留
+- **`@ConditionalOnProperty(app.query-router.enabled)` 默认关** —— 整套 Bean 不构造，关掉时 `/chat/auto` 返回 503 友好提示，不影响其他 endpoint
+- **不确定时 fallback 到 CHAT** —— prompt 里明令"偏 CHAT"，因为它成本最低，错分到 CHAT 大不了模型自己说"我不知道"，错分到 RAG/TOOL 浪费一轮 round-trip
+- **classifier 错误 → fallback RAG** —— 异常路径保 RAG 最安全（最多多一次 retriever 调用，不会丢功能）
+
+### 改动文件
+
+- `ai/routing/RouteKind.java`（新建）—— 枚举，每档 `@Description` 进 JSON Schema 当分类规则
+- `ai/routing/RouteDecision.java`（新建）—— record `{kind, reason}`，reason 一句中文方便日志和返回
+- `ai/routing/QueryClassifier.java`（新建）—— @AiService 接口，5 例 few-shot + 1 反例（"什么是 RAG" → CHAT，不是 RAG）
+- `ai/routing/BareAssistant.java`（新建）—— 跟 Assistant 同型号但不挂 augmentor
+- `ai/routing/QueryRouterService.java`（新建）—— classify → switch dispatch
+- `config/QueryRoutingConfig.java`（新建）—— `@ConditionalOnProperty` 装配 classifier + BareAssistant
+- `controller/ChatController.java` —— 新增 `/chat/auto` endpoint
+- `application.yml` —— `app.query-router.enabled: false`
+
+### 关键代码
+
+```java
+// RouteKind.java —— @Description 进 JSON Schema 让 LLM 按规则选
+public enum RouteKind {
+    @Description("问题需要检索文档/知识库才能正确回答，比如包含『文档里』『手册』『资料』...")
+    RAG,
+    @Description("问题需要调用工具才能正确回答，比如询问当前时间/日期/距离某天多少天...")
+    TOOL,
+    @Description("纯对话/通用知识/解释概念/写代码示例等 —— 模型自身知识足以回答")
+    CHAT
+}
+```
+
+```java
+// QueryRouterService.java —— 3 阶段流水线
+public RoutedReply route(String chatId, String message) {
+    RouteDecision decision;
+    try {
+        decision = classifier.classify(message);
+    } catch (Exception e) {
+        log.warn("classifier threw, falling back to RAG path", e);
+        decision = new RouteDecision(RouteKind.RAG, "classifier error fallback");
+    }
+    String reply = switch (decision.kind()) {
+        case RAG -> assistant.chat(chatId, /*style*/..., message);
+        // TOOL 和 CHAT 都走 BareAssistant —— 一个变种够了
+        case TOOL, CHAT -> bareAssistant.chat(chatId, /*style*/..., message);
+    };
+    return new RoutedReply(decision, reply, classifyMs, answerMs);
+}
+```
+
+```java
+// QueryRoutingConfig.java —— BareAssistant 程序化构建，不挂 augmentor
+@Bean
+public BareAssistant bareAssistant(ChatModel chatModel,
+                                   ChatMemoryProvider memoryProvider,
+                                   DateTimeTool dateTimeTool) {
+    return AiServices.builder(BareAssistant.class)
+            .chatModel(chatModel)
+            .chatMemoryProvider(memoryProvider)
+            .tools(dateTimeTool)
+            // 故意不传 .retrievalAugmentor(...)
+            .build();
+}
+```
+
+### 量化验证
+
+3 个手动 case，3/3 正确分类：
+
+| query | 分类 | reason | classify + answer |
+| --- | --- | --- | --- |
+| 现在几点？时区 Asia/Shanghai | **TOOL** | 问到当前时间，需要 currentDateTime 工具 | 1126ms + 1826ms（含 tool call） |
+| 根据文档，本项目当前默认的 chat provider 是什么？ | **RAG** | 明确要求按文档回答项目配置 | 729ms + 1212ms |
+| 用一句话解释 dependency injection | **CHAT** | 通用概念解释，模型知识足够 | 918ms + 1194ms |
+
+TOOL case 答案带正确时间 + `finish=TOOL_EXECUTION` 日志；RAG case 答案带 `[doc=project-faq.md#0]`；CHAT case 跳过 RAG 完全没引用。
+
+**但总耗时差不多**（~1900-2950ms） —— DeepSeek API 响应快、本地 Ollama embedding 也快，classifier 没省到时间。这印证了：**对 ollama embedding + 同主模型分类的配置，query routing 是净亏**。真要赚回成本要专门的小 classifier 模型（3B 量级 ~200ms）+ 云 embedding 计费场景。
+
+### 教训
+
+1. **LLM-as-router 不一定值得开**：本地 embedding + 同主模型分类时 classifier 比 RAG 还贵，是净亏。要么换专用小 classifier，要么只在云 embedding + 主对话用大模型的生产场景开。Q2 in `docs/qa.md` 写了完整 ROI 矩阵。
+2. **TOOL 和 CHAT 合并一个变种**：不必为两档各做一个 Assistant —— BareAssistant 跳 RAG 但保留 tools，TOOL/CHAT 都能跑。区分只为运维 metrics，不增加代码。
+3. **分类器要确定性**：跟 Judge 同思路，独立 `temp=0` ChatModel。不然同一 query 多次分类会随机分流到不同后端，eval 没法稳定比对。复用 `LlmConfig.buildJudgeChatModel()`，零新代码。
+4. **错误路径偏向"保留功能"**：classifier 异常 → fallback RAG（最完整功能），不要 fallback BareAssistant（万一是该 RAG 的就丢能力）。Fallback 方向要明确写在文档里，否则后人不知道怎么选。
+5. **同 chatMemoryProvider 共享会话**：BareAssistant 和 Assistant 用同一 chatId 历史，同一会话在两个变种间切换不丢上下文。靠 Spring 的 `ChatMemoryProvider` Bean 共享天然成立。
+
+---
+
+## 16. Round j：Multi-agent DAG planner —— 有依赖时按拓扑序分层并行
+
+### 起因
+
+Multi-agent 早期是纯并行 fan-out：所有 sub-task 同时跑，互不依赖。对多维度比较（"对比 A 和 B 在 X/Y/Z 三方面"）这种场景没问题，但**有真依赖**的场景（"先列出 3 个特性，再基于其中最重要的一个详细展开"）就只能强行拆成"列+展开混在一个 task"，丢失并行性也丢失结构。
+
+### 关键决策
+
+- **`SubTask` 加 `dependsOn: List<String>`** —— 默认空（flat 全并行），只有真依赖才填
+- **Kahn 拓扑排序按层执行** —— 同层并行扔 `multiAgentExecutor`，跨层等上一层完成。比"逐个 task 等 deps"的事件驱动模型简单
+- **环检测 → 降级 flat 全并行 + log 警告**，**不抛异常** —— 业务流量瞬时 plan 出 bug 时丢部分能力（并行变 fan-out）比整个 500 好
+- **Worker 不感知 DAG** —— 只接收 `(task, upstream)` 两参数，调用方拼好 upstream string 传过去。`MultiAgentService` 是唯一懂 DAG 的，Planner / Synthesizer 不用动
+- **Planner few-shot 加 1 正例 + 1 反例**：正例展示真 DAG（"基于 t1 列出的..."字面引用），反例反对滥用（不要把独立维度强行串成链）
+- **EvaluationRunner 序列化显示 `[deps: t1]`** —— eval case 可以用 mustInclude 钉这个字面验证 Planner 真的用了 DAG
+
+### 改动文件
+
+- `ai/multiagent/SubTask.java` —— 加 `dependsOn` + `effectiveDependsOn()` null-safe
+- `ai/multiagent/Worker.java` —— `execute(task)` → `execute(@V task, @V upstream)`
+- `ai/multiagent/Planner.java` —— 加 EXAMPLE 3（真 DAG）+ 反例（不要把多维比较串成链）+ "DAG used SPARINGLY" 规则段
+- `ai/multiagent/MultiAgentService.java` —— 重写：Kahn 拓扑排序 + 按层并行 + upstream 上下文拼装 + 环降级
+- `eval/EvaluationRunner.java` —— 序列化加 deps 标注
+- `eval-cases.json` —— 加 `multiagent-dag` case，mustInclude `["[deps:", "tasks: 2"]`
+
+### 关键代码
+
+```java
+// MultiAgentService.java —— Kahn 拓扑排序按层
+public Run run(String question) {
+    Plan plan = planner.plan(question);
+    List<List<SubTask>> levels = topologicalLevels(plan.tasks());
+    if (levels == null) {
+        log.warn("cycle detected in plan, falling back to flat fan-out");
+        levels = List.of(plan.tasks());
+    }
+    Map<String, WorkerResult> byId = new ConcurrentHashMap<>();
+    List<WorkerResult> ordered = new ArrayList<>();
+    for (List<SubTask> level : levels) {
+        List<CompletableFuture<WorkerResult>> futures = level.stream()
+                .map(t -> CompletableFuture.supplyAsync(() -> runOne(t, byId), executor))
+                .toList();
+        for (var f : futures) {
+            WorkerResult r = f.join();
+            byId.put(r.taskId(), r);
+            ordered.add(r);
+        }
+    }
+    return new Run(plan, ordered, synthesizer.synthesize(question, format(ordered)));
+}
+```
+
+```java
+// Planner.java —— DAG 教学的关键反例
+// Anti-examples (do NOT do these)
+// For "对比 X 在 a, b, c 三方面" do NOT chain as:
+//   t1: 对比 a
+//   t2 [deps: t1]: 对比 b
+//   t3 [deps: t2]: 对比 c
+// Aspects are INDEPENDENT — keep them parallel, no deps.
+```
+
+### 量化验证
+
+**DAG case** —— "先列 Java 21 三特性，再基于其中最影响并发的一个展开"：
+
+```text
+plan.tasks:
+  t1 dependsOn=[]:    列出 Java 21 引入的 3 个最重要的语言层面新特性
+  t2 dependsOn=[t1]:  基于 t1 列出的 3 个特性，挑出对并发编程影响最大的那一个详细展开
+
+执行日志:
+  agent-1 跑 t1 (~3s) → 完成后 agent-2 才开始跑 t2
+  t2 收到 upstream context (token_in 从 98 → 320，多的 222 token 就是 t1 输出)
+  t2 选了 Virtual Threads，详细展开设计动机 + 代码示例
+```
+
+**Flat case 不回归** —— "对比 HTTP/1.1 和 HTTP/2 在连接复用/头部压缩/多路复用三方面"：
+
+```text
+plan.tasks: 3 个全 dependsOn=[]
+agent-1 / agent-3 / agent-4 同一秒齐开 → 完全并行
+```
+
+### 教训
+
+1. **DAG 默认不用，sparingly 才好用**：判断标准是"sub-task 描述里字面引用了另一个 sub-task 输出（'基于 t1 ...'）"。否则别加。合成是 Synthesizer 的事，不是 Planner 的事。
+2. **环检测降级 flat 不抛异常**：业务流量里偶尔 plan 出环就当 flat 跑，丢并行 + log 警告就够了。直接抛会导致整个 endpoint 挂。
+3. **Worker 不感知 DAG**：保留接口简单。`MultiAgentService` 是唯一懂拓扑的，Planner 只关心"要不要填 dependsOn"，Worker 只关心"消化 upstream"。三方各管一段，改一处不牵连其他。
+4. **反例钉滥用**：DAG 最大风险是 Planner 把每个 task 都串成链，退化成单线程顺序执行。Planner prompt 里专门写反例（"对比 X 在 a/b/c" 不要串成 t1→t2→t3）—— 这种"看着合理实则坏"的失败模式必须显式禁止。
+5. **eval 用 mustInclude 钉 deps 字面**：`mustInclude: ["[deps:", "tasks: 2"]` 同时验证拆分粒度（2 个 task）和 DAG 用了（带 deps 标注）。EvaluationRunner 在序列化层把 deps 显式打印出来才能这么 check —— **如果 eval 看不到的字段，就该考虑 serialize 出来给 eval 看**。
+
+---
+
+## 17. Round f：跨 provider 不同默认 prompt（覆盖 vs 替换）
+
+### 起因
+
+`AssistantProperties` 一份默认值用到所有 provider（ollama/openai/anthropic/gemini/deepseek/vllm）。不同 provider 对 prompt 偏好不一样：
+
+- DeepSeek-V3：中文强，但 system prompt 太长会忽略后半段
+- Claude Haiku：偏好 XML 标签（`<fact>...</fact>` 之类）
+- Gemini Flash：tool-calling 触发不积极，要更"诱导"
+- Ollama 小模型：需要更明确的指令 + few-shot 兜底
+
+Round-h 之后这是主线最后一条 prompt 工程项（letter "f"）。
+
+### 关键决策
+
+- **保留 `AssistantProperties` 默认字段 + 加 `Map<String, Override> overrides`** —— 部分覆盖，不是整套替换。null=fallback，空串=真清空
+- **启动时一次性解析 → `ResolvedAssistantStyle` Bean** —— 不在调用时动态查 overrides Map。换 provider = 重启（项目里 provider 本身就是启动期定的）
+- **业务调用方注入 `ResolvedAssistantStyle`，不再依赖 `AssistantProperties`** —— 把"配置长什么样"和"运行时实际用哪份"解耦。后面要做 A/B 流量分桶用不同 style 也只改 `AssistantStyleConfig` 一个文件
+- **不实现"per-call override"** —— 同一 chat 流不应该中途换风格；那是 A/B 测试场景，应该走单独的 endpoint 或 header
+
+### 改动文件
+
+- `config/AssistantProperties.java` —— 加 `Override` 内部类（4 字段全 nullable）+ `overrides` Map + `resolve(provider)` 方法
+- `config/ResolvedAssistantStyle.java`（新建）—— immutable record
+- `config/AssistantStyleConfig.java`（新建）—— `@Bean ResolvedAssistantStyle` 启动时解析
+- 4 个调用方迁移：`ChatController` / `CategoryChatService` / `EvaluationRunner` / `QueryRouterService`
+- `application.yml` —— `overrides: {}` 默认空 + 4 个 provider 的注释例子
+
+### 关键代码
+
+```java
+// AssistantProperties.java —— 部分覆盖逻辑
+public ResolvedAssistantStyle resolve(String provider) {
+    Override ov = overrides == null ? null : overrides.get(provider);
+    if (ov == null) {
+        return new ResolvedAssistantStyle(language, tone, citationPolicy, extra);
+    }
+    return new ResolvedAssistantStyle(
+            ov.getLanguage() != null ? ov.getLanguage() : language,
+            ov.getTone() != null ? ov.getTone() : tone,
+            ov.getCitationPolicy() != null ? ov.getCitationPolicy() : citationPolicy,
+            ov.getExtra() != null ? ov.getExtra() : extra);
+}
+```
+
+```java
+// AssistantStyleConfig.java —— 启动时一次解析
+@Bean
+public ResolvedAssistantStyle resolvedAssistantStyle(AssistantProperties props,
+                                                     LlmConfig.LlmProperties llmProps) {
+    String provider = llmProps.getProvider();
+    ResolvedAssistantStyle style = props.resolve(provider);
+    boolean overridden = props.getOverrides() != null && props.getOverrides().containsKey(provider);
+    log.info("ResolvedAssistantStyle for provider={} (override={})", provider, overridden);
+    return style;
+}
+```
+
+```yaml
+# application.yml 示例
+app:
+  assistant:
+    language: "中文"
+    tone: "简洁，1–2 句话答完，必要时再展开"
+    overrides:
+      anthropic:
+        tone: "简洁，1–2 句；分组事实时用 <fact>...</fact> XML 标签"
+      gemini:
+        extra: "如果有可用工具能直接给答案，立刻调用；不要先猜再决定"
+      ollama:
+        tone: "简洁，每句独立成段，避免长复合句；最多 3 句"
+      deepseek:
+        tone: "口语化，像跟同事讲技术，必要时用类比；2–3 句话"
+```
+
+### 量化验证
+
+同样问题「什么是 Spring DI？」，DeepSeek 用默认 vs override：
+
+| 配置 | 回答 |
+| --- | --- |
+| 默认 tone（简洁 1-2 句） | "Spring DI 是 Spring 框架的核心机制，它让对象之间的依赖关系由容器在运行时自动注入..." (2 个正式长句) |
+| override tone（口语化 2-3 句） | "**简单说就是**对象不再自己 new 依赖... **比如你有个 Service 需要用到 Dao**，不用自己 new DaoImpl()，只要声明一下..." (口语 + 代码举例 + 3 句话) |
+
+启动日志确认：`ResolvedAssistantStyle for provider=deepseek (override=true)`。CLI 参数也能临时覆盖：`--app.assistant.overrides.deepseek.tone='口语化,...'`。
+
+### 教训
+
+1. **部分覆盖 > 整套替换**：override 里只列要改的字段，其他 fallback 到默认。改个 tone 不用复制 citationPolicy 那一长串 yaml。
+2. **null vs 空串语义要清晰**：null（或缺失）= 沿用默认；空串 = 真清空。文档写明，否则用户配置时容易踩。
+3. **启动时解析 > 运行时查 Map**：换 provider 反正要重启，没必要每次调用查 Map。一次解析后 `ResolvedAssistantStyle` 是 immutable record，零状态零并发问题。
+4. **配置层和使用层解耦**：`AssistantProperties` 描述"可能怎么配"，`ResolvedAssistantStyle` 是"本进程实际用哪份"。业务调用方只见 Resolved，不知道 overrides 存在 —— 这给后续"A/B 流量按 traffic % 切 style"留了扩展点（只改 `AssistantStyleConfig` 一处）。
+5. **默认空 Map 不破坏 baseline**：`overrides: {}` 默认值让所有 provider 共享默认 style，跟此前行为完全一致。要打开某个 override 单独配那个 provider 即可，没有迁移成本。
+
+---
+
+## 18. 设计原则总览（跨章节的反复模式）
 
 把这一路浮出来的几个反复出现的模式抽出来：
 
-### 15.1 Structured Output > 自由文本
+### 18.1 Structured Output > 自由文本
 
 任何时候模型要给 "结构化" 的东西，**用 record + `@Description`，不要 prompt 里写"请用 JSON"**。框架强制 JSON Schema，模型几乎不会跑偏。
 
 适用：Critic 评分、Extractor、Planner Plan、Judge Judgment。
 
-### 15.2 Few-shot 示范判断，不是格式
+### 18.2 Few-shot 示范判断，不是格式
 
 格式被 `@Description` 锁了，例子用来展示**判断**：
 
@@ -1343,7 +1635,7 @@ K8s readinessProbe 可以直接挂这个 endpoint，failureThreshold=3 + periodS
 
 **反例（anti-example）杠杆比正例还高**：明确「不要这样」+ 错误示范，模型更受教。Synthesizer 进一步演化出 **good + bad 配对**：bad answer 后面加一句"why it's bad"，把 anti-pattern 跟反例显式绑定。
 
-### 15.3 客观 vs 主观：规则匹配 + LLM 双层分工
+### 18.3 客观 vs 主观：规则匹配 + LLM 双层分工
 
 eval harness 的核心模式：
 
@@ -1352,7 +1644,7 @@ eval harness 的核心模式：
 
 不混淆 = 不让 LLM 重复审已经验证过的、稳定的字段。Judge 的 prompt 也明令禁止重复审 MUST_*。
 
-### 15.4 LLM-as-judge 三要素
+### 18.4 LLM-as-judge 三要素
 
 要让 Judge 真正可用做对照实验：
 
@@ -1360,7 +1652,7 @@ eval harness 的核心模式：
 2. **注入 ground truth**：today（系统时钟）/ clock-tool（系统能力）/ judgeHint（领域规则）等 Judge 自己看 (Q, A) 没法知道的信息
 3. **限定 scope**：明令"不要重复判 MUST_*"、"`Default to 1.0` do not be stingy"，避免主观通胀扣分
 
-### 15.5 Bug 是 eval 钉出来的
+### 18.5 Bug 是 eval 钉出来的
 
 整个 session 至少 6 个 bug 是 eval 揭穿的：
 
@@ -1373,7 +1665,7 @@ eval harness 的核心模式：
 
 **eval 是 prompt 的回归告警器**。改任何 prompt 都要靠 eval 监控漂移，否则改了反而坏只能靠用户投诉发现。
 
-### 15.6 调一处看变化的工程化
+### 18.6 调一处看变化的工程化
 
 每改一处 prompt 都跑 eval：
 
@@ -1384,7 +1676,7 @@ eval harness 的核心模式：
 
 **每次只动一个变量**——不然分数变了不知道是谁的功劳。
 
-### 15.7 Spring/LangChain4j 集成的踩坑模式
+### 18.7 Spring/LangChain4j 集成的踩坑模式
 
 - 多个同类型 Bean 共存：LangChain4j `@AiService` 不认 `@Primary`、`autowireCandidate=false`、`EXPLICIT` 模式会副作用关掉自动发现。**最后办法是不把第二个注册成 Bean**，从外部直接构造。
 - HTTP client SPI 冲突：classpath 有两套时 `HttpClientBuilderLoader` 抛 conflict，要 system property 显式锁定。
@@ -1393,7 +1685,7 @@ eval harness 的核心模式：
 - **Actuator readiness group 引用 `readinessState` 要先 `management.health.probes.enabled=true`**：K8s 部署模式默认开启，本地启动不开就抛 "contributor does not exist"。
 - **starter 接管的横切关注，绕过 starter 后会静默失效**：`MetricsChatModelListener` 之前靠 starter 自动 wire，我们改成手动建 ChatModel 后 listener 没人接管 —— metrics 静默丢了几个月。见 15.12。
 
-### 15.8 渐进式拆分
+### 18.8 渐进式拆分
 
 每个抽象都从「简单粗暴硬编码」起步，发现真的需要可配时再加：
 
@@ -1403,7 +1695,7 @@ eval harness 的核心模式：
 
 避免提前抽象。
 
-### 15.9 prompt + backend 注入必须成对（来自 d）
+### 18.9 prompt + backend 注入必须成对（来自 d）
 
 很多 prompt 规则只有在 backend 配合的情况下才可能被模型遵守。典型例子：
 
@@ -1413,7 +1705,7 @@ eval harness 的核心模式：
 
 **单边动 prompt 是空许诺**。每条强约束都要问"backend 配套了吗？没配套的话模型怎么知道？"
 
-### 15.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
+### 18.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
 
 合成 / 整合 / 摘要类任务，模型默认会偷懒 → 直接拼接 worker 输出 / 罗列要点 / 用源 ID 当标题。光说"compose a coherent answer"是空话，必须：
 
@@ -1423,7 +1715,7 @@ eval harness 的核心模式：
 
 更广义的模式：**模型默认行为是"安全但偷懒"。要它做高质量工作，必须显式禁止偷懒路径**。
 
-### 15.11 OpenAI-compatible 是 LLM 推理服务的事实标准（来自 h）
+### 18.11 OpenAI-compatible 是 LLM 推理服务的事实标准（来自 h）
 
 vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Together / Fireworks / DeepSeek / Moonshot —— 全都暴露 OpenAI 兼容的 `/v1/chat/completions` 和 `/v1/embeddings`。一个 `OpenAiCompatProps` + base-url 切换就能接 N 家。新接一家通常是改一行 yml，不是工程任务。
 
@@ -1431,7 +1723,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 
 唯一例外：Anthropic（自己协议 `messages.create`）和 Google Gemini（自己 SDK 协议），这两家因为生态优势没投靠 OpenAI 协议，要独立 builder。
 
-### 15.12 横切关注每次重构都要 grep 验证（来自 h 的 silent bug）
+### 18.12 横切关注每次重构都要 grep 验证（来自 h 的 silent bug）
 
 `MetricsChatModelListener` 在 round-1 后**默默失效了几个月**：
 
@@ -1448,24 +1740,44 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 
 **反制**：每次改装配链路（特别是绕过框架自动装配的时候），grep 一遍这些组件的注入点确认还在生效。或者写 integration test 验证 listener 触发计数。这次是为了挂 Grafana 翻代码才发现 —— 没有这个外部需求，bug 能藏到第一次生产事故。
 
+### 18.13 LLM-as-router 何时值得开（来自 i）
+
+加一次 LLM 分类调用换"跳过 RAG / 减少工具槽位"的好处，**不是无脑的赢**。ROI 取决于：
+
+| 场景 | 净收益 |
+| --- | --- |
+| 本地 Ollama embedding + 主模型同样本地 | **亏**（classifier 比 RAG 还贵） |
+| 云 embedding + 主对话小模型 | **接近持平** |
+| 云 embedding + 主对话大模型 + 大量非 RAG 流量 | **赚** |
+| 流量混合不均（80% 是闲聊，20% 才要 RAG） | **赚** |
+
+通用反制：**LLM-as-router 的成本必须显著低于被它绕过的成本**。最常见做法：classifier 走专用小模型（3B 量级），主对话走大模型。本项目实测在 DeepSeek + 本地 Ollama embedding 配置下没省到时间，所以默认关 —— 文档（`docs/qa.md` Q2）写明 ROI 矩阵避免后人盲目开。
+
+### 18.14 DAG sparingly + 反例钉滥用（来自 j）
+
+DAG 最大风险不是不会用，而是**滥用** —— Planner 把每个 task 都串成链，退化成单线程顺序执行，完全失去 multi-agent 价值。**强约束规则不靠 prompt 字面禁止，要靠反例展示"看似合理实则坏"的模式**：
+
+> For "对比 X 在 a, b, c 三方面" do NOT chain as:
+> `t1: 对比 a`、`t2 [deps: t1]: 对比 b`、`t3 [deps: t2]: 对比 c`。
+> Aspects are INDEPENDENT — keep them parallel, no deps.
+
+判断 DAG 是否真有必要的硬标准：**写 sub-task description 时是否必须用 "基于 t1 的输出" 这种字面引用**？如果不需要引用就能写完 description，就不该有依赖。合成是 Synthesizer 的事。
+
+这条跟 15.10（编织 not 拼接）是同一类反例策略 —— **模型默认行为是"安全但偷懒/过度"**，要做正确决策必须显式列错误模式 + 配错误示例。
+
+### 18.15 配置层与运行时层解耦（来自 f）
+
+`AssistantProperties` 描述"可能怎么配"（包括 overrides 这种结构化扩展），`ResolvedAssistantStyle` 是"本进程实际用哪份"。业务调用方只见 Resolved，不知道 overrides 存在 —— 这给后续"按 traffic % 分桶 A/B 切 style"留了扩展点（只改 `AssistantStyleConfig` 一个文件，业务调用方零感知）。
+
+适用条件：**配置形态可能演化（加 override / 加 A/B / 加按 chatId 路由），但调用方接口不变**。一旦预感到这种"配置侧灵活但调用侧稳定"，就该立这层 "Resolved" Bean。
+
+跟 18.8（渐进式拆分）平衡：不是一上来就分层，是发现"配置侧要灵活了"时才升级。AssistantProperties 起步直接被用了好几轮，到 round f 才抽 Resolved。
+
 ---
 
-## 16. 未做完的：剩 4 条生产 hardening + f
+## 19. 未做完的：剩 4 条生产 hardening + eval 运营
 
-主线 prompt 工程（a/b/c/d/e/g）都做完了。round h 把生产 hardening 的前 3 条（重试 / 健康检查 / Prometheus+Grafana）也做了。剩下：
-
-### f. 跨 provider 不同默认 prompt
-
-**目标**：`AssistantProperties` 改成 `Map<String, AssistantStyle>`，按 `app.llm.provider` 取对应那份。比如：
-
-- DeepSeek：擅长中文，但对 long system prompt 敏感
-- Claude：偏好 XML 标签（`<context>...</context>` 之类）
-- Gemini：tool-calling 触发不积极，工具描述要更诱导
-- Ollama 小模型：要更明确的指令 + few-shot 兜底
-
-**为什么暂缓**：目前生产只跑 DeepSeek，没有多 provider 路由需求。提前做就是 YAGNI。
-
-**触发条件**：真要在生产分 provider 路由时（或要做 provider 对比评测）再做。
+主线 prompt 工程 7 条（a/b/c/d/e/f/g）+ round h（vLLM 生产化 + 重试/健康/可观测）+ round i（query routing）+ round j（DAG planner）都做完了。剩下的全是运营 / 工程化：
 
 ### 剩下 4 条生产 hardening
 
@@ -1484,7 +1796,13 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 - **eval auto-ingest**：现在 `/eval/run` 前要手动 `/rag/ingest`（不然 RAG case 召回空）。加个 yml 开关 `app.eval.auto-ingest=true` 让 runner 启动时自动跑一次
 - **测试用例 mustInclude review**：`format-table` case 要 `["404"]` 但 DeepSeek 倾向给 400/401/403 三件套（更全面）—— 测试设计 bug，要么改 mustInclude 要么改题面要求必须含 404
 - **CI 集成**：GitHub Actions 跑 `/eval/run?runs=3`，passRate 跌就 fail PR
-- **大规模 case 集**：现在 30 case 全 1.0 太顺利，加些刻意 hard 的 adversarial（多语言混合 / 长输入 / 模糊指令）让 Judge 真正扣分
+- **大规模 case 集**：现在 30+ case 大部分稳定通过，加些刻意 hard 的 adversarial（多语言混合 / 长输入 / 模糊指令）让 Judge 真正扣分
+- **DAG eval 多 case**：当前只有 1 个 `multiagent-dag` case，应该再加 2-3 个不同形态（一对多依赖、菱形依赖等）
+
+### 想做但优先级低
+
+- **自动 prompt 优化 loop**：用 eval 分数当 reward，让 LLM 自己迭代 system prompt（小型 prompt-tuning 闭环）。研究性而非工程性
+- **可解释路由 trace**：把 query routing 决策、multi-agent DAG 路径、reflexion attempts 串成统一 trace 视图，方便 debug。需要新加 trace store
 
 ---
 
@@ -1494,14 +1812,16 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 
 | 组件 | 状态 |
 | --- | --- |
-| Assistant 主对话 | 5 段结构 + 4 个 @V 参数化（language / tone / citationPolicy / extra） |
+| Assistant 主对话 | 5 段结构 + 4 个 @V 参数化（language / tone / citationPolicy / extra）+ 支持 per-provider override（round f） |
 | DateTimeTool 工具描述 | WHEN-USE / WHEN-NOT / PARAM 三段式 + @P |
 | Critic 评分 | 3 维结构化（correctness / completeness / clarity）+ mainIssue + 加权聚合 |
 | Extractor | 3 例 few-shot 覆盖典型/边界/反例 + priority rubric |
-| Planner | 3 例 few-shot + 1 反例 + 拆分规则 |
+| Planner | 3 例 few-shot + 1 真 DAG 例 + 2 反例（包括 DAG 滥用反例）+ 拆分规则 |
+| Worker | 接受 `(task, upstream)` 双参数，upstream 拼上游 task 输出当 context |
 | Synthesizer | 5 条 rules + 4 条 anti-patterns + good/bad 配对例子 |
 | RAG 引用 | `TaggedSourceContentInjector` + citationPolicy 闭环（输出 `[doc=文件名#N]`） |
-| 其他 AiService（Judge / Worker / Answerer / Critic） | Judge 已多轮迭代，其余按需 |
+| QueryClassifier（round i） | 3 档分类（RAG/TOOL/CHAT），5 例 few-shot + 1 反例，独立 temp=0 ChatModel，默认关 |
+| 其他 AiService（Judge / Answerer / Critic） | Judge 已多轮迭代，其余按需 |
 
 ### LLM Provider 层
 
@@ -1512,19 +1832,30 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 | API key | 环境变量；vLLM 默认无校验给 `EMPTY` 占位 |
 | Embedding provider（独立） | `ollama`（默认本地）/ `openai-compat`（生产推荐，可走 vLLM/TEI/云 OpenAI） |
 | Embedding 维度切换 | 必须 drop 重建持久化向量库（InMemory 无所谓） |
-| 跨 provider prompt 适配 | 未做（共用同一份默认值） |
+| 跨 provider prompt 适配（round f） | ✅ `app.assistant.overrides.<provider>` 部分覆盖 → 启动时解析 `ResolvedAssistantStyle` Bean |
+| Query routing（round i） | ✅ 可选开关 `app.query-router.enabled`，`POST /chat/auto` 走 classify → 分流 Assistant/BareAssistant |
+
+### Multi-Agent 层
+
+| 维度 | 状态 |
+| --- | --- |
+| Planner | 1-6 sub-task，DAG 可选（round j） |
+| 调度 | Kahn 拓扑排序按层并行；环检测降级 flat + log 警告 |
+| Worker | `(task, upstream)` 接受上游 context，自身不感知 DAG |
+| 并发 | `multiAgentExecutor` 4-8 线程 + MDC 透传 |
+| 反例钉滥用 | Planner prompt 反例：多维比较不要串成 deps 链 |
 
 ### Eval Harness 层
 
 | 维度 | 状态 |
 | --- | --- |
-| case 数 | 30（20 chat + 3 extract + 3 multi-agent + 1 reflexive + 3 RAG） |
+| case 数 | 31（20 chat + 3 extract + 4 multi-agent 含 1 DAG + 1 reflexive + 3 RAG） |
 | Judge | 独立 ChatModel temp=0；注入 today + clock-tool 提示 + judgeHint |
 | 客观字段 | 规则匹配（mustInclude / mustNotInclude → contains） |
 | Multi-run | `?runs=N`，per-case avg/σ |
 | 跨 endpoint | type dispatch 4 种 |
 | 并行 | `evalExecutor` 默认 4 线程，2.5× 加速 |
-| 最近实测（30 cases × 2 runs） | 59/60 (98.3%)，唯一 fail 是 `format-table` 测试设计 bug |
+| DAG 验证 | EvaluationRunner 序列化 `[deps: t1]`，mustInclude 钉这个字面验真 |
 | auto-ingest / CI 集成 | 未做 |
 
 ### 生产 Hardening 层（round h）
@@ -1565,4 +1896,12 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 12. Health check 别真发 LLM —— TCP 探测够了，烧 token 都不可接受
 13. 维度切换 = 必须重建持久化向量库 —— 高密度告警
 
+**编排层（路由 / DAG / Provider 适配）做完之后的反思**：
+
+14. LLM-as-router 不是无脑赢 —— classifier 成本必须显著低于被它绕过的成本，否则就是给 token 计数器送钱
+15. DAG 默认不用，sparingly 才好用 —— 滥用 DAG 退化成单线程顺序执行，比 flat 还慢；强约束规则要靠反例展示"看着合理实则坏"的模式
+16. 配置层 vs 运行时层解耦 —— 当配置形态可能演化（per-provider override / A/B / 按 chatId 路由）但调用方接口不变时，立 "Resolved" Bean，业务调用方零感知
+
 最大的发现：**eval 不只是 prompt 工程的验证工具，它本身就是发现 prompt bug 的主力**。整个 session 至少 7 个 bug（Java 库用错、测试题面互斥、prompt 误套用、Assistant 算错、RAG minScore 太严、doc 写法不利于召回、listener 静默失效）都是非业务流程发现的 —— 跑 eval / 翻代码做 hardening / 加 dashboard 才钉出来。如果 eval 和可观测性还没建到可信，prompt 工程和生产部署都是凭感觉。
+
+走到 round j 终于把"模型推理"和"业务编排"两层分别打磨完。**下一步如果还要前进，重点是 trace store / 自动 prompt 优化 / 大规模 case 集这种运营级工作 —— 工程基建已经齐了**。
