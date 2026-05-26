@@ -1,0 +1,159 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "title": "LangChain4j Demo · LLM Observability",
+  "uid": "langchain4j-demo-llm",
+  "version": 1,
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "tags": ["llm", "langchain4j"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "provider",
+        "label": "Provider",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(gen_ai_client_requests_total, provider)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {"text": "All", "value": "$__all"}
+      },
+      {
+        "name": "model",
+        "label": "Model",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(gen_ai_client_requests_total{provider=~\"$provider\"}, model)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (provider, model) (rate(gen_ai_client_requests_total{provider=~\"$provider\", model=~\"$model\"}[1m]))",
+          "legendFormat": "{{provider}} / {{model}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "reqps"}}
+    },
+    {
+      "id": 2,
+      "title": "Latency p50 / p95 / p99 (seconds)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, provider) (rate(gen_ai_client_operation_duration_seconds_bucket{provider=~\"$provider\", model=~\"$model\"}[5m])))",
+          "legendFormat": "p50 · {{provider}}",
+          "refId": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, provider) (rate(gen_ai_client_operation_duration_seconds_bucket{provider=~\"$provider\", model=~\"$model\"}[5m])))",
+          "legendFormat": "p95 · {{provider}}",
+          "refId": "P95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, provider) (rate(gen_ai_client_operation_duration_seconds_bucket{provider=~\"$provider\", model=~\"$model\"}[5m])))",
+          "legendFormat": "p99 · {{provider}}",
+          "refId": "P99"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 3,
+      "title": "Token Usage Rate (tokens/s)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (provider, model, type) (rate(gen_ai_client_token_usage_total{provider=~\"$provider\", model=~\"$model\"}[1m]))",
+          "legendFormat": "{{provider}} / {{model}} · {{type}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Error Rate by Type (errors/s)",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (provider, error) (rate(gen_ai_client_errors_total{provider=~\"$provider\", model=~\"$model\"}[1m]))",
+          "legendFormat": "{{provider}} · {{error}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Total Token Spend (last 24h)",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 0, "y": 16, "w": 8, "h": 6},
+      "targets": [
+        {
+          "expr": "sum by (type) (increase(gen_ai_client_token_usage_total{provider=~\"$provider\"}[24h]))",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Health: Chat / Embedding",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 8, "y": 16, "w": 8, "h": 6},
+      "description": "需 actuator 暴露的 health-up gauge；如未挂可用 /actuator/health JSON 监控替代",
+      "targets": [
+        {"expr": "up{job=~\"langchain4j.*\"}", "legendFormat": "{{instance}}", "refId": "A"}
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Request Count by Provider (last 5m)",
+      "type": "bargauge",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"x": 16, "y": 16, "w": 8, "h": 6},
+      "targets": [
+        {
+          "expr": "sum by (provider) (increase(gen_ai_client_requests_total{provider=~\"$provider\"}[5m]))",
+          "legendFormat": "{{provider}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

@@ -37,8 +37,9 @@ src/main/
 └── java/com/lrj/langchain4j/
     ├── LangChain4jApplication.java       启动类
     ├── config/
-    │   ├── LangChain4jConfig.java        ContentRetriever（direct / candidate）+ ScoringModel + RetrievalAugmentor
-    │   ├── LlmConfig.java                按 app.llm.provider 装配 ChatModel/StreamingChatModel（ollama/openai/anthropic/gemini/deepseek）
+    │   ├── LangChain4jConfig.java        ContentRetriever（direct / candidate）+ ScoringModel + RetrievalAugmentor + TaggedSourceContentInjector
+    │   ├── LlmConfig.java                按 app.llm.provider 装配 ChatModel/StreamingChatModel（ollama/openai/anthropic/gemini/deepseek/vllm）
+    │   ├── EmbeddingModelConfig.java     按 app.embedding.provider 装配 EmbeddingModel（ollama/openai-compat），跟 chat provider 解耦
     │   ├── ChatMemoryConfig.java         ChatMemoryStore（InMemory / Redis）+ ChatMemoryProvider
     │   └── EmbeddingStoreConfig.java     条件化 InMemory / PGVector / Milvus / Chroma / Qdrant / Doris
     ├── store/
@@ -102,6 +103,7 @@ mvn spring-boot:run
 | `anthropic` | `ANTHROPIC_API_KEY` | `claude-haiku-4-5` | 可改 `claude-sonnet-4-6` / `claude-opus-4-7` |
 | `gemini` | `GOOGLE_AI_GEMINI_API_KEY` | `gemini-2.0-flash` | Google AI Studio key |
 | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` | OpenAI 兼容协议，已预设 `base-url=https://api.deepseek.com/v1`；可换 `deepseek-reasoner`(R1) |
+| `vllm` | `VLLM_MODEL`（必填）/ `VLLM_API_KEY`（vLLM 默认不校验，默 `EMPTY`） | 留空，必须显式设 | **生产推荐**。OpenAI 兼容协议，默认 K8s service DNS（`http://vllm-chat.default.svc.cluster.local:8000/v1`）。复用 `OpenAiChatModel`，零新依赖 |
 
 ```bash
 # OpenAI
@@ -118,9 +120,41 @@ DEEPSEEK_API_KEY=sk-... mvn spring-boot:run -Dspring-boot.run.arguments=--app.ll
 ```
 
 注意：
-- **EmbeddingModel 始终走 Ollama**（`langchain4j.ollama.embedding-model.*`），切换 chat provider 不会影响 RAG 已入库的向量；要换 embedding 模型需重建向量库（维度必须匹配）。
+- **EmbeddingModel 由独立开关装配**（`app.embedding.provider`），跟 chat provider 完全解耦 —— 见下面 "切换 Embedding Provider" 节。切换 chat 不影响 RAG 已入库的向量。
 - `application.yml` 里**不要**再添加 `langchain4j.ollama.chat-model` / `langchain4j.<provider>.chat-model` 块，否则 LangChain4j starter 会和 `LlmConfig` 各创建一个 `ChatModel` Bean → 启动冲突。所有 chat/streaming 配置都走 `app.llm.<provider>.*`。
 - Tool calling 在 Gemini / DeepSeek-V3 上行为略有差异；`@AiService` 接口代码无需改。
+
+切换 Embedding Provider（`app.embedding.provider` 可选 `ollama | openai-compat`，默认 `ollama`）：
+
+| provider | 用途 | 配置块 |
+| --- | --- | --- |
+| `ollama`（默认） | 本地开发 / 小规模 | `app.embedding.ollama.{base-url, model-name, timeout}`；默认 `nomic-embed-text`（768 维） |
+| `openai-compat` | **生产推荐**：vLLM 跑 embed / TEI / 云 OpenAI | `app.embedding.openai-compat.{base-url, api-key, model-name, timeout}`；推荐 `BAAI/bge-m3`（1024 维多语言） |
+
+**重要：换 embedding = 换向量维度 = 必须重建持久化向量库**。`nomic-embed-text`(768) → `bge-m3`(1024) 切换前要：
+1. drop 已有的 PGVector 表 / Milvus 集合 / Chroma collection / Doris 表
+2. 重启应用，让 starter 按新维度建表
+3. 重新 `POST /rag/ingest` 入库
+
+InMemoryEmbeddingStore 重启即丢，无所谓。
+
+vLLM 生产示例（同集群 chat + embedding 两个 deployment）：
+```bash
+# chat
+kubectl run vllm-chat --image=vllm/vllm-openai:latest -- \
+  --model meta-llama/Llama-3.1-8B-Instruct --port 8000
+# embedding
+kubectl run vllm-embed --image=vllm/vllm-openai:latest -- \
+  --model BAAI/bge-m3 --task embed --port 8000
+
+# 应用 yml 设
+# app.llm.provider=vllm
+# app.llm.vllm.base-url=http://vllm-chat.default.svc.cluster.local:8000/v1
+# app.llm.vllm.model-name=meta-llama/Llama-3.1-8B-Instruct
+# app.embedding.provider=openai-compat
+# app.embedding.openai-compat.base-url=http://vllm-embed.default.svc.cluster.local:8000/v1
+# app.embedding.openai-compat.model-name=BAAI/bge-m3
+```
 
 切换向量库（`app.rag.store` 可选 `in-memory | pgvector | milvus | chroma | qdrant | doris`）：
 ```bash
@@ -307,11 +341,24 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - 流式 `chatStream` 暂未挂 guardrail（流式 guardrail 会缓冲整段，按需要再加）
 - 输入侧用 `@InputGuardrails(SomeInputGuardrail.class)` 同理
 
-**Observability**：
+**Observability**（详见 `docs/observability.md`）：
 - `LoggingChatModelListener` — 每次 LLM 调用打一行 `model / duration_ms / tokens_in/out/total`
 - `MetricsChatModelListener` — 自己写的最小实现（`langchain4j-micrometer` 还未发到 Maven Central），用 `MeterRegistry` 直接打点：`gen_ai.client.requests`（counter）、`gen_ai.client.operation.duration`（timer）、`gen_ai.client.token.usage`（counter，按 input/output 拆 tag）、`gen_ai.client.errors`
+- **listener 通过 `LlmConfig` 构造器注入 `List<ChatModelListener>` 灌到每个 chat builder**。之前注释说 "starter 自动 wire"，但项目改成手动建 ChatModel 后绕开了 starter，metrics 其实没记录 —— 这是 hardening 时修的 silent bug
 - `TraceIdFilter` — 每个 HTTP 请求生成 8 位 `traceId` 进 MDC、回写 `X-Trace-Id` 响应头；日志 pattern 已带 `[%X{traceId:-}]`
 - Prometheus 抓取：`/actuator/prometheus`
+- Grafana dashboard：`docs/grafana-dashboard.json` 提供 7 个 panel（req rate / latency p50p95p99 / token spend / error rate by type / etc），导入即用
+
+**Health Check**：
+- `LlmHealthIndicator` + `EmbeddingHealthIndicator` 自定义 Actuator indicator，对当前 provider 的 base-url 做 1s TCP 探测（不烧 token、不需要 api-key 有效）
+- 暴露在 `/actuator/health/llm` `/actuator/health/embedding` 单独可查
+- `management.endpoint.health.group.readiness.include=readinessState,llm,embedding` 把 LLM 后端可达性挂进 K8s readinessProbe
+- 需要 `management.health.probes.enabled=true`（已默配）才有 `readinessState`/`livenessState`
+
+**Retry**：
+- 每个 chat / embedding builder 都接受 `maxRetries`（默认 3），针对 429 / 5xx / 超时自动退避
+- 按 provider 独立配：`app.llm.<provider>.max-retries` / `app.embedding.<provider>.max-retries`
+- 注意：重试是 LangChain4j 客户端内部行为，`gen_ai_client_requests_total` 反映的是逻辑次数不是物理 HTTP 次数
 
 ## MCP（Model Context Protocol）
 

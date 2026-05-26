@@ -10,6 +10,9 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 
 import java.util.concurrent.Executor;
 
+/**
+ * 评分配置
+ */
 @Configuration
 public class EvalConfig {
 

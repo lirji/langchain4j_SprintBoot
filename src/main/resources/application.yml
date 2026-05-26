@@ -18,14 +18,12 @@ spring:
 
 app:
   llm:
-    # ollama | openai | anthropic | gemini | deepseek
-    # 切 provider 只影响 chat/streaming-chat 模型；embedding（向量库维度相关）始终用 Ollama。
+    # ollama | openai | anthropic | gemini | deepseek | vllm
+    # 切 provider 只影响 chat/streaming-chat；embedding 由 app.embedding.provider 独立控制。
     provider: ollama
     ollama:
       base-url: http://localhost:11434
       model-name: llama3.1
-      # RAG 用 embedding；切换 chat provider 不影响这里
-      embedding-model-name: nomic-embed-text
       temperature: 0.7
       timeout: PT60S
       log-requests: true
@@ -58,10 +56,41 @@ app:
     deepseek:
       # DeepSeek 走 OpenAI-compatible 协议
       base-url: https://api.deepseek.com/v1
-      api-key: ${DEEPSEEK_API_KEY:}
+      api-key: ${DEEPSEEK_API_KEY:sk-8add789dcbc04bfa99d9ba54b57c8ebe}
       # deepseek-chat（V3）/ deepseek-reasoner（R1）
       model-name: deepseek-chat
       temperature: 0.7
+      timeout: PT60S
+      log-requests: false
+      log-responses: false
+    vllm:
+      # vLLM 走 OpenAI-compatible 协议；生产推荐（PagedAttention + continuous batching）
+      # K8s 部署：填 service DNS（http://<svc>.<ns>.svc.cluster.local:8000/v1）
+      # 本地起 vLLM 调试可改成 http://localhost:8000/v1
+      base-url: http://vllm-chat.default.svc.cluster.local:8000/v1
+      # vLLM 默认不校验 api-key，留 EMPTY 占位即可（require() 不接受空串）
+      api-key: ${VLLM_API_KEY:EMPTY}
+      # 必填：vLLM 启动时 --model 传的那个，比如 meta-llama/Llama-3.1-8B-Instruct / Qwen/Qwen2.5-7B-Instruct
+      model-name: ${VLLM_MODEL:}
+      temperature: 0.7
+      timeout: PT120S
+      log-requests: false
+      log-responses: false
+
+  embedding:
+    # ollama（默认，本地开发）| openai-compat（生产推荐，走 vLLM/TEI/云 API）
+    # 切 provider = 换向量维度 = 必须 drop 重建持久化向量库（InMemoryEmbeddingStore 无所谓）
+    provider: ollama
+    ollama:
+      base-url: http://localhost:11434
+      model-name: nomic-embed-text     # 768 维
+      timeout: PT60S
+    openai-compat:
+      # 生产示例：vLLM 单独跑 embedding 模型（vllm serve BAAI/bge-m3 --task embed）
+      # 或者 TEI（Text Embeddings Inference）/ 云端 OpenAI
+      base-url: http://vllm-embed.default.svc.cluster.local:8000/v1
+      api-key: ${VLLM_EMBED_API_KEY:EMPTY}
+      model-name: BAAI/bge-m3          # 1024 维，多语言
       timeout: PT60S
       log-requests: false
       log-responses: false
@@ -196,7 +225,18 @@ management:
         include: health,info,metrics,prometheus
   endpoint:
     health:
-      show-details: when-authorized
+      # always 让 K8s probe / 运维直接看到每个 component 详情；actuator 端口通常只对内网开放
+      show-details: always
+      show-components: always
+      # 把 llm / embedding 加进 readiness group，让 K8s readinessProbe 能感知 LLM 后端可达性
+      group:
+        readiness:
+          include: readinessState,llm,embedding
+  health:
+    # 启用 Spring Boot 的 LivenessState/ReadinessState 健康指标（K8s 部署模式默认开启，
+    # 本地启动需要显式打开，不然上面 group.readiness.include 里的 readinessState 找不到）
+    probes:
+      enabled: true
 
 logging:
   level:
