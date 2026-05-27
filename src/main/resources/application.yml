@@ -167,6 +167,21 @@ app:
       correctness: 0.4
       completeness: 0.4
       clarity: 0.2
+
+  multi-agent:
+    replan:
+      # Plan-and-Execute 闭环：Synthesizer 出最终答案后跑 Critic 评分，
+      # 加权聚合 < threshold → 让 Replanner 看着上一轮 plan/answer/mainIssue 出新 plan，
+      # 重跑 DAG。默认关 —— 开启会额外多 1 次 Critic + 可能 1 次 Replanner + 一整轮 worker fan-out。
+      enabled: false
+      threshold: 0.75
+      # 上限 = 多少次"额外"重规划（首次执行不计入）。常见值 1；2 已经接近极限，更多说明 plan 写崩
+      max-replans: 1
+      # 跟 reflexion 同款 3 维加权，独立配置便于未来分别调整
+      weights:
+        correctness: 0.4
+        completeness: 0.4
+        clarity: 0.2
   mcp:
     enabled: false
     # stdio | http

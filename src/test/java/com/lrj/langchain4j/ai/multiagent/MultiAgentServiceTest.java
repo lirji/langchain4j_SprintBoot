@@ -13,7 +13,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class MultiAgentServiceTest {
 
-    private final MultiAgentService svc = new MultiAgentService(null, null, null, Runnable::run);
+    // topologicalLevels 是纯函数，跟所有 AiService / Critic / Props 无关——全喂 null。
+    private final MultiAgentService svc = new MultiAgentService(
+            null, null, null, null, null, null, Runnable::run);
 
     @Test
     void emptyTasks_returnsEmptyLevels() {
