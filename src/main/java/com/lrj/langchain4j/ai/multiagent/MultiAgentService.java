@@ -1,9 +1,13 @@
 package com.lrj.langchain4j.ai.multiagent;
 
+import dev.langchain4j.service.TokenStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.io.IOException;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -86,6 +90,79 @@ public class MultiAgentService {
 
         String finalAnswer = synthesizer.synthesize(question, formatted);
         return new Run(plan, ordered, finalAnswer);
+    }
+
+    /**
+     * SSE 流式版本：按阶段 emit 事件。事件 names：
+     * <ul>
+     *   <li>{@code plan} — 全部子任务的 plan 一次性发出（含 dependsOn）</li>
+     *   <li>{@code worker-result} — 每个 worker 完成时立即 emit（不等同层其他 worker）</li>
+     *   <li>{@code synthesis-token} — Synthesizer 流式 token，前端可立刻渲染</li>
+     *   <li>{@code done} — 全部完成，最终全文一并发一次（方便客户端收口）</li>
+     *   <li>{@code error} — 任何阶段异常都 emit + completeWithError</li>
+     * </ul>
+     *
+     * <p>Worker 仍非流式（多 worker 同时流 token 会混乱）—— 这里的核心收益是
+     * Synthesizer 那 10-20s 一次性等变成 token-by-token 立刻看到。
+     */
+    public void runStream(String question, SseEmitter emitter) {
+        try {
+            Plan plan = planner.plan(question);
+            log.info("planner produced {} sub-tasks (stream)", plan.tasks().size());
+            emitter.send(SseEmitter.event().name("plan").data(plan));
+
+            List<List<SubTask>> levels = topologicalLevels(plan.tasks());
+            if (levels == null) {
+                log.warn("cycle detected (stream), falling back to flat fan-out");
+                levels = List.of(plan.tasks());
+            }
+            Map<String, WorkerResult> byId = new ConcurrentHashMap<>();
+            List<WorkerResult> ordered = new ArrayList<>(plan.tasks().size());
+            for (List<SubTask> level : levels) {
+                List<CompletableFuture<WorkerResult>> futures = level.stream()
+                        .map(t -> CompletableFuture.supplyAsync(() -> runOne(t, byId), executor))
+                        .toList();
+                for (CompletableFuture<WorkerResult> f : futures) {
+                    WorkerResult r = f.join();
+                    byId.put(r.taskId(), r);
+                    ordered.add(r);
+                    safeSend(emitter, "worker-result", r);
+                }
+            }
+
+            String formatted = ordered.stream()
+                    .map(r -> "[" + r.taskId() + "] " + r.description() + "\n→ " + r.result())
+                    .collect(Collectors.joining("\n\n"));
+
+            TokenStream tokens = synthesizer.synthesizeStream(question, formatted);
+            tokens
+                    .onPartialResponse(token -> safeSend(emitter, "synthesis-token", token))
+                    .onCompleteResponse(resp -> {
+                        // 全文一并发一次，方便客户端做最终落盘 / metric 计算
+                        String text = resp.aiMessage() != null ? resp.aiMessage().text() : "";
+                        safeSend(emitter, "done", new Run(plan, ordered, text));
+                        emitter.complete();
+                    })
+                    .onError(err -> {
+                        log.error("synthesis stream error", err);
+                        safeSend(emitter, "error", err.getMessage());
+                        emitter.completeWithError(err);
+                    })
+                    .start();
+        } catch (Exception e) {
+            log.error("runStream pre-synthesis error", e);
+            safeSend(emitter, "error", e.getMessage());
+            emitter.completeWithError(e);
+        }
+    }
+
+    private static void safeSend(SseEmitter emitter, String event, Object data) {
+        try {
+            emitter.send(SseEmitter.event().name(event).data(data));
+        } catch (IOException e) {
+            // emitter 可能已被客户端关闭；不当作硬错，让外层逻辑继续
+            // （不可恢复的话 onError / completeWithError 会兜底）
+        }
     }
 
     private WorkerResult runOne(SubTask t, Map<String, WorkerResult> upstreamResults) {

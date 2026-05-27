@@ -24,11 +24,11 @@
 
 | 项 | 说明 | ROI |
 | --- | --- | --- |
-| **History-aware retrieval** | 用对话历史改写 query 再检索（"那个第二项..."这种代词指向问题）。LangChain4j 有 `QueryTransformer` 接口可挂 | 多轮 RAG 对话质量直接提升一档 |
-| **Query expansion** | 一个 query 扩出 N 个相关 query 并行检索，结果 RRF 融合，提升召回 | 跟现有 hybrid retriever 思路一致，扩展 1 行即可 |
+| ~~**History-aware retrieval**~~ | ✅ 完成于 2026-05-27：装 LangChain4j 内置 `CompressingQueryTransformer` + 自实现 10 行 `ChainedQueryTransformer` 让 history-aware 和 expansion 能 chain（顺序：compress→expand）。实测本项目 corpus 小 + nomic-embed-text 收益不显著，跟 expansion 同类。见 docs/qa.md Q7 | ~~小~~ |
+| ~~**Query expansion**~~ | ✅ 完成于 2026-05-27：装 LangChain4j 内置 `ExpandingQueryTransformer`，`app.rag.query-expansion.{enabled,n}` 默认关。实测本项目 corpus 小 + nomic-embed-text 对同义改写已经包容，**baseline 和 expansion 召回到一样的 chunk**。真正受益场景：大 corpus + 模糊 query + 跨语言。见 docs/qa.md Q6 | ~~小~~ |
 | **Re-rank 默认开 + 跑一次 eval 对比** | 项目有 `OllamaLlmScoringModel` / `JinaScoringModel` 但默认关，从没量化过收益 | 30 分钟跑 eval 对比 rerank on/off，看 passRate 漂动 |
-| **跨 endpoint 的 stream response** | 现在只有 `/chat/stream` 是 SSE，multi-agent / reflexive / RAG 都是一次性 JSON。生产里多 agent 流要 30+ 秒，用户等不起 | 中（要给 MultiAgentService 加增量回调） |
-| **Chunking 策略优化** | 现在用默认 recursive 300/50，没尝试过 semantic chunking / parent-document retrieval | 中（要 ingest 完跑 eval 对比） |
+| ~~**跨 endpoint 的 stream response**~~ | ✅ 完成于 2026-05-27：加 `/chat/multi-agent/stream` + `/chat/reflexive/stream`，SSE 按阶段 emit `plan` / `worker-result` / `synthesis-token` / `done`（multi-agent）和 `attempt-start` / `answer-token` / `critique` / `done`（reflexive）。Worker / Critic 仍非流式（结构化输出 + 多 worker 交错难处理）。见 docs/qa.md Q5 | ~~中~~ |
+| ~~**Chunking 策略优化**~~ | ✅ 完成于 2026-05-27：加 `MarkdownHeaderSplitter`（按 `##` 切节，超长 fallback 到 recursive）+ yml 配置化 `app.rag.chunking.{strategy,max-chars,overlap}`。**实测对本项目结构化 markdown 收益显著**：同一 query 答出 provider 数从 2 → 5（完整召回整个 LLM Provider section）。6 个单元测试。见 docs/qa.md Q8 | ~~中~~ |
 
 **做不做的判断条件**：B 看你下一步项目走向 —— 还在钻 prompt + RAG 就做"Re-rank 跑 eval 对比"（最快出价值），符合本项目反复推的"调一处看变化"方法论。
 

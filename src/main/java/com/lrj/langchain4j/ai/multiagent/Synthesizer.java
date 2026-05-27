@@ -1,6 +1,7 @@
 package com.lrj.langchain4j.ai.multiagent;
 
 import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.TokenStream;
 import dev.langchain4j.service.UserMessage;
 import dev.langchain4j.service.V;
 
@@ -19,7 +20,8 @@ import dev.langchain4j.service.V;
  */
 public interface Synthesizer {
 
-    @SystemMessage("""
+    /** 抽成常量是为了 {@link #synthesize} 和 {@link #synthesizeStream} 共用同一份 prompt。 */
+    String SYSTEM_PROMPT = """
             You weave several specialist worker answers into a single coherent reply
             to the user's ORIGINAL question. Your job is composition + judgment, not
             concatenation.
@@ -75,8 +77,9 @@ public interface Synthesizer {
              Sub-task 1: PostgreSQL has B-tree, Hash, GiST ... MySQL uses B+Tree ...
              Sub-task 2: PostgreSQL defaults to READ COMMITTED ... MySQL defaults to REPEATABLE READ ..."
             (Reasons it's bad: leaks sub-task structure, no merge, no narrative, no closing takeaway.)
-            """)
-    @UserMessage("""
+            """;
+
+    String USER_TEMPLATE = """
             ORIGINAL QUESTION:
             {{question}}
 
@@ -84,6 +87,20 @@ public interface Synthesizer {
             {{answers}}
 
             Write the final synthesized answer now. Do not narrate your synthesis process.
-            """)
+            """;
+
+    @SystemMessage(SYSTEM_PROMPT)
+    @UserMessage(USER_TEMPLATE)
     String synthesize(@V("question") String question, @V("answers") String answers);
+
+    /**
+     * 流式版本：同 prompt + 同参数，返回 {@link TokenStream}。Multi-agent 合成是用户感知
+     * 最长的一步（10-20s+），token-by-token 流出来可以让前端立刻开始渲染，不用等全部完成。
+     *
+     * <p>需要 {@code MultiAgentConfig} 给 Synthesizer builder 额外传 {@code streamingChatModel}
+     * 才会生效（默认 builder 只挂 chatModel 不挂 streaming）。
+     */
+    @SystemMessage(SYSTEM_PROMPT)
+    @UserMessage(USER_TEMPLATE)
+    TokenStream synthesizeStream(@V("question") String question, @V("answers") String answers);
 }

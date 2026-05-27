@@ -10,6 +10,346 @@
 
 ---
 
+## Q8. Chunking 策略到底重不重要？跟 expansion / rerank 比哪个收益大？
+
+> 问于 2026-05-27
+
+### 背景
+
+加了 query-expansion 和 history-aware 之后实测对本项目 corpus 收益不显著（Q6 / Q7）。chunking 策略呢？默认 `recursive(300, 50)` 按字符硬切，能不能换 markdown-header 策略提升召回？
+
+### A
+
+**Chunking 是本项目 RAG 链路里收益最显著的优化** —— 远超 expansion 和 history-aware。原因：本项目文档（`project-faq.md` / `eval-spec.md`）是结构化 markdown，每个 `##` section 是一个完整主题（"支持的 LLM Provider"、"ChatMemory 配置"等）。`recursive(300, 50)` 把 section 切断在字符 300 处，导致一个主题的内容分散在多个 chunk 里，retriever 召回部分信息。
+
+#### 实测对比
+
+同样问题 `本项目支持哪些 chat provider？`：
+
+| 策略 | 召回结果 | 答案完整度 |
+| --- | --- | --- |
+| `recursive(300, 50)` | 引用 `[doc=project-faq.md#0][doc=project-faq.md#2]` | 只列 **ollama / deepseek** 2 个 provider |
+| `markdown-header(max=600)` | 引用整个 "## 支持的 LLM Provider" section | 完整 **5 个 provider**（ollama / openai / anthropic / gemini / deepseek） |
+
+文档原文有 5 个 provider 的完整列表，但 recursive 把它切断了，retriever 只召回到一半。markdown-header 整段保留就完整召回。
+
+#### 收益排序（本项目 corpus）
+
+| 优化 | 实测收益 |
+| --- | --- |
+| **chunking 改 markdown-header** | **显著**：召回完整度从 40% → 100% |
+| query-expansion | 不显著（小 corpus 单 query 已经够好） |
+| history-aware | 不显著（小 corpus 改写后召回也不变） |
+| rerank（未量化）| 待测 |
+
+这说明对**结构化 markdown 文档**，**chunking 是召回质量的天花板** —— chunk 切错了，后续 expansion / rerank 都救不回（它们提的是"在已有候选里的精度"，不是"补全 chunk"）。
+
+#### markdown-header 的实现要点
+
+```java
+public List<TextSegment> split(Document document) {
+    // (?m) multiline + lookahead 保留 heading 在 section 开头
+    String[] sections = document.text().split("(?m)(?=^##+ )");
+
+    for (String raw : sections) {
+        String section = raw.strip();
+        if (section.isEmpty()) continue;
+
+        Metadata meta = baseMeta.copy();
+        meta.put("index", String.valueOf(idx));
+        meta.put("section", extractTitle(section));
+
+        if (section.length() <= maxCharsPerSection) {
+            out.add(TextSegment.from(section, meta));
+        } else {
+            // section 太长 → fallback 到 recursive 在 section 内切，沿用 section metadata
+            out.addAll(fallbackForLongSection.split(Document.from(section, meta)));
+        }
+    }
+    return out;
+}
+```
+
+关键点：
+
+- **regex `(?m)(?=^##+ )`**：`(?m)` 让 `^` 匹配行首，`(?=...)` 正向先行断言保留 `##` 在切分后的 section 开头（不消耗）
+- **匹配 `##+`（两个或更多井号）后接空格而非 `#+` 后接空格**：刻意跳过单 `#` 一级标题（通常是文档名/H1，整个文档就一个，不该当分隔点）
+- **超长 section fallback 到 recursive**：避免一个 `##` section 巨大（比如 README 那种）成为 1 个 embed 不下的 chunk
+- **metadata 注入 `section` 标题**：人工排查检索结果时一眼看到"哦这条来自《支持的 LLM Provider》"，比看 chunk 索引号清楚
+
+#### 什么时候用哪个
+
+| 场景 | 选 |
+| --- | --- |
+| 结构化 markdown 文档（README / FAQ / 技术规范） | **markdown-header** |
+| 任意纯文本 / PDF / Word（无 markdown 结构） | recursive（fallback） |
+| 长法律合同 / 论文（按"条款"或"章节"分） | 写一个 `LegalClauseSplitter` 类似的自定义 splitter |
+| 代码文件（按 class / function 分） | LangChain4j 有 `DocumentByXxxSplitter` 系列，没合适的就自己写 |
+
+通用模式：**chunk 边界应该跟文档原本的语义边界对齐**。markdown 的语义边界是 heading，代码是 class/function，法律文档是条款。强行用字符数硬切是"无知优化"。
+
+#### 几个延伸方向（roadmap 里没列）
+
+- **Hierarchical / parent-child chunking**：embed 小 chunk（precision），但 retrieve 时返回 parent chunk（更多 context）。LangChain4j 1.13 没内置，要自己实现
+- **Semantic chunking**：按 embedding 相似度滑动窗口，相邻句子语义相近的合并。需要先 embed 句子，比基于规则的 chunking 贵很多
+- **Multi-modal chunking**：图片 + 文字混排时按 caption / figure 切。本项目不涉及
+
+参考代码：`rag/MarkdownHeaderSplitter.java`、`rag/RagIngestionService.java`（按 yml strategy 装配），`src/test/java/.../MarkdownHeaderSplitterTest.java`（6 个 case）。
+
+---
+
+## Q7. History-aware retrieval 跟 expansion 怎么组合？
+
+> 问于 2026-05-27
+
+### 背景
+
+加了 expansion 之后又加 history-aware，**两个都是 QueryTransformer**，但 LangChain4j 的 `DefaultRetrievalAugmentor` 只接单个 transformer。怎么让两个能同时生效？顺序敏感吗？
+
+### A
+
+自实现一个 `ChainedQueryTransformer`（10 行）把多个 transformer 串成一个：前一个的输出 `Collection<Query>` 逐个喂下一个，结果 flat 起来。
+
+#### 关键：顺序敏感
+
+必须 **compress 先，expand 后**：
+
+```text
+原 query "它跟 IoC 啥区别" + history
+   ↓ CompressingQueryTransformer (1 LLM call)
+1 个 self-contained query "Spring DI 跟 Spring IoC 啥区别"
+   ↓ ExpandingQueryTransformer (1 LLM call)
+N 个变体: ["DI 和 IoC 概念区别", "Spring 依赖注入 vs 控制反转", "IoC 容器和 DI 的关系"]
+   ↓ DefaultQueryRouter
+N 路并行检索
+   ↓ DefaultContentAggregator (RRF)
+top-k 候选
+```
+
+颠倒（expand 先 compress 后）就毫无意义 —— expander 看到带代词的原 query 扩出 N 个一样有歧义的变体，compressor 再去对每一个分别拼 history 反而把上下文搞混。
+
+#### 配置组合
+
+```yaml
+app:
+  rag:
+    history-aware:
+      enabled: true     # 多轮对话场景必开
+    query-expansion:
+      enabled: true     # 大 corpus + 模糊 query 才开
+      n: 3
+    rerank:
+      enabled: true     # 召回提升后用 rerank 收口
+      type: jina
+```
+
+成本是每条 query 多 2-3 次 LLM call（compress + expand + rerank 各 1+N 次）。
+
+#### 实现要点
+
+- **`ChainedQueryTransformer` 自实现 10 行**：把 list of transformers 按序应用，每步 flat。LangChain4j 内部接口 `Collection<Query> transform(Query)` 天然支持 1→N 输出，flat 拼起来即可
+- **Bean 注入用 `@Qualifier` + `required=false`**：分别拿 compressing / expanding 两个可选 Bean，按固定顺序组装。两个都 null → 不挂 transformer；只一个 → 直接用单个不包 chain；两个都有 → 包 ChainedQueryTransformer
+- **`CompressingQueryTransformer` 不要传 chatMemoryProvider**：它从 `Query.metadata().chatMemoryId()` 自己拿（LangChain4j AiService 拦截时已经注入）。只需要传 chatModel
+- **Compressor 和 expander 都用主 ChatModel**：跟 Judge / classifier 不一样，这两个不要 temp=0 —— compress 需要语义理解、expand 需要多样性，主模型 temp=0.7 都合适
+- **`@ConditionalOnProperty` 默认关**：跟 query-router 同思路
+
+#### 实测发现：本项目 corpus 收益不显著
+
+| 多轮场景 | baseline T2 | history-aware T2 |
+| --- | --- | --- |
+| T1 「本项目用什么 ChatMemory 存储？」 | 召回 ChatMemory 段 ✓ | 召回 ChatMemory 段 ✓ |
+| T2 「它默认的窗口大小是多少？」 | 「未在文档中找到」 | 「未在文档中找到」 |
+
+History-aware 的 compressor 真跑了（log 多一次 `llm-request messages=1`），但召回结果跟 baseline 一样。**因为本项目小 corpus + nomic-embed-text + 项目文档把"默认窗口"写成"默认上限 20 条消息"，跨概念语义距离大，compressor 改写后的 query 仍命中不了**。
+
+这跟 expansion 那次的发现（Q6）是同一类：**功能挂上 ≠ 召回提升**。要真正受益需要：
+
+- 大 corpus（>1000 文档）
+- 真正多轮对话场景（代词指代频繁）
+- corpus 内容跟 query 措辞接近
+
+#### 什么时候必须开 history-aware
+
+- 用户在多轮中频繁用代词 / 省略主语（"那个怎么改"、"它支持吗"）
+- RAG 索引的文档跟用户 query 用同套术语 —— compressor 改写才有意义
+- 业务对召回准确性敏感（如客服系统）
+
+什么时候**不**开：
+
+- 单轮 chat 场景（每个 query 独立）
+- corpus 跟 query 措辞完全不同（compressor 改写也救不回）
+
+参考代码：`rag/ChainedQueryTransformer.java`、`config/LangChain4jConfig.java`（`compressingQueryTransformer` Bean + `composeTransformers` 顺序组装）。
+
+---
+
+## Q6. Query expansion 什么时候真有用？
+
+> 问于 2026-05-27
+
+### 背景
+
+`app.rag.query-expansion.enabled=true` 开了之后，原 query 会被 LLM 扩成 n 个变体，多路召回 → RRF 融合。直觉上应该提升召回质量，但实测在本项目 corpus 上**baseline 跟 expansion 召回到一样的 chunk**。什么场景才真有差距？
+
+### A
+
+Expansion 跟 query-router（Q2）的 ROI 故事是同一类 —— **classifier / expander 都是多花 1 次 LLM call 换某种"理论收益"，要看 baseline 已经多好**。
+
+#### 实测两组 case（DeepSeek + Ollama nomic-embed-text + 2 篇 .md，10 segments）
+
+| query | baseline | expansion(n=3) | 差异 |
+| --- | --- | --- | --- |
+| 「本项目预置的语言模型服务是哪个？」 | `Ollama [doc=#0][doc=#1]` | `Ollama [doc=#0][doc=#1]` | 召回完全一致 |
+| 「本系统的 AI 后端默认是什么？」（故意用文档没有的"AI 后端"措辞） | `Ollama [doc=#0]` | `Ollama [doc=#0]` | 召回完全一致 |
+
+**两组都没差**。说明 nomic-embed-text 对"chat provider ↔ 语言模型服务 ↔ AI 后端"这种同义跳跃已经很包容了。
+
+#### 什么场景 expansion 才真有用
+
+| 场景 | 为什么 |
+| --- | --- |
+| 大 corpus（>1000 文档）相关 chunk 占比低 | 单 query 召回 top-k 可能漏掉真相关的；扩 3 个变体多路召回提升 recall |
+| 模糊 / 短 query（"那个 bug"、"配置怎么改"） | LLM 扩展能补充上下文，让 vector 命中更准 |
+| 多 sub-question 单 query（"对比 A 和 B 的性能 + 价格"） | expander 拆成 "A 的性能"、"B 的性能"、"A vs B 价格"，分别召回再融合 |
+| 跨语言（用户中文问 + 英文文档） | expander 可以补一个英文 query 变体提升召回 |
+
+#### 什么场景不要开
+
+- 小 corpus（<100 文档），embedding 召回已经足够覆盖
+- query 已经包含文档原文关键词（"根据文档第 3 节..."）
+- 延迟敏感场景 —— expansion 加 ~1-2s LLM call
+- 主对话用大模型 + expansion 也用大模型 → 成本翻倍但收益不显著
+
+#### Expansion 跟 rerank 的区别
+
+| 维度 | Expansion | Rerank |
+| --- | --- | --- |
+| 提升什么 | **召回**（让相关 chunk 进候选池） | **精度**（已召回的候选挑最相关） |
+| 多 LLM call | 1 次（expand 时） | N 次（N 个候选各打 1 次分） |
+| 跟另一个互斥？ | **不互斥**，叠加效果最好 | 同上 |
+| 适合 | 大 corpus / 模糊 query | 召回足够但 noise 多 |
+
+理想的生产 RAG pipeline：**expansion → 多路召回 → 大 candidate-size（如 30）→ rerank top-k（如 5）→ inject 给 LLM**。本项目都支持，按 yml 开关组合即可：
+
+```yaml
+app:
+  rag:
+    query-expansion:
+      enabled: true
+      n: 3
+    rerank:
+      enabled: true
+      candidate-size: 30
+      type: jina  # 云 API 快，需要 JINA_API_KEY
+```
+
+#### 关键决策
+
+- **复用 LangChain4j 内置 `ExpandingQueryTransformer`**：不自己写，零代码，配置即用。少踩 prompt 设计的坑
+- **classifier ChatModel 用主 ChatModel（非 temp=0）**：跟 Judge / QueryClassifier 不同 —— expander 不要求确定性，反而想要多样性（n=3 应该是 3 个不同变体，不是 3 份相同）。所以用主模型 temp=0.7 OK
+- **`@ConditionalOnProperty` 默认关**：跟 query-router 同思路，需要明确权衡才开
+
+参考代码：`config/LangChain4jConfig.java`（`expandingQueryTransformer` Bean + `retrievalAugmentor` 注入逻辑），`application.yml` `app.rag.query-expansion.*`。
+
+---
+
+## Q5. Multi-agent / Reflexive 怎么做 SSE 流式？
+
+> 问于 2026-05-27
+
+### 背景
+
+`/chat/multi-agent` 一次性返回 JSON，但流程是 Plan(~2s) → Workers(并行 ~3-8s/level) → Synthesizer(~10-20s)，**用户感知主要被 Synthesizer 那一截一次性等卡住**。`/chat/reflexive` 同理：每轮 Answerer 几秒 + Critic 几秒，多轮迭代用户等 30s+ 没反馈。
+
+### A
+
+加 SSE 变体 endpoint `/chat/multi-agent/stream` 和 `/chat/reflexive/stream`，按阶段 emit 命名事件。Worker / Critic 这种结构化输出步骤仍非流式（多 worker token 交错难处理；Critic 结构化输出本来就不适合 stream），核心收益在 **Synthesizer 和 Answerer 的最终文本** —— 这两个本身就是大段 free-text，token-by-token 流出来对前端友好。
+
+#### Multi-agent 事件流
+
+```text
+event:plan
+data:{"tasks":[{"id":"t1","description":"...","dependsOn":[]},{"id":"t2","dependsOn":["t1"]}]}
+
+event:worker-result
+data:{"taskId":"t1","description":"...","result":"完整结果"}
+
+event:worker-result
+data:{"taskId":"t2","description":"...","result":"完整结果"}
+
+event:synthesis-token
+data:HTTP
+
+event:synthesis-token
+data: 状态码
+
+... (Synthesizer 流式吐 token)
+
+event:done
+data:{"plan":{...},"workerResults":[...],"finalAnswer":"全文"}
+```
+
+实测 48 个 synthesis-token + 1 个 done。前端每个 token 立即渲染，最后 done 兜底全文（用于落盘、metrics）。
+
+#### Reflexive 事件流
+
+```text
+event:attempt-start
+data:1
+
+event:answer-token
+data:Spring
+
+event:answer-token
+data: Boot
+
+... (Answerer 流式吐 token)
+
+event:critique
+data:{"n":1,"answer":"完整 answer","aggregate":0.95,"correctness":0.9,...,"mainIssue":"n/a"}
+
+event:done
+data:{"finalAnswer":"...","attempts":[...],"acceptedByThreshold":true}
+```
+
+如果 critique 不过阈值，会继续：
+
+```text
+event:attempt-start
+data:2
+
+event:answer-token   # 这一轮是 improve 不是 answer
+...
+
+event:critique
+data:{"n":2,...}
+```
+
+直到通过或达到 maxAttempts。
+
+#### 实现的几个关键点
+
+- **`Synthesizer` 和 `Answerer` 各加一个 TokenStream 返回的方法**（同 prompt 抽成常量复用，避免在两个方法间复制大段 system prompt）
+- **配置层挂 `streamingChatModel`**：`AiServices.builder(...).chatModel(cm).streamingChatModel(scm).build()` —— 缺了就 NullPointerException
+- **`Worker` 仍非流式**：多 worker token 交错难处理，且 Worker 输出要完整才能传给下游 task（DAG 依赖）。Worker 完成时直接 emit 整段 `worker-result`
+- **`Critic` 仍非流式**：结构化输出（JSON Schema 锁字段）本来就不适合 stream
+- **CountDownLatch 把 TokenStream 转阻塞**：reflexive 多轮需要"answer 写完 → 调 critic → 拿到分 → improve"严格顺序，但 TokenStream 本身是 async。用 `CountDownLatch` + `AtomicReference<Throwable>` 包装让上层逻辑保持同步流，不引入 reactive 链路
+- **`safeSend` 包 `IOException`**：SSE 客户端可能随时关闭连接，emit 失败不能直接抛 —— 否则 reflexive 的 multi-attempt 流会中途崩溃。捕获后让外层 try/catch 兜底
+- **`SseEmitter(180_000L)` timeout**：multi-agent 最坏 30s+，给 3 分钟超时
+
+#### 什么时候用 stream，什么时候用 non-stream？
+
+| 场景 | 用哪个 |
+| --- | --- |
+| 前端 chat UI（用户在等） | stream，体感关键 |
+| 后端服务调用、批处理、eval | non-stream，简单可观测 |
+| 想拿到结构化 `plan` / `workerResults` 对象 | stream `done` 事件也含完整对象，或非 stream |
+| 真要省总耗时 | 都一样，stream 只省"用户感知延迟"，不省 wall-clock |
+
+参考代码：`ai/multiagent/Synthesizer.java`（双方法）、`ai/multiagent/MultiAgentService.runStream()`、`ai/reflexion/Answerer.java`、`ai/reflexion/ReflexiveService.chatReflexiveStream()`。
+
+---
+
 ## Q4. 跨 provider 的 prompt 差异怎么处理？
 
 > 问于 2026-05-26

@@ -13,7 +13,14 @@ import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.model.jina.JinaScoringModel;
 import dev.langchain4j.model.scoring.ScoringModel;
+import com.lrj.langchain4j.rag.ChainedQueryTransformer;
 import dev.langchain4j.rag.DefaultRetrievalAugmentor;
+import dev.langchain4j.rag.query.transformer.CompressingQueryTransformer;
+import dev.langchain4j.rag.query.transformer.ExpandingQueryTransformer;
+import dev.langchain4j.rag.query.transformer.QueryTransformer;
+
+import java.util.ArrayList;
+import java.util.List;
 import dev.langchain4j.rag.RetrievalAugmentor;
 import dev.langchain4j.rag.content.aggregator.ContentAggregator;
 import dev.langchain4j.rag.content.aggregator.DefaultContentAggregator;
@@ -128,12 +135,51 @@ public class LangChain4jConfig {
      * {@code @AiService} 自动发现见到 RetrievalAugmentor 后就不再单独装 ContentRetriever Bean，
      * 所以 directContentRetriever / candidateContentRetriever 现在是这个 augmentor 的依赖而非直接被 AiService 用。
      */
+    /**
+     * Query expansion：开了之后用 LLM 把 1 个 query 扩成 N 个变体（默 3），多路并行召回，
+     * `DefaultContentAggregator` 用 RRF 融合。代价是每条 query 多 1 次 LLM call 做扩展。
+     *
+     * <p>跟 rerank 互补：expansion 提升**召回**（让相关 chunk 更可能被检索到），
+     * rerank 提升**精度**（已召回的候选里挑最相关）。生产场景两个都开效果叠加。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "app.rag.query-expansion.enabled", havingValue = "true")
+    public QueryTransformer expandingQueryTransformer(ChatModel chatModel,
+                                                      @Value("${app.rag.query-expansion.n:3}") int n) {
+        return ExpandingQueryTransformer.builder()
+                .chatModel(chatModel)
+                .n(n)
+                .build();
+    }
+
+    /**
+     * History-aware retrieval：把多轮对话 history 压成 self-contained query。
+     * 典型场景：用户问"什么是 Spring DI" → 然后问"它跟 IoC 啥区别"，没这个 transformer 会去
+     * 检索"它跟 IoC 啥区别"召回不到，有了就改写成"Spring DI 跟 Spring IoC 啥区别"再检索。
+     *
+     * <p>跟 {@link #expandingQueryTransformer} 互补，可同时开 —— 见
+     * {@link #retrievalAugmentor} 里的 chain 组装顺序（compress 先，expand 后）。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "app.rag.history-aware.enabled", havingValue = "true")
+    public QueryTransformer compressingQueryTransformer(ChatModel chatModel) {
+        return CompressingQueryTransformer.builder()
+                .chatModel(chatModel)
+                .build();
+    }
+
     @Bean
     public RetrievalAugmentor retrievalAugmentor(ContentRetriever vectorRetriever,
                                                  @org.springframework.beans.factory.annotation.Autowired(required = false)
                                                  KeywordContentRetriever keywordRetriever,
                                                  @org.springframework.beans.factory.annotation.Autowired(required = false)
                                                  ScoringModel scoringModel,
+                                                 @org.springframework.beans.factory.annotation.Autowired(required = false)
+                                                 @org.springframework.beans.factory.annotation.Qualifier("compressingQueryTransformer")
+                                                 QueryTransformer compressing,
+                                                 @org.springframework.beans.factory.annotation.Autowired(required = false)
+                                                 @org.springframework.beans.factory.annotation.Qualifier("expandingQueryTransformer")
+                                                 QueryTransformer expanding,
                                                  @Value("${app.rag.top-k:5}") int topK) {
         QueryRouter router = (keywordRetriever != null)
                 ? new DefaultQueryRouter(vectorRetriever, keywordRetriever)
@@ -147,10 +193,27 @@ public class LangChain4jConfig {
                         .build()
                 : new DefaultContentAggregator();
 
-        return DefaultRetrievalAugmentor.builder()
+        // 链组合顺序敏感：compress 必须在 expand 前 ——
+        // 不然 expander 看到带代词的 query 扩出 N 个一样有歧义的变体。
+        // 0/1 个 transformer 时不用包 chain，直接用单个 transformer。
+        QueryTransformer composed = composeTransformers(compressing, expanding);
+
+        DefaultRetrievalAugmentor.DefaultRetrievalAugmentorBuilder b = DefaultRetrievalAugmentor.builder()
                 .queryRouter(router)
                 .contentAggregator(aggregator)
-                .contentInjector(new TaggedSourceContentInjector())
-                .build();
+                .contentInjector(new TaggedSourceContentInjector());
+        if (composed != null) {
+            b.queryTransformer(composed);
+        }
+        return b.build();
+    }
+
+    private static QueryTransformer composeTransformers(QueryTransformer compressing, QueryTransformer expanding) {
+        List<QueryTransformer> chain = new ArrayList<>(2);
+        if (compressing != null) chain.add(compressing);
+        if (expanding != null) chain.add(expanding);
+        if (chain.isEmpty()) return null;
+        if (chain.size() == 1) return chain.get(0);
+        return new ChainedQueryTransformer(chain);
     }
 }
