@@ -4,6 +4,7 @@ import com.lrj.langchain4j.ai.multiagent.Planner;
 import com.lrj.langchain4j.ai.multiagent.Replanner;
 import com.lrj.langchain4j.ai.multiagent.Synthesizer;
 import com.lrj.langchain4j.ai.multiagent.Worker;
+import com.lrj.langchain4j.security.TenantContext;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.service.AiServices;
@@ -117,17 +118,26 @@ public class MultiAgentConfig {
         return exec;
     }
 
+    /**
+     * 把请求线程的 MDC（traceId / tenantId 等日志变量）和 {@link TenantContext}（强类型租户身份）
+     * 同时透传到子线程。multi-agent worker fan-out 和 eval 子任务都依赖这个 ——
+     * 没有它，子线程拿不到 tenant 就会越权或在 RAG 检索时 fail-fast 到 anonymous。
+     */
     static class MdcCopyingTaskDecorator implements TaskDecorator {
         @Override
         public Runnable decorate(Runnable runnable) {
             Map<String, String> context = MDC.getCopyOfContextMap();
+            TenantContext.Tenant tenant = TenantContext.captureRaw();
             return () -> {
-                Map<String, String> previous = MDC.getCopyOfContextMap();
+                Map<String, String> previousMdc = MDC.getCopyOfContextMap();
+                TenantContext.Tenant previousTenant = TenantContext.captureRaw();
                 if (context != null) MDC.setContextMap(context); else MDC.clear();
+                if (tenant != null) TenantContext.set(tenant); else TenantContext.clear();
                 try {
                     runnable.run();
                 } finally {
-                    if (previous != null) MDC.setContextMap(previous); else MDC.clear();
+                    if (previousMdc != null) MDC.setContextMap(previousMdc); else MDC.clear();
+                    if (previousTenant != null) TenantContext.set(previousTenant); else TenantContext.clear();
                 }
             };
         }

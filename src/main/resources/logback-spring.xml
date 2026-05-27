@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Spring Boot 检测到 logback-spring.xml 时不再用 application.yml 的 logging.* 全套自动配置。
+  这里只补一个 AUDIT 专属 file appender，console 仍跟原来一样跑（用 Spring Boot 自带的
+  console-appender.xml + defaults.xml，自动识别 logging.pattern.console 等 yml 配置）。
+
+  注意：CONSOLE_LOG_PATTERN 取 application.yml 的 logging.pattern.console；
+  AUDIT logger additivity=false 不会被 root 转发到 console，避免审计 JSON 污染主日志。
+-->
+<configuration>
+
+    <!-- Spring Boot defaults：定义 CONSOLE_LOG_PATTERN, ${LOG_FILE} 等 property -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml" />
+    <include resource="org/springframework/boot/logging/logback/console-appender.xml" />
+
+    <!-- 主审计文件：jsonl（每行一个 JSON）+ 按日轮转 + 保留 30 天。
+         实际部署到 K8s 可以挂 PV 或 sidecar 转走（filebeat/vector），路径由 LOG_PATH 环境变量覆盖。 -->
+    <appender name="AUDIT_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_PATH:-./logs}/audit.jsonl</file>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_PATH:-./logs}/audit.%d{yyyy-MM-dd}.%i.jsonl.gz</fileNamePattern>
+            <maxFileSize>100MB</maxFileSize>
+            <maxHistory>30</maxHistory>
+            <totalSizeCap>5GB</totalSizeCap>
+        </rollingPolicy>
+        <encoder>
+            <!-- AuditLogger 已经把整条 event 序列化成 JSON 字符串，这里直接 %msg 输出，不再叠 pattern -->
+            <pattern>%msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- AUDIT logger 单独路由到 AUDIT_FILE。additivity=false 关键：禁止冒泡到 root（console），
+         否则主控台会被审计 JSON 刷屏 -->
+    <logger name="AUDIT" level="INFO" additivity="false">
+        <appender-ref ref="AUDIT_FILE" />
+    </logger>
+
+    <!-- root 走 console，沿用 spring boot 默认 -->
+    <root level="INFO">
+        <appender-ref ref="CONSOLE" />
+    </root>
+
+</configuration>

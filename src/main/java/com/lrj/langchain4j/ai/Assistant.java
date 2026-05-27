@@ -1,6 +1,8 @@
 package com.lrj.langchain4j.ai;
 
 import com.lrj.langchain4j.ai.guardrail.PiiGuardrail;
+import com.lrj.langchain4j.ai.guardrail.PromptInjectionGuardrail;
+import dev.langchain4j.service.guardrail.InputGuardrails;
 import dev.langchain4j.service.guardrail.OutputGuardrails;
 import dev.langchain4j.service.MemoryId;
 import dev.langchain4j.service.SystemMessage;
@@ -51,6 +53,7 @@ public interface Assistant {
             """;
 
     @SystemMessage(SYSTEM_PROMPT)
+    @InputGuardrails(PromptInjectionGuardrail.class)
     @OutputGuardrails(value = PiiGuardrail.class, maxRetries = 2)
     String chat(@MemoryId String chatId,
                 @V("language") String language,
@@ -60,6 +63,7 @@ public interface Assistant {
                 @UserMessage String userMessage);
 
     @SystemMessage(SYSTEM_PROMPT)
+    @InputGuardrails(PromptInjectionGuardrail.class)
     TokenStream chatStream(@MemoryId String chatId,
                            @V("language") String language,
                            @V("tone") String tone,

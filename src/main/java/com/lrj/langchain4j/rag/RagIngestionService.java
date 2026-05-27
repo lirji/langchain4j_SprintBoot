@@ -1,10 +1,10 @@
 package com.lrj.langchain4j.rag;
 
 import com.lrj.langchain4j.rag.hybrid.DocumentMirror;
+import com.lrj.langchain4j.security.TenantContext;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.loader.FileSystemDocumentLoader;
-import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.model.embedding.EmbeddingModel;
 import dev.langchain4j.store.embedding.EmbeddingStore;
@@ -27,25 +27,19 @@ public class RagIngestionService {
     private final EmbeddingStore<TextSegment> embeddingStore;
     private final EmbeddingModel embeddingModel;
     private final DocumentMirror documentMirror;
+    private final DocumentSplitterFactory splitterFactory;
     private final Path documentsDir;
-    private final String chunkingStrategy;
-    private final int chunkMaxChars;
-    private final int chunkOverlap;
 
     public RagIngestionService(EmbeddingStore<TextSegment> embeddingStore,
                                EmbeddingModel embeddingModel,
                                DocumentMirror documentMirror,
-                               @Value("${app.rag.documents-dir}") String documentsDir,
-                               @Value("${app.rag.chunking.strategy:recursive}") String chunkingStrategy,
-                               @Value("${app.rag.chunking.max-chars:300}") int chunkMaxChars,
-                               @Value("${app.rag.chunking.overlap:50}") int chunkOverlap) {
+                               DocumentSplitterFactory splitterFactory,
+                               @Value("${app.rag.documents-dir}") String documentsDir) {
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
         this.documentMirror = documentMirror;
+        this.splitterFactory = splitterFactory;
         this.documentsDir = Paths.get(documentsDir);
-        this.chunkingStrategy = chunkingStrategy == null ? "recursive" : chunkingStrategy.trim().toLowerCase();
-        this.chunkMaxChars = chunkMaxChars;
-        this.chunkOverlap = chunkOverlap;
     }
 
     public int ingestFromConfiguredDir() {
@@ -58,10 +52,13 @@ public class RagIngestionService {
             return 0;
         }
         List<Document> documents = FileSystemDocumentLoader.loadDocuments(documentsDir);
+        // tenantId 是隔离 RAG 的核心 metadata；retriever 的 dynamicFilter 会强制 AND 上去
+        String tenantId = TenantContext.current().tenantId();
+        documents.forEach(d -> d.metadata().put("tenantId", tenantId));
         if (category != null && !category.isBlank()) {
             documents.forEach(d -> d.metadata().put("category", category));
         }
-        DocumentSplitter splitter = buildSplitter();
+        DocumentSplitter splitter = splitterFactory.create();
         List<TextSegment> segments = documents.stream()
                 .flatMap(d -> splitter.split(d).stream())
                 .toList();
@@ -72,29 +69,10 @@ public class RagIngestionService {
                 .build()
                 .ingest(documents);
         documentMirror.add(segments);
-        log.info("Ingested {} documents ({} segments, strategy={} max-chars={} overlap={}) from {} (category={})",
-                documents.size(), segments.size(), chunkingStrategy, chunkMaxChars, chunkOverlap,
-                documentsDir.toAbsolutePath(), category);
+        log.info("Ingested {} documents ({} segments, strategy={} max-chars={} overlap={}) from {} (tenant={} category={})",
+                documents.size(), segments.size(), splitterFactory.strategy(),
+                splitterFactory.maxChars(), splitterFactory.overlap(),
+                documentsDir.toAbsolutePath(), tenantId, category);
         return documents.size();
-    }
-
-    /**
-     * 按 {@code app.rag.chunking.strategy} 构造 splitter：
-     * <ul>
-     *   <li>{@code recursive}（默认）— 字符数硬切 + overlap，简单粗暴；任意文档都能用</li>
-     *   <li>{@code markdown-header} — 按 {@code ##} 切 section，超长 fallback 到 recursive。
-     *       适合结构化 markdown，chunk = 完整主题</li>
-     * </ul>
-     */
-    private DocumentSplitter buildSplitter() {
-        DocumentSplitter recursive = DocumentSplitters.recursive(chunkMaxChars, chunkOverlap);
-        return switch (chunkingStrategy) {
-            case "recursive" -> recursive;
-            case "markdown-header" -> new MarkdownHeaderSplitter(chunkMaxChars, recursive);
-            default -> {
-                log.warn("Unknown app.rag.chunking.strategy '{}', falling back to recursive", chunkingStrategy);
-                yield recursive;
-            }
-        };
     }
 }

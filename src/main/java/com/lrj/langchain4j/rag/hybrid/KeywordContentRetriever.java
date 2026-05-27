@@ -1,6 +1,7 @@
 package com.lrj.langchain4j.rag.hybrid;
 
 import com.lrj.langchain4j.rag.CategoryContext;
+import com.lrj.langchain4j.security.TenantContext;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.content.retriever.ContentRetriever;
@@ -32,10 +33,12 @@ public class KeywordContentRetriever implements ContentRetriever {
     @Override
     public List<Content> retrieve(Query query) {
         String category = CategoryContext.get();
+        String tenantId = TenantContext.current().tenantId();
         Set<String> qTokens = tokenizer.tokenize(query.text());
         if (qTokens.isEmpty()) return List.of();
 
         return mirror.all().stream()
+                .filter(s -> tenantMatches(s, tenantId))
                 .filter(s -> categoryMatches(s, category))
                 .map(s -> new Scored(s, score(qTokens, s.text())))
                 .filter(sc -> sc.score > 0)
@@ -43,6 +46,10 @@ public class KeywordContentRetriever implements ContentRetriever {
                 .limit(maxResults)
                 .map(sc -> Content.from(sc.segment))
                 .collect(Collectors.toList());
+    }
+
+    private static boolean tenantMatches(TextSegment s, String tenantId) {
+        return s.metadata() != null && Objects.equals(tenantId, s.metadata().getString("tenantId"));
     }
 
     private static boolean categoryMatches(TextSegment s, String category) {

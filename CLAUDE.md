@@ -6,6 +6,7 @@
 
 - `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
 - `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
+- `docs/production-hardening.md` — **业务化基线 #1–#8 完整落地记录**：多租户隔离 / 限流 / token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送。包含设计要点、关键文件、yml 配置、验证脚本、关键设计决定
 - `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
 - `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
 - `docs/grafana-dashboard.json` — 现成的 7 panel dashboard JSON
