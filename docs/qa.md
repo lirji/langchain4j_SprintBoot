@@ -10,6 +10,107 @@
 
 ---
 
+## Q9. 切片（chunking）方式都有哪些？怎么选？
+
+> 问于 2026-05-27
+
+### 背景
+
+Q8 答了"chunking 是 RAG 天花板"+ 本项目用了 markdown-header 切。但 chunking 是个大家族，**到底有哪几类策略 + 怎么按场景选**？这条捋一下决策框架，方便后续遇到新文档类型（代码 / PDF / 转录稿）能马上知道该上哪种。
+
+### A
+
+按"**按什么切**"分 3 大类 + 1 个正交维度（检索粒度 vs 返回粒度）。
+
+#### 一、结构无关（不依赖文档语义边界）
+
+| 方式 | 怎么切 | 适用 | 缺点 |
+| --- | --- | --- | --- |
+| **固定字符数 + overlap** | `recursive(N, M)` 按字符硬切 + M 个 char 重叠 | 任何文档保底 | 句子被切断、跨章节拼接 |
+| **token-based** | 按 embedding tokenizer 切 | 想精确控制 embed 输入大小 | 跟字符切本质一样 |
+| **Sentence** | 按 `.` `?` `。` 切 | 短文本 / 转录稿 | 单句太短 = chunk 太碎，要二次聚合 |
+| **Paragraph** | 按 `\n\n` 切 | 散文 / 文章 / 邮件 | 长段超过 embed 上限就崩 |
+
+#### 二、结构对齐（按文档原本的语义边界切，**推荐起手**）
+
+| 方式 | 怎么切 | 适用 |
+| --- | --- | --- |
+| **Markdown header**（本项目已做） | 按 `## section` 切，超长 fallback | 技术文档 / FAQ / README |
+| **Code-aware** | 按 class / function 切（用 tree-sitter / AST） | 代码库索引 |
+| **Layout-aware** | 按 PDF 页面布局 / 表格 / 标题区切 | 扫描件 / 报告（unstructured.io / Docling） |
+| **Domain-specific** | 法律按条款、财报按表格、论文按章节+引用块 | 特定领域文档 |
+
+#### 三、语义切（不靠边界靠 embedding 相似度）
+
+| 方式 | 怎么做 | 适用 |
+| --- | --- | --- |
+| **Semantic chunking** | 先 embed 每个句子，相邻语义相近的合并，相似度跌破阈值切 | 非结构化长文 / OCR / 转录 |
+| **Proposition-based** | 用 LLM 把文档拆成原子命题（"X 是 Y"），每命题 1 chunk | 知识抽取场景，能撑得起 LLM 成本 |
+| **Late chunking** | 长 context embedding 模型先 embed 整文，再按位置切出 chunk embedding（每 chunk "看到"全局） | 用 Jina v3 / 类似长 context 模型 |
+
+#### 四（正交）：检索粒度 vs 返回粒度可以分开
+
+| 方式 | 思路 |
+| --- | --- |
+| **Parent-document** | embed 小 chunk（精度高），返回时给 LLM 大 chunk（context 全） |
+| **Sentence-window** | 同上但更细：embed 单句，返回 ±N 句作 context |
+| **Multi-vector** | 同一 chunk 存多个 embedding（不同摘要 / 不同 aspect 各一份） |
+
+### 设计决策框架（4 个决策）
+
+#### 决策 1：你的文档有没有"原生语义边界"？
+
+- 有（markdown heading / 代码 function / 法律条款）→ **优先按这个边界切**，`recursive` 只当 fallback
+- 没有（纯文本 / OCR / chat 转录）→ paragraph / sentence / semantic 三选一
+
+#### 决策 2：chunk 多大？
+
+- 小（100-300 char/token）：精度高 / 检索更准 / 但 context 少
+- 中（500-1000）：平衡，**多数场景默认**
+- 大（2000+）：context 多 / 但 embedding 精度降 / prompt 长烧钱
+
+实操：**先按语义边界切让 section 长度自然分布，超长 fallback；不要一上来锁死字符数**。
+
+#### 决策 3：要不要 overlap？
+
+- 用了语义边界切 → **通常不用 overlap**（边界本就在"自然停顿"）
+- 字符硬切 → 必须 overlap（10-20%），不然跨 chunk 句子被切断
+- 上 parent-document → 不用 overlap，parent chunk 天然给足 context
+
+#### 决策 4：检索粒度 = 返回粒度吗？
+
+- 一致（最简单，本项目就是）→ 单一 chunk 既 embed 又给 LLM
+- 不一致（parent-document）→ 召回精度 + context 完整度同时拿到，**生产 RAG 推荐**但要写两套存储 / 检索逻辑
+
+### 本项目现状 + 还能怎么推
+
+**当前**：`recursive` + `markdown-header` 两选一。`markdown-header` 对结构化 markdown 显著提升（Q8 实测 40% → 100%）。
+
+**下一步排序**（按 ROI）：
+
+1. **Parent-document retrieval** —— 小 chunk embed + 大 chunk 返回。**ROI 最高**：弥补"chunk 太小 LLM context 不够 / chunk 太大召回不准"的两难。对本项目：可切到 `###` 三级提精度，retrieve 时返回 `##` section 给 context
+2. **Code-aware splitter** —— 如果 `documents/` 以后放 Java/Python 文件，要按 class/function 切。Tree-sitter 是标准方案
+3. **Sentence-window** —— 对非 markdown 长文（转录稿、客服日志）适用，本项目当前不需要
+4. **Semantic chunking** —— fancy 但代价高（先 embed 所有句子）；只在文档完全没结构时考虑
+5. **Late chunking** —— 等用 Jina v3 之类长 context embed 模型时再考虑
+
+**避免**：
+
+- Proposition-based 对小项目过度（每 doc 调 LLM 提取命题，成本高 / 不可控）
+- Multi-vector 增加存储复杂度，本项目向量库就这么大没必要
+
+### 通用原则
+
+**chunking 是 RAG 链路的天花板**（见 18.17 / Q8）：
+
+- chunk 边界应该跟文档原本的语义边界对齐 —— **markdown 是 heading，代码是 class/function，法律是条款，财报是表格**
+- 强行字符数硬切对任何文档都"能跑"，但对每种文档都次优。`recursive` 应该作为 fallback 不是默认
+- 检索 / 返回粒度分离（parent-document）是从"切边界对不对"升级到"用什么粒度索引、用什么粒度回答"的下一阶段思考
+
+参考代码：`rag/MarkdownHeaderSplitter.java`、`rag/RagIngestionService.java`（按 yml `strategy` 装配）。
+
+---
+
 ## Q8. Chunking 策略到底重不重要？跟 expansion / rerank 比哪个收益大？
 
 > 问于 2026-05-27
