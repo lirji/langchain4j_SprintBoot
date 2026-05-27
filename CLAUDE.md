@@ -209,7 +209,9 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | POST | `/rag/ingest`   | 把 `./documents` 下文档分片入向量库；可选 query `category=xxx` 给所有文档打标签 |
 | POST | `/extract/ticket` | 结构化输出示例：从 `{"text":"..."}` 提取 `Ticket(title, priority, category, summary, nextSteps)` POJO |
 | POST | `/chat/reflexive` | Reflexion 自反思：body `{"message":"..."}`，返回最终答案 + 每轮 critique 的 trace |
+| POST | `/chat/reflexive/stream` | SSE 流式反思：按阶段 emit `attempt-start` / `answer-token` / `critique` / `done` |
 | POST | `/chat/multi-agent` | Planner 拆 → 多 Worker 并行 → Synthesizer 汇总；返回 plan + 每个 worker 输出 + final |
+| POST | `/chat/multi-agent/stream` | SSE 流式 multi-agent：按阶段 emit `plan` / `worker-result` / `synthesis-token` / `done`。**Synthesizer 那 10-20s 一次性等变成 token-by-token 立刻看** |
 | POST | `/chat/mcp` | 由 MCP server 的工具驱动的对话（需 `app.mcp.enabled=true`） |
 | POST | `/chat/auto` | LLM-as-router：classifier 分类成 RAG/TOOL/CHAT 分别走 Assistant 或 BareAssistant（需 `app.query-router.enabled=true`）；返回 `{decision, reply, classifyMs, answerMs}` |
 | POST | `/eval/run?runs=N` | 跑 `resources/eval/eval-cases.json` 黄金集，每 case 跑 N 次（默认 1）；返回 per-case avg/σ/passRate + 整体 |
@@ -353,6 +355,32 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 - `VECTOR`（默认）— 纯向量
 - `HYBRID` — PGVector 原生向量 + `tsvector` 全文 RRF 融合（`rrf-k` 默认 60，`text-search-config` 默认 `simple`，中文建议改 `chinese` 或外部分词后再入库）
+
+**Chunking 策略** `app.rag.chunking.*`:
+
+- `strategy=recursive`（默认）— `DocumentSplitters.recursive(max-chars, overlap)`，按字符数硬切 + overlap，简单粗暴适合任何文档
+- `strategy=markdown-header` — `MarkdownHeaderSplitter` 自实现：按 `(?m)(?=^##+ )` 切 section，每个 chunk 是完整主题；超长 section fallback 到 recursive
+- `max-chars: 300` — recursive 模式的 chunk 大小目标；markdown-header 模式的 section 长度阈值
+- `overlap: 50` — recursive 模式 chunk 重叠（markdown-header 只在 fallback 时用到）
+- markdown-header 给 segment 加 metadata：`section` 标题 + `index` 顺序号，引用 `[doc=file.md#3]` 对应"第 3 个 section"而不是"第 3 个 300-char 块"
+- 实测对本项目（5 个 chat provider 列在 1 个 `## Section` 里）的可见提升：recursive(300) 召回不全只列 2 个 provider，markdown-header(600) 召回完整 5 个
+
+**History-aware retrieval** `app.rag.history-aware.*`:
+
+- `enabled=false`（默认）— 当前 query 直接喂 retriever，多轮对话中代词类 follow-up（"它", "那个"）会召回不到
+- `enabled=true` — 用 `CompressingQueryTransformer` 拿 chat history 把当前 query 改写成 self-contained 再去检索
+- 跟 query-expansion 自动 chain：两个都开时按 `compress → expand` 顺序（compress 先合并 history，expand 后扩变体；颠倒就毫无意义）
+- 自实现 `ChainedQueryTransformer` 把两个 transformer 串成一个（LangChain4j 1.13 的 `RetrievalAugmentor` 只接单个 QueryTransformer）
+- 代价：每条 query 多 1 次 LLM call 做 history 压缩
+- **跟 expansion 一样，对本项目小 corpus + nomic-embed-text 收益不显著**：实测多轮场景 compressor 真跑了但召回结果跟 baseline 一样。大 corpus + 真多轮对话场景才价值显著
+
+**Query Expansion** `app.rag.query-expansion.*`:
+
+- `enabled=false`（默认）— 单 query 直接召回
+- `enabled=true` + `n: 3` — 用 LLM 把 1 个 query 扩成 n 个变体（同义改写 / 加上下文 / 拆子问题），多路并行召回 + `DefaultContentAggregator` RRF 融合
+- 走 LangChain4j 内置 `ExpandingQueryTransformer`，注入到 `DefaultRetrievalAugmentor.queryTransformer(...)`
+- 跟 **rerank 互补**：expansion 提升召回（让相关 chunk 更可能被检索到），rerank 提升精度（已召回的候选里挑最相关）。生产场景两个叠加
+- 代价：每条 query 多 1 次 LLM call 做扩展。**对小 corpus + 中文 embedding 收益有限**（实测 nomic-embed-text 对同义改写已经很包容）；大 corpus / 多语言 / 模糊 query 才显价值
 
 **RAG 引用格式** `TaggedSourceContentInjector`:
 

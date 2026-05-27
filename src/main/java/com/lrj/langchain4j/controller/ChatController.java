@@ -132,9 +132,31 @@ public class ChatController {
         return reflexiveService.chatReflexive(body.getOrDefault("message", ""));
     }
 
+    /**
+     * Reflexion SSE stream：按阶段 emit attempt-start / answer-token / critique / done。
+     * 见 {@link ReflexiveService#chatReflexiveStream}。
+     */
+    @PostMapping(value = "/chat/reflexive/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter chatReflexiveStream(@RequestBody Map<String, String> body) {
+        SseEmitter emitter = new SseEmitter(180_000L);
+        reflexiveService.chatReflexiveStream(body.getOrDefault("message", ""), emitter);
+        return emitter;
+    }
+
     @PostMapping("/chat/multi-agent")
     public MultiAgentService.Run chatMultiAgent(@RequestBody Map<String, String> body) {
         return multiAgentService.run(body.getOrDefault("message", ""));
+    }
+
+    /**
+     * Multi-agent SSE stream：按阶段 emit plan / worker-result / synthesis-token / done。
+     * 见 {@link MultiAgentService#runStream}。
+     */
+    @PostMapping(value = "/chat/multi-agent/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter chatMultiAgentStream(@RequestBody Map<String, String> body) {
+        SseEmitter emitter = new SseEmitter(180_000L);
+        multiAgentService.runStream(body.getOrDefault("message", ""), emitter);
+        return emitter;
     }
 
     @PostMapping("/chat/mcp")

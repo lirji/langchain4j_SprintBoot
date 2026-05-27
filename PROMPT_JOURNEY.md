@@ -26,8 +26,11 @@
 - [15. Round i：Query routing —— LLM-as-router 跳过无谓的 RAG](#15-round-iquery-routing--llm-as-router-跳过无谓的-rag)
 - [16. Round j：Multi-agent DAG planner —— 有依赖时按拓扑序分层并行](#16-round-jmulti-agent-dag-planner--有依赖时按拓扑序分层并行)
 - [17. Round f：跨 provider 不同默认 prompt（覆盖 vs 替换）](#17-round-f跨-provider-不同默认-prompt覆盖-vs-替换)
-- [18. 设计原则总览（跨章节的反复模式）](#18-设计原则总览跨章节的反复模式)
-- [19. 未做完的：剩 4 条生产 hardening + eval 运营](#19-未做完的剩-4-条生产-hardening--eval-运营)
+- [18. Roadmap A 收尾：测试 + Critic 确定性 + 安全 + auto-ingest](#18-roadmap-a-收尾测试--critic-确定性--安全--auto-ingest)
+- [19. Multi-agent / Reflexive 加 SSE 流式](#19-multi-agent--reflexive-加-sse-流式)
+- [20. RAG 进阶三件套：query expansion + history-aware + chunking](#20-rag-进阶三件套query-expansion--history-aware--chunking)
+- [21. 设计原则总览（跨章节的反复模式）](#21-设计原则总览跨章节的反复模式)
+- [22. 未做完的：剩生产 hardening + eval 运营](#22-未做完的剩生产-hardening--eval-运营)
 
 ---
 
@@ -1614,17 +1617,345 @@ app:
 
 ---
 
-## 18. 设计原则总览（跨章节的反复模式）
+## 18. Roadmap A 收尾：测试 + Critic 确定性 + 安全 + auto-ingest
+
+### 起因
+
+`docs/roadmap.md` 整理时把"短期可能踩坑"的 4 项归为 A 档：单元测试空白、Critic 用默认 temp=0.7 导致评分不稳、API key 在 yml hardcode、eval 跑前要手动 `/rag/ingest`。半天工作量全做掉。
+
+### 4 个子项
+
+#### A.1 单元测试空白 → 加 18 个核心 path 测试
+
+之前所有验证都靠手动 smoke + eval harness。改一行 Java 代码可能默默改坏一个分支，eval 只覆盖 30+ 条 happy/adversarial case。**测试覆盖的是"算法层"而非"集成层"**：
+
+- `MultiAgentServiceTest`（7 case）：Kahn 拓扑排序的 7 种形态 —— 空 / flat / 链式 / 菱形 DAG / 环（返回 null） / 未知 dep id 清洗 / 自环
+- `AssistantPropertiesTest`（6 case）：per-provider override 部分合并的 5 种边界 + null Map 兜底
+- `CaseAggregateTest`（5 case）：统计聚合（passRate / avgScore / scoreStdev）的正确性 —— 关键不变量是"用总体标准差（÷N），不是抽样（÷N-1）"
+
+为了能直接 unit test 拓扑算法，把 `MultiAgentService.topologicalLevels` 改为 package-private + 注释明确"勿改回 private"：
+
+```java
+/**
+ * <p>包级可见以便单元测试直接调用（{@code MultiAgentServiceTest}），不要改成 private。
+ */
+List<List<SubTask>> topologicalLevels(List<SubTask> tasks) { ... }
+```
+
+测试时构造 `MultiAgentService` 用 null 喂 Planner / Worker / Synthesizer：
+
+```java
+private final MultiAgentService svc = new MultiAgentService(null, null, null, Runnable::run);
+```
+
+`topologicalLevels` 是纯函数不用这些依赖。Trade-off：保单元测试方便 vs 加 `Objects.requireNonNull` 早期防御。当前选前者。
+
+#### A.2 Critic temp=0 —— 跟 Judge / Classifier 同思路
+
+Round c 引入多维 Critic 时只给 Judge 做了独立 temp=0 ChatModel（round 8），漏了 Critic。后果：`ReflexiveService` 用 Critic 评分跟 threshold 比较决定是否触发 improve，**评分不稳 = 反思可能假触发或假通过**。eval 量化反思效果时已经撞上 σ 偏大。
+
+修法：跟 Judge / QueryClassifier 同套路 —— 调 `LlmConfig.buildJudgeChatModel(props)` 拿独立 temp=0 model，绕开"多 ChatModel Bean 冲突"。
+
+```java
+@Bean
+public Critic critic(LlmConfig llmConfig, LlmConfig.LlmProperties props) {
+    ChatModel criticModel = llmConfig.buildJudgeChatModel(props);  // 复用现成 trick
+    return AiServices.builder(Critic.class).chatModel(criticModel).build();
+}
+```
+
+到这里项目里有 3 个"应当确定性"的 AiService 都走 temp=0 了：Judge / QueryClassifier / Critic。**判断标准是：这个 AiService 的输出会被后续阻塞条件依赖吗？**（Judge 决定 pass/fail，Classifier 决定 router 分流，Critic 决定 reflexion 阈值）。
+
+#### A.3 API key hardcode → 改空 fallback + 轮换
+
+`application.yml` 之前是 `api-key: ${DEEPSEEK_API_KEY:sk-8add789dcbc04bfa99d9ba54b57c8ebe}`，真 key 当 fallback。后果：commit / 截图 / 给 AI 看都会泄露。
+
+改成空 fallback + 加注释告警：
+
+```yaml
+deepseek:
+  # 安全提醒：之前这里有过 hardcode 的 key（sk-8add...），已轮换 + 改为空 fallback
+  # 部署时务必走环境变量 / K8s Secret / Vault，绝不要把真 key 写回 yml
+  api-key: ${DEEPSEEK_API_KEY:}
+```
+
+加注释 "已轮换" 是给后人看的 —— 防止有人重新 commit 同个 key 觉得"反正已经泄露过了"。轮换后这个 key 已经无效，**注释里保留旧前缀 `sk-8add...` 让后人能验证 git history 里那个 key 不再有效**。
+
+#### A.4 eval auto-ingest —— 用 AtomicBoolean lazy 触发
+
+RAG case 跑前要手动 `POST /rag/ingest`，第一次跑或重启后忘了就一堆 RAG case 假 fail。加 `app.eval.auto-ingest` 开关，默认关（不想被 eval 误改向量库）。
+
+```java
+private final AtomicBoolean ingested = new AtomicBoolean(false);
+
+public EvalResult.Summary run(List<EvalCase> cases, int runs) {
+    if (autoIngest && ingested.compareAndSet(false, true)) {
+        try {
+            int n = ragIngestionService.ingestFromConfiguredDir();
+            log.info("auto-ingested {} documents before first eval run", n);
+        } catch (Exception e) {
+            log.warn("auto-ingest failed; RAG cases may return empty results", e);
+        }
+    }
+    // ...
+}
+```
+
+`compareAndSet` 保证并发触发也只跑一次；失败 log warn 不重试不阻塞主流程。实测开关打开后 `/eval/run` 直接打 RAG case 都 1/1 pass，无需手动前置 ingest。
+
+### 教训
+
+1. **算法层单元测试比集成测试 ROI 高**：MultiAgent 的 topological sort / AssistantProperties 的 resolve / CaseAggregate 的 stdev 都是**纯函数 + 明确不变量**。Mock 一堆 AiService / ChatModel 写"集成测试"成本高且脆弱（mock 跟不上 LangChain4j API 变更），不如挑出"算法层"做纯函数 test
+2. **`MultiAgentService` 构造接受 null 不是 anti-pattern**：纯函数测试时不用拉起 Spring / 不需要 mock 3 个 AiService。把"production 端 fail-fast"的 `Objects.requireNonNull` 留给业务路径，单元测试入口稍微宽松能省一大堆 mock 代码
+3. **"应当确定性"的 AiService 都走 temp=0 独立 model**：判断标准统一 —— 它的输出会被后续阻塞条件依赖吗？是的话必须 temp=0。当前 3 个：Judge / QueryClassifier / Critic。后续加新 AiService 时按这个标准 review
+4. **被泄露的 key 注释里保留前缀**：方便后人验证"git history 里那个 key 已经无效"，避免"反正都泄露过了"的破窗效应
+5. **`AtomicBoolean.compareAndSet` 实现 lazy-once**：比 `synchronized` 块轻 + 显式语义"原子地标记已做"。eval 这种"启动后第一次调时触发一次"的需求模板，可以复用
+
+---
+
+## 19. Multi-agent / Reflexive 加 SSE 流式
+
+### 起因
+
+`/chat/multi-agent` 一次性返回 JSON，但流程是 Plan(~2s) → Workers(并行 ~3-8s/level) → Synthesizer(~10-20s)，**用户感知主要被 Synthesizer 那一截一次性等卡住**。`/chat/reflexive` 同理：每轮 Answerer 几秒 + Critic 几秒，多轮迭代用户等 30s+ 没反馈。Roadmap B 第一项。
+
+### 关键决策
+
+- **Worker 仍非流式** —— 多 worker 同时流 token 在 SSE 上交错难处理；Worker 输出要完整才能传给下游 DAG task。Worker 完成时直接 emit 整段 `worker-result`
+- **Critic 仍非流式** —— 结构化输出（JSON Schema 锁字段）本来就不适合 stream
+- **核心收益在 Synthesizer / Answerer** —— 这两步是最终 free-text，token-by-token 让前端立刻渲染
+- **SSE 用命名事件 + JSON data**，不是裸 token 流。前端按 event name dispatch handler
+- **CountDownLatch 把 TokenStream 转阻塞** —— reflexive 需要 "answer 写完 → 调 critic → 拿到分 → improve" 严格顺序，但 TokenStream 是 async；用 latch 包成同步阻塞拿全文 + 同时 SSE 推 token
+
+### 改动文件
+
+- `Synthesizer.java` / `Answerer.java` —— 抽 SYSTEM_PROMPT/USER_TEMPLATE 常量复用，加 `TokenStream`-returning 方法
+- `MultiAgentConfig` / `ReflexionConfig` —— Builder 加 `.streamingChatModel(streamingChatModel)`
+- `MultiAgentService.runStream(question, SseEmitter)` —— 按阶段 emit
+- `ReflexiveService.chatReflexiveStream(question, SseEmitter)` —— 多轮顺序保持
+- `ChatController` —— 2 新 endpoint `/chat/multi-agent/stream` `/chat/reflexive/stream`
+
+### 关键代码
+
+```java
+// MultiAgentService.runStream —— Synthesizer 真正流式
+public void runStream(String question, SseEmitter emitter) {
+    Plan plan = planner.plan(question);
+    safeSend(emitter, "plan", plan);
+
+    List<List<SubTask>> levels = topologicalLevels(plan.tasks());
+    if (levels == null) levels = List.of(plan.tasks());  // 环降级
+    Map<String, WorkerResult> byId = new ConcurrentHashMap<>();
+    List<WorkerResult> ordered = new ArrayList<>();
+    for (List<SubTask> level : levels) {
+        // 同层并行；本层完成才推下一层
+        for (var f : level.stream().map(t -> CompletableFuture.supplyAsync(...)).toList()) {
+            WorkerResult r = f.join();
+            ordered.add(r);
+            safeSend(emitter, "worker-result", r);
+        }
+    }
+
+    TokenStream tokens = synthesizer.synthesizeStream(question, format(ordered));
+    tokens.onPartialResponse(t -> safeSend(emitter, "synthesis-token", t))
+          .onCompleteResponse(r -> {
+              safeSend(emitter, "done", new Run(plan, ordered, r.aiMessage().text()));
+              emitter.complete();
+          })
+          .onError(err -> emitter.completeWithError(err))
+          .start();
+}
+```
+
+```java
+// ReflexiveService.streamAndCollect —— TokenStream → 阻塞拿全文 + 同时推 SSE
+private String streamAndCollect(SseEmitter emitter, TokenStream stream) throws InterruptedException {
+    StringBuilder buf = new StringBuilder();
+    CountDownLatch latch = new CountDownLatch(1);
+    AtomicReference<Throwable> err = new AtomicReference<>();
+    stream.onPartialResponse(t -> { buf.append(t); safeSend(emitter, "answer-token", t); })
+          .onCompleteResponse(r -> latch.countDown())
+          .onError(t -> { err.set(t); latch.countDown(); })
+          .start();
+    latch.await();
+    if (err.get() != null) throw new RuntimeException("answerer stream failed", err.get());
+    return buf.toString();
+}
+```
+
+### 量化验证
+
+| endpoint | 事件序列 |
+| --- | --- |
+| `/chat/multi-agent/stream` | `plan(1) + worker-result(N) + synthesis-token(K) + done(1)` |
+| `/chat/reflexive/stream` | `attempt-start(1) + answer-token(K) + critique(1) + done(1)`（一轮过）/ 多轮时 attempt-start/answer-token/critique 重复 |
+
+实测多 agent 一个 2-task DAG case：`plan(1) + worker-result(2) + synthesis-token(48) + done(1)` 全部按预期顺序到达。
+
+### 教训
+
+1. **不是所有 LLM call 都该流式**：Worker 输出要给下游 task（DAG 依赖），Critic 输出是结构化 JSON。**只让 final-text 步骤流（Synthesizer / Answerer）**是 80/20 折衷
+2. **CountDownLatch 转 async → sync 简单粗暴够用**：reflexive 多轮的同步约束（answer → critic → improve）用 reactive chain 重写复杂度高得多。Latch + AtomicReference 包装让上层逻辑保持同步流，下层异步细节藏在一个私有 helper
+3. **`safeSend` 包 IOException**：SSE 客户端随时可能关连接（用户关 tab / 网络断），emit 失败不能让 reflexive 多轮循环崩。捕获后让外层 try/catch 兜底
+4. **同 prompt 抽常量复用 stream / non-stream**：`SYSTEM_PROMPT` 常量给两个方法各自 `@SystemMessage(SYSTEM_PROMPT)` 引用 —— 改 prompt 一处生效两处，永远同步
+5. **流式只省"用户感知延迟"，不省 wall-clock**：选 stream 还是 non-stream 看场景 —— 前端 chat UI（用户在等）必选 stream；后端服务调用 / 批处理 / eval 用 non-stream 简单可观测
+
+---
+
+## 20. RAG 进阶三件套：query expansion + history-aware + chunking
+
+### 起因
+
+`docs/qa.md` Q1 在做"决策权地图"时挂了一条 future：Query routing 应该用 LLM 做一次轻量分类。后来 round i 真做了。这一轮把 RAG 链路再做深一层 —— roadmap B 的剩余 3 项：query expansion / history-aware retrieval / chunking 策略。
+
+3 个都是 RAG 召回质量优化，但实测**只有 chunking 真有可见提升**，前两项在本项目小 corpus 上挂上等于没用。诚实记录。
+
+### 子项 1：Query expansion（LangChain4j 内置 ExpandingQueryTransformer）
+
+**目标**：1 个 query → N 个变体（同义改写 / 拆子问题 / 加上下文），多路并行召回，`DefaultContentAggregator` RRF 融合。
+
+**实现**：
+
+```java
+@Bean
+@ConditionalOnProperty(name = "app.rag.query-expansion.enabled", havingValue = "true")
+public QueryTransformer expandingQueryTransformer(ChatModel chatModel,
+                                                  @Value("${app.rag.query-expansion.n:3}") int n) {
+    return ExpandingQueryTransformer.builder().chatModel(chatModel).n(n).build();
+}
+```
+
+`retrievalAugmentor` 接 `@Autowired(required=false) QueryTransformer queryTransformer`，有就挂 `DefaultRetrievalAugmentor.builder().queryTransformer(...)`。
+
+**实测**（DeepSeek + Ollama nomic-embed-text + 2 .md / 10 segments）：
+
+| query | baseline | expansion(n=3) |
+| --- | --- | --- |
+| 「本项目预置的语言模型服务是哪个？」 | `Ollama [doc=#0][doc=#1]` | `Ollama [doc=#0][doc=#1]` |
+| 「本系统的 AI 后端默认是什么？」（故意用文档没有的措辞） | `Ollama [doc=#0]` | `Ollama [doc=#0]` |
+
+**两组都没差**。`nomic-embed-text` 对"chat provider ↔ 语言模型服务 ↔ AI 后端"的同义跳跃已经够包容。
+
+**结论**：expansion 真正受益场景是**大 corpus + 模糊 query + 跨语言**。本项目 demo corpus 看不出区别。
+
+### 子项 2：History-aware retrieval + ChainedQueryTransformer
+
+**目标**：用 `CompressingQueryTransformer` 把"它跟 IoC 啥区别" + chat history → "Spring DI 跟 Spring IoC 啥区别" 再检索。
+
+**关键问题**：LangChain4j 的 `DefaultRetrievalAugmentor` 只接**一个** `QueryTransformer`。要让 compress + expand 同时生效得自己 chain。
+
+**实现 `ChainedQueryTransformer`**（10 行）：
+
+```java
+public class ChainedQueryTransformer implements QueryTransformer {
+    private final List<QueryTransformer> transformers;
+    @Override
+    public Collection<Query> transform(Query query) {
+        Collection<Query> current = List.of(query);
+        for (QueryTransformer t : transformers) {
+            List<Query> next = new ArrayList<>();
+            for (Query q : current) next.addAll(t.transform(q));
+            current = next;
+        }
+        return current;
+    }
+}
+```
+
+`retrievalAugmentor` 注入两个 `@Qualifier` 可选 Bean，按 **compress → expand** 固定顺序组装（颠倒就没意义：expander 看带代词原 query 扩出 N 个一样有歧义的变体）：
+
+```java
+public RetrievalAugmentor retrievalAugmentor(
+    ...,
+    @Autowired(required=false) @Qualifier("compressingQueryTransformer") QueryTransformer compressing,
+    @Autowired(required=false) @Qualifier("expandingQueryTransformer") QueryTransformer expanding,
+    ...
+) {
+    QueryTransformer composed = composeTransformers(compressing, expanding);
+    // 0 个 transformer 不挂；1 个直接用；2 个包 ChainedQueryTransformer
+    ...
+}
+```
+
+**实测多轮**（T1 用文档原话 + T2 用代词 "它"）：
+
+| 多轮场景 | baseline T2 | history-aware T2 |
+| --- | --- | --- |
+| T2 「它默认的窗口大小是多少？」 | 「未在文档中找到」 | 「未在文档中找到」 |
+
+Compressor 真跑了（log 多一次 `llm-request messages=1`），但召回结果跟 baseline 一样。**因为本项目文档把"默认窗口"写成"默认上限 20 条消息"，跨概念语义距离大，compressor 改写后的 query 仍命中不了**。
+
+**结论**：跟 expansion 同类 —— 功能挂上 ≠ 召回提升。真正受益要看 corpus 跟 query 措辞是否对齐。
+
+### 子项 3：Chunking 策略 ← 真正显著的提升
+
+**目标**：默认 `DocumentSplitters.recursive(300, 50)` 按字符硬切，对 markdown 文档常把 section 切断。改成 markdown-header 策略。
+
+**实现 `MarkdownHeaderSplitter`**：
+
+```java
+@Override
+public List<TextSegment> split(Document document) {
+    // (?m) multiline + lookahead 保留 heading 在当前 section 开头
+    String[] sections = document.text().split("(?m)(?=^##+ )");
+
+    for (String raw : sections) {
+        String section = raw.strip();
+        if (section.isEmpty()) continue;
+        Metadata meta = baseMeta.copy();
+        meta.put("index", String.valueOf(idx));
+        meta.put("section", extractTitle(section));
+
+        if (section.length() <= maxCharsPerSection) {
+            out.add(TextSegment.from(section, meta));
+        } else {
+            // 超长 fallback 到 recursive 在 section 内切，沿用 section metadata
+            out.addAll(fallbackForLongSection.split(Document.from(section, meta)));
+        }
+    }
+    return out;
+}
+```
+
+**实测可见提升**：
+
+| 策略 | 答 `本项目支持哪些 chat provider？` |
+| --- | --- |
+| recursive(300) | "ollama / deepseek" —— **只 2 个**，因为 300 chars 把 provider 列表切断 |
+| markdown-header(600) | "ollama / openai / anthropic / gemini / deepseek" —— **完整 5 个** |
+
+文档里 `## 支持的 LLM Provider` section 完整 5 行，被 recursive 切断只召回到 2 个 provider；markdown-header 把整段当 1 个 chunk 召回完整。
+
+### 收益排序（本项目 corpus 实测）
+
+| 优化 | 实测收益 |
+| --- | --- |
+| **chunking → markdown-header** | **显著**：召回完整度 40% → 100% |
+| query-expansion | 不显著 |
+| history-aware | 不显著 |
+| rerank | 待测 |
+
+### 教训
+
+1. **Chunking 是 RAG 链路的天花板**：chunk 切错了，后续 expansion / rerank / reranker 都救不回 —— 它们提的是"在已有候选里的精度"，不是"补全 chunk"
+2. **Chunk 边界应该跟文档原本的语义边界对齐**：markdown 是 heading，代码是 class/function，法律是条款，财报是表格。**强行字符数硬切是无知优化**，应该作为 fallback 不是默认
+3. **诚实记录"挂上没用"也是结论**：roadmap 里 expansion / history-aware 都用 strikethrough + "对本项目 corpus 收益不显著"标注，避免后人盲目开。**功能挂上 ≠ 收益提升**这条比"我做了优化"重要
+4. **ChainedQueryTransformer 顺序敏感写注释**：compress 必须在 expand 前。这种"看代码看不出但搞反就毫无意义"的约束必须 javadoc 显式写明
+5. **`@Qualifier` + `@Autowired(required=false)` 注入可选 Bean**：避免用 `List<QueryTransformer>` —— Spring 注入 list 顺序不稳定，显式拿两个固定名字的 Bean 才能保证 chain 顺序
+
+---
+
+## 21. 设计原则总览（跨章节的反复模式）
 
 把这一路浮出来的几个反复出现的模式抽出来：
 
-### 18.1 Structured Output > 自由文本
+### 21.1 Structured Output > 自由文本
 
 任何时候模型要给 "结构化" 的东西，**用 record + `@Description`，不要 prompt 里写"请用 JSON"**。框架强制 JSON Schema，模型几乎不会跑偏。
 
 适用：Critic 评分、Extractor、Planner Plan、Judge Judgment。
 
-### 18.2 Few-shot 示范判断，不是格式
+### 21.2 Few-shot 示范判断，不是格式
 
 格式被 `@Description` 锁了，例子用来展示**判断**：
 
@@ -1635,7 +1966,7 @@ app:
 
 **反例（anti-example）杠杆比正例还高**：明确「不要这样」+ 错误示范，模型更受教。Synthesizer 进一步演化出 **good + bad 配对**：bad answer 后面加一句"why it's bad"，把 anti-pattern 跟反例显式绑定。
 
-### 18.3 客观 vs 主观：规则匹配 + LLM 双层分工
+### 21.3 客观 vs 主观：规则匹配 + LLM 双层分工
 
 eval harness 的核心模式：
 
@@ -1644,7 +1975,7 @@ eval harness 的核心模式：
 
 不混淆 = 不让 LLM 重复审已经验证过的、稳定的字段。Judge 的 prompt 也明令禁止重复审 MUST_*。
 
-### 18.4 LLM-as-judge 三要素
+### 21.4 LLM-as-judge 三要素
 
 要让 Judge 真正可用做对照实验：
 
@@ -1652,7 +1983,7 @@ eval harness 的核心模式：
 2. **注入 ground truth**：today（系统时钟）/ clock-tool（系统能力）/ judgeHint（领域规则）等 Judge 自己看 (Q, A) 没法知道的信息
 3. **限定 scope**：明令"不要重复判 MUST_*"、"`Default to 1.0` do not be stingy"，避免主观通胀扣分
 
-### 18.5 Bug 是 eval 钉出来的
+### 21.5 Bug 是 eval 钉出来的
 
 整个 session 至少 6 个 bug 是 eval 揭穿的：
 
@@ -1665,7 +1996,7 @@ eval harness 的核心模式：
 
 **eval 是 prompt 的回归告警器**。改任何 prompt 都要靠 eval 监控漂移，否则改了反而坏只能靠用户投诉发现。
 
-### 18.6 调一处看变化的工程化
+### 21.6 调一处看变化的工程化
 
 每改一处 prompt 都跑 eval：
 
@@ -1676,7 +2007,7 @@ eval harness 的核心模式：
 
 **每次只动一个变量**——不然分数变了不知道是谁的功劳。
 
-### 18.7 Spring/LangChain4j 集成的踩坑模式
+### 21.7 Spring/LangChain4j 集成的踩坑模式
 
 - 多个同类型 Bean 共存：LangChain4j `@AiService` 不认 `@Primary`、`autowireCandidate=false`、`EXPLICIT` 模式会副作用关掉自动发现。**最后办法是不把第二个注册成 Bean**，从外部直接构造。
 - HTTP client SPI 冲突：classpath 有两套时 `HttpClientBuilderLoader` 抛 conflict，要 system property 显式锁定。
@@ -1685,7 +2016,7 @@ eval harness 的核心模式：
 - **Actuator readiness group 引用 `readinessState` 要先 `management.health.probes.enabled=true`**：K8s 部署模式默认开启，本地启动不开就抛 "contributor does not exist"。
 - **starter 接管的横切关注，绕过 starter 后会静默失效**：`MetricsChatModelListener` 之前靠 starter 自动 wire，我们改成手动建 ChatModel 后 listener 没人接管 —— metrics 静默丢了几个月。见 15.12。
 
-### 18.8 渐进式拆分
+### 21.8 渐进式拆分
 
 每个抽象都从「简单粗暴硬编码」起步，发现真的需要可配时再加：
 
@@ -1695,7 +2026,7 @@ eval harness 的核心模式：
 
 避免提前抽象。
 
-### 18.9 prompt + backend 注入必须成对（来自 d）
+### 21.9 prompt + backend 注入必须成对（来自 d）
 
 很多 prompt 规则只有在 backend 配合的情况下才可能被模型遵守。典型例子：
 
@@ -1705,7 +2036,7 @@ eval harness 的核心模式：
 
 **单边动 prompt 是空许诺**。每条强约束都要问"backend 配套了吗？没配套的话模型怎么知道？"
 
-### 18.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
+### 21.10 编织 not 拼接 + 显式列 anti-pattern（来自 g）
 
 合成 / 整合 / 摘要类任务，模型默认会偷懒 → 直接拼接 worker 输出 / 罗列要点 / 用源 ID 当标题。光说"compose a coherent answer"是空话，必须：
 
@@ -1715,7 +2046,7 @@ eval harness 的核心模式：
 
 更广义的模式：**模型默认行为是"安全但偷懒"。要它做高质量工作，必须显式禁止偷懒路径**。
 
-### 18.11 OpenAI-compatible 是 LLM 推理服务的事实标准（来自 h）
+### 21.11 OpenAI-compatible 是 LLM 推理服务的事实标准（来自 h）
 
 vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Together / Fireworks / DeepSeek / Moonshot —— 全都暴露 OpenAI 兼容的 `/v1/chat/completions` 和 `/v1/embeddings`。一个 `OpenAiCompatProps` + base-url 切换就能接 N 家。新接一家通常是改一行 yml，不是工程任务。
 
@@ -1723,7 +2054,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 
 唯一例外：Anthropic（自己协议 `messages.create`）和 Google Gemini（自己 SDK 协议），这两家因为生态优势没投靠 OpenAI 协议，要独立 builder。
 
-### 18.12 横切关注每次重构都要 grep 验证（来自 h 的 silent bug）
+### 21.12 横切关注每次重构都要 grep 验证（来自 h 的 silent bug）
 
 `MetricsChatModelListener` 在 round-1 后**默默失效了几个月**：
 
@@ -1740,7 +2071,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 
 **反制**：每次改装配链路（特别是绕过框架自动装配的时候），grep 一遍这些组件的注入点确认还在生效。或者写 integration test 验证 listener 触发计数。这次是为了挂 Grafana 翻代码才发现 —— 没有这个外部需求，bug 能藏到第一次生产事故。
 
-### 18.13 LLM-as-router 何时值得开（来自 i）
+### 21.13 LLM-as-router 何时值得开（来自 i）
 
 加一次 LLM 分类调用换"跳过 RAG / 减少工具槽位"的好处，**不是无脑的赢**。ROI 取决于：
 
@@ -1753,7 +2084,7 @@ vLLM / SGLang / TGI / LM Studio / llama.cpp server / Xinference / Groq / Togethe
 
 通用反制：**LLM-as-router 的成本必须显著低于被它绕过的成本**。最常见做法：classifier 走专用小模型（3B 量级），主对话走大模型。本项目实测在 DeepSeek + 本地 Ollama embedding 配置下没省到时间，所以默认关 —— 文档（`docs/qa.md` Q2）写明 ROI 矩阵避免后人盲目开。
 
-### 18.14 DAG sparingly + 反例钉滥用（来自 j）
+### 21.14 DAG sparingly + 反例钉滥用（来自 j）
 
 DAG 最大风险不是不会用，而是**滥用** —— Planner 把每个 task 都串成链，退化成单线程顺序执行，完全失去 multi-agent 价值。**强约束规则不靠 prompt 字面禁止，要靠反例展示"看似合理实则坏"的模式**：
 
@@ -1765,19 +2096,60 @@ DAG 最大风险不是不会用，而是**滥用** —— Planner 把每个 task
 
 这条跟 15.10（编织 not 拼接）是同一类反例策略 —— **模型默认行为是"安全但偷懒/过度"**，要做正确决策必须显式列错误模式 + 配错误示例。
 
-### 18.15 配置层与运行时层解耦（来自 f）
+### 21.15 配置层与运行时层解耦（来自 f）
 
 `AssistantProperties` 描述"可能怎么配"（包括 overrides 这种结构化扩展），`ResolvedAssistantStyle` 是"本进程实际用哪份"。业务调用方只见 Resolved，不知道 overrides 存在 —— 这给后续"按 traffic % 分桶 A/B 切 style"留了扩展点（只改 `AssistantStyleConfig` 一个文件，业务调用方零感知）。
 
 适用条件：**配置形态可能演化（加 override / 加 A/B / 加按 chatId 路由），但调用方接口不变**。一旦预感到这种"配置侧灵活但调用侧稳定"，就该立这层 "Resolved" Bean。
 
-跟 18.8（渐进式拆分）平衡：不是一上来就分层，是发现"配置侧要灵活了"时才升级。AssistantProperties 起步直接被用了好几轮，到 round f 才抽 Resolved。
+跟 21.8（渐进式拆分）平衡：不是一上来就分层，是发现"配置侧要灵活了"时才升级。AssistantProperties 起步直接被用了好几轮，到 round f 才抽 Resolved。
+
+### 21.16 用户感知延迟 ≠ wall-clock（来自第 19 章 SSE 流式）
+
+Multi-agent 总耗时 30s+ 不变，但用 SSE 流式后用户**感知延迟**从"等 30s 一坨"变成"2s 看到 plan → 8s 看到 worker → 立刻看到 token 流"。这是两个完全不同的 KPI：
+
+- **wall-clock**：服务端总耗时 —— 影响成本、吞吐
+- **感知延迟**：用户看到第一个有用信号的时间 + 之后的信息密度 —— 影响留存
+
+加 stream 几乎不省 wall-clock（甚至略增），但**显著改善感知延迟**。决定要不要做的标准不是"省 X% 时间"而是"用户在等吗 / 等多久才看到第一字"。
+
+跟 21.13（LLM-as-router 何时值得）异曲同工 —— 衡量优化要看 ROI 不要看"是否能做"。
+
+### 21.17 Chunk 边界对齐文档原本的语义边界（来自第 20 章 chunking）
+
+Chunking 是 RAG 链路的天花板。chunk 切错了，后续 expansion / rerank 都救不回 —— 它们提的是"在已有候选里的精度"，**不是"补全 chunk"**。所以 chunking 策略**优先级高于** retriever 增强。
+
+通用模式：
+
+| 文档类型 | 语义边界 |
+| --- | --- |
+| Markdown | `## heading` |
+| Code | class / function |
+| 法律文档 | 条款（"第 N 条"）|
+| 财报 | 表格 / 章节 |
+| 论文 | 章节 + 段落 + 引用块 |
+
+**强行用字符数硬切是"无知优化"** —— 它对任何文档都"能跑"，但对每种文档都次优。`recursive(N)` 应该作为 fallback 而非默认。
+
+实测对本项目 markdown：召回完整度 40% → 100%（同一 query 答出 provider 数 2 → 5）。这是整个 round 20 三件套里**唯一显著的**提升 —— 比 expansion / history-aware 都重要。
+
+### 21.18 诚实记录"功能挂上但没用"（来自第 20 章 expansion / history-aware）
+
+Round 20 的 expansion 和 history-aware 都"挂上了 + 实测没改善召回"。我没把它们伪装成"提升"，roadmap.md 直接用 strikethrough 标 done，但带"对本项目 corpus 收益不显著"的注释。
+
+为什么这条值得当原则：
+
+- **避免后人盲目开**：看 yml 注释觉得"这个看起来很强"就 enabled=true，结果 token 烧了双倍但收益 0
+- **避免给自己造工程债**：把"没用的功能"标"已上线"，下次改 RAG 链路就要兼顾这条没用的代码路径
+- **诚实的文化**：项目里所有量化结论（不管好 / 坏 / 没差）都记录到 docs/qa.md + roadmap.md。**没差也是数据**
+
+这跟 21.5（Bug 是 eval 钉出来的）一脉相承 —— 工程决策靠数据不靠直觉，"没数据时承认没数据"也算数据。
 
 ---
 
-## 19. 未做完的：剩 4 条生产 hardening + eval 运营
+## 22. 未做完的：剩生产 hardening + eval 运营
 
-主线 prompt 工程 7 条（a/b/c/d/e/f/g）+ round h（vLLM 生产化 + 重试/健康/可观测）+ round i（query routing）+ round j（DAG planner）都做完了。剩下的全是运营 / 工程化：
+主线 prompt 工程 7 条（a/b/c/d/e/f/g）+ round h（vLLM 生产化 + 重试/健康/可观测）+ round i（query routing）+ round j（DAG planner）+ Roadmap A 收尾（测试 + Critic 确定性 + 安全 + auto-ingest）+ SSE 流式 + RAG 进阶三件套都做完了。剩下的全是运营 / 工程化：
 
 ### 剩下 4 条生产 hardening
 
@@ -1814,7 +2186,7 @@ DAG 最大风险不是不会用，而是**滥用** —— Planner 把每个 task
 | --- | --- |
 | Assistant 主对话 | 5 段结构 + 4 个 @V 参数化（language / tone / citationPolicy / extra）+ 支持 per-provider override（round f） |
 | DateTimeTool 工具描述 | WHEN-USE / WHEN-NOT / PARAM 三段式 + @P |
-| Critic 评分 | 3 维结构化（correctness / completeness / clarity）+ mainIssue + 加权聚合 |
+| Critic 评分 | 3 维结构化（correctness / completeness / clarity）+ mainIssue + 加权聚合；**独立 temp=0 ChatModel（round 18）** |
 | Extractor | 3 例 few-shot 覆盖典型/边界/反例 + priority rubric |
 | Planner | 3 例 few-shot + 1 真 DAG 例 + 2 反例（包括 DAG 滥用反例）+ 拆分规则 |
 | Worker | 接受 `(task, upstream)` 双参数，upstream 拼上游 task 输出当 context |
@@ -1856,7 +2228,29 @@ DAG 最大风险不是不会用，而是**滥用** —— Planner 把每个 task
 | 跨 endpoint | type dispatch 4 种 |
 | 并行 | `evalExecutor` 默认 4 线程，2.5× 加速 |
 | DAG 验证 | EvaluationRunner 序列化 `[deps: t1]`，mustInclude 钉这个字面验真 |
-| auto-ingest / CI 集成 | 未做 |
+| **auto-ingest（round 18）** | ✅ `app.eval.auto-ingest=true` 时 lazy 第一次 run 时触发 |
+| CI 集成 | 未做 |
+| **单元测试覆盖（round 18）** | ✅ 24 个 test：MultiAgentService 拓扑（7）+ AssistantProperties resolve（6）+ CaseAggregate 统计（5）+ MarkdownHeaderSplitter（6） |
+
+### RAG 链路 (round 12 + 20)
+
+| 维度 | 状态 |
+| --- | --- |
+| ContentInjector | ✅ `TaggedSourceContentInjector` 给检索片段加 `<source id="文件名#N">` |
+| Citation policy | ✅ `[doc=文件名#片段号]` 闭环 |
+| **Chunking 策略（round 20）** | ✅ `recursive` / `markdown-header`（结构化 markdown 推荐后者）；实测召回完整度 40% → 100% |
+| **Query expansion（round 20）** | ✅ 可选 `app.rag.query-expansion.enabled`，本项目 corpus 不显著 |
+| **History-aware retrieval（round 20）** | ✅ 可选 `app.rag.history-aware.enabled`，自实现 `ChainedQueryTransformer` 让两个 transformer 按 compress→expand 顺序 chain |
+| Re-rank | ✅ `OllamaLlmScoringModel` / `JinaScoringModel` 可选，默认关 |
+| Hybrid retrieval (vector + keyword) | ✅ 可选 `app.rag.hybrid.enabled`，HanLP tokenizer 中文友好 |
+
+### SSE 流式 (round 19)
+
+| endpoint | 事件 |
+| --- | --- |
+| `/chat/stream` | 原有 token 流 |
+| `/chat/multi-agent/stream` | ✅ `plan` / `worker-result` / `synthesis-token` / `done` |
+| `/chat/reflexive/stream` | ✅ `attempt-start` / `answer-token` / `critique` / `done` |
 
 ### 生产 Hardening 层（round h）
 
@@ -1902,6 +2296,12 @@ DAG 最大风险不是不会用，而是**滥用** —— Planner 把每个 task
 15. DAG 默认不用，sparingly 才好用 —— 滥用 DAG 退化成单线程顺序执行，比 flat 还慢；强约束规则要靠反例展示"看着合理实则坏"的模式
 16. 配置层 vs 运行时层解耦 —— 当配置形态可能演化（per-provider override / A/B / 按 chatId 路由）但调用方接口不变时，立 "Resolved" Bean，业务调用方零感知
 
+**RAG 链路深挖之后的反思**：
+
+17. Chunking 是 RAG 的天花板 —— 切错了 retrieval 增强都救不回。chunk 边界必须跟文档原本的语义边界对齐（markdown 用 heading / 代码用 function / 法律用条款），字符数硬切是 fallback 不是默认
+18. 体感延迟 ≠ wall-clock —— SSE 流式不省总耗时，但用户感知从"等 30s 一坨"变成"立刻看到 token 流"。这是两个独立 KPI
+19. 诚实记录"挂上没用"也是结论 —— Query expansion / history-aware 都"功能挂上但召回没改善"，roadmap.md 用 strikethrough + "对本项目 corpus 收益不显著"标记，避免后人盲目开。**没差也是数据**
+
 最大的发现：**eval 不只是 prompt 工程的验证工具，它本身就是发现 prompt bug 的主力**。整个 session 至少 7 个 bug（Java 库用错、测试题面互斥、prompt 误套用、Assistant 算错、RAG minScore 太严、doc 写法不利于召回、listener 静默失效）都是非业务流程发现的 —— 跑 eval / 翻代码做 hardening / 加 dashboard 才钉出来。如果 eval 和可观测性还没建到可信，prompt 工程和生产部署都是凭感觉。
 
-走到 round j 终于把"模型推理"和"业务编排"两层分别打磨完。**下一步如果还要前进，重点是 trace store / 自动 prompt 优化 / 大规模 case 集这种运营级工作 —— 工程基建已经齐了**。
+走到 round 20 终于把"模型推理 / 业务编排 / RAG 召回"三层都打磨完。**下一步如果还要前进，重点是 rerank eval 对比 / trace store / 大规模 case 集 / CI 集成这种运营级工作 —— 工程基建已经齐了**。

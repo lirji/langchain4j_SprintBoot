@@ -3,6 +3,7 @@ package com.lrj.langchain4j.config;
 import com.lrj.langchain4j.ai.reflexion.Answerer;
 import com.lrj.langchain4j.ai.reflexion.Critic;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.service.AiServices;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -11,10 +12,15 @@ import org.springframework.context.annotation.Configuration;
 @Configuration
 public class ReflexionConfig {
 
+    /**
+     * Answerer 同时挂 chatModel + streamingChatModel —— 让 {@code answerStream} /
+     * {@code improveStream} 能用 TokenStream 返回类型（{@code /chat/reflexive/stream} 走这条）。
+     */
     @Bean
-    public Answerer answerer(ChatModel chatModel) {
+    public Answerer answerer(ChatModel chatModel, StreamingChatModel streamingChatModel) {
         return AiServices.builder(Answerer.class)
                 .chatModel(chatModel)
+                .streamingChatModel(streamingChatModel)
                 .build();
     }
 

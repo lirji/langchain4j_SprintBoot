@@ -184,6 +184,26 @@ app:
     documents-dir: ./documents
     # 召回截断（rerank 关闭时直接作为返回数；rerank 开启时由 reranker 作为最终 top-k）
     top-k: 5
+    chunking:
+      # recursive（默认）— 按字符数硬切 + overlap，简单粗暴，适合任何文档
+      # markdown-header — 按 ## section 切，每个 chunk 是完整主题；超长 section fallback 到 recursive
+      strategy: recursive
+      max-chars: 300       # recursive 的目标 chunk 大小；markdown-header 的 section 长度阈值
+      overlap: 50          # recursive 模式 chunk 重叠字符数（markdown-header 模式只在 fallback 时用到）
+
+    history-aware:
+      # 多轮对话场景：CompressingQueryTransformer 把"它跟 X 啥区别"+ history → "Y 跟 X 啥区别"
+      # 再检索。不开则代词类 follow-up 召回会很差。代价是每条 query 多 1 次 LLM call。
+      # 跟 query-expansion 互补，两个都开会自动 chain（compress→expand 顺序）。
+      enabled: false
+
+    query-expansion:
+      # 开了之后每条 query 多 1 次 LLM call 把它扩成 n 个变体（同义改写 / 加上下文 / 拆子问题），
+      # 多路并行召回 → DefaultContentAggregator RRF 融合。提升召回，代价是 LLM 成本 + 延迟。
+      # 跟 rerank 互补：expansion 提召回，rerank 提精度，两个都开效果叠加。
+      enabled: false
+      n: 3
+
     rerank:
       # 关闭则普通向量检索；开启则在 EmbeddingStore 召回 candidate-size 条后再排
       enabled: false

@@ -4,6 +4,7 @@ import com.lrj.langchain4j.ai.multiagent.Planner;
 import com.lrj.langchain4j.ai.multiagent.Synthesizer;
 import com.lrj.langchain4j.ai.multiagent.Worker;
 import dev.langchain4j.model.chat.ChatModel;
+import dev.langchain4j.model.chat.StreamingChatModel;
 import dev.langchain4j.service.AiServices;
 import org.slf4j.MDC;
 import org.springframework.context.annotation.Bean;
@@ -27,9 +28,16 @@ public class MultiAgentConfig {
         return AiServices.builder(Worker.class).chatModel(chatModel).build();
     }
 
+    /**
+     * Synthesizer 同时装 chatModel + streamingChatModel —— 让 {@code synthesizeStream}
+     * 能用 TokenStream 返回类型（{@code /chat/multi-agent/stream} 走这条）。
+     */
     @Bean
-    public Synthesizer synthesizer(ChatModel chatModel) {
-        return AiServices.builder(Synthesizer.class).chatModel(chatModel).build();
+    public Synthesizer synthesizer(ChatModel chatModel, StreamingChatModel streamingChatModel) {
+        return AiServices.builder(Synthesizer.class)
+                .chatModel(chatModel)
+                .streamingChatModel(streamingChatModel)
+                .build();
     }
 
     /**
