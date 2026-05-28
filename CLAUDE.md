@@ -264,6 +264,7 @@ curl -X POST 'localhost:8080/chat/category?chatId=u1&category=manual' \
 - `DorisEmbeddingStore` 是社区/自实现版本，已支持 add / search / remove **和 metadata filter**（`DorisFilterTranslator` 把 `IsEqualTo` / `IsIn` / `And` / `Or` / `Not` 等翻译成 `get_json_string(metadata,'$.key') = ?` 形式的 SQL；JSON key 用 `[A-Za-z0-9_.-]+` 白名单校验防注入）。生产用法仍建议补：批量 Stream Load、连接池。
 - **HTTP client 冲突**：classpath 里同时有 `langchain4j-http-client-spring-restclient` 和 `langchain4j-http-client-jdk` 两个 SPI 实现，LangChain4j 会抛 `Conflict: multiple HTTP clients found`。`LangChain4jApplication.main()` 里用 `System.setProperty("langchain4j.http.clientBuilderFactory", "dev.langchain4j.http.client.jdk.JdkHttpClientBuilderFactory")` 显式锁定 JDK 实现。要换回 Spring RestClient 改这一行即可，不要删。
 - **Ollama starter 与 Spring Boot 3.3.5 不兼容**：`langchain4j-ollama-spring-boot-starter` 1.13.x 的 `OllamaEmbeddingModel` 自动装配引用了 Spring Boot 3.4+ 才有的 `org.springframework.boot.http.client.ClientHttpRequestFactorySettings`，3.3.5 下会 `NoClassDefFoundError`。因此 yml 里**不要**配 `langchain4j.ollama.embedding-model.*`（也不要配 `chat-model` / `streaming-chat-model`），所有 Ollama Bean 都在 `LlmConfig` 里手动 `OllamaChatModel.builder()` / `OllamaEmbeddingModel.builder()` 构建。升级 Spring Boot 到 3.4+ 后可以考虑回到 starter 自动装配，但目前自管比较省事。
+- **Guardrail 必须靠自定义 SPI 才能注入依赖**（**别删 `SpringClassInstanceFactory`**）：LangChain4j（1.13.x）实例化 `@InputGuardrails(X.class)` / `@OutputGuardrails(Y.class)` 引用的类时，走 `ClassInstanceLoader` → 默认**反射调无参构造**，spring-boot-starter **并不会** `getBean()`。本项目的 guardrail（`PromptInjectionGuardrail` 需 `PromptInjectionDetector`、`PiiGuardrail` 需 `AuditLogger`）只有带参构造，默认路径会抛 `NoSuchMethodException` 把整条 `Assistant.chat` 打挂（连带 `/chat`、`/chat/category` 和 eval 全废）。解法：`config/SpringClassInstanceFactory` 实现 `dev.langchain4j.spi.classloading.ClassInstanceFactory` SPI，注册在 `resources/META-INF/services/dev.langchain4j.spi.classloading.ClassInstanceFactory`，优先从 Spring 容器取 bean、取不到再回退反射；context 通过 `SpringContextHolder`（`ApplicationContextAware` 静态持有）拿。这一层对所有 LC4j class 实例化生效，对非 bean 类无回归。
 
 ## Prompt 工程
 
@@ -390,6 +391,18 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - `LangChain4jConfig.retrievalAugmentor` 是**始终构造**的（不再 conditional on rerank/hybrid），目的就是无条件挂这个 injector —— 不然没启 rerank 的默认路径就走 `DefaultContentInjector`，引用格式契约失效。
 - 与 `app.assistant.citation-policy` 形成闭环：injector 给模型可引的 id，policy 告诉模型按 `[doc=ID]` 引用。任一缺失模型都不会输出格式化引用。
 - `app.rag.min-score`（默认 0.3）控制 cosine 相似度阈值。0.6 之类的高阈值在中文 query 用 `nomic-embed-text` 时召回很低，eval 把这个钉出来过。
+
+**RAG 事实幻觉事后校验（grounding）** `app.rag.grounding.*`:
+
+- 解决的是**事实幻觉**（答案结构完美但内容不被检索资料支撑），跟 Schema（治结构幻觉）、状态机（治动作幻觉）正交。`enabled=false`（默认）时行为与历史完全一致。
+- **仅作用于触发了检索的回答**（本轮没召回到 source 直接跳过，不烧 token）。两层叠加：
+  - **Layer 0（零 LLM，确定性）** `GroundingService.fabricatedCitations`：答案里 `[doc=ID]` 引用的 id 必须在本轮检索集合里，否则判"编造引用"。靠 `RetrievedSourcesContext`（ThreadLocal，由 `TaggedSourceContentInjector` 注入时写入，仿 `CategoryContext` 套路）拿到检索到的 id。
+  - **Layer 1（faithfulness）** `GroundednessChecker`：RAGAS 风格，把答案拆成原子断言逐条对照 `<source>` 判是否被支撑，`groundedScore = 被支撑数 / 总数`；诚实弃答/闲聊无事实断言记 1.0。走独立 temp=0 ChatModel（`LlmConfig.buildJudgeChatModel`，**不注册 ChatModel Bean**，跟 `Critic`/`Judge` 同思路），且 `@ConditionalOnProperty` 只在开启时才构造（关闭零开销）。
+- **v1 只实现 warn 模式**：命中任一层就在答案末尾追加 `⚠️ 可信度提示：…。请以原始资料为准。` + 打 WARN 日志，**不改写、不拒答**。`refuse`/`regenerate` 暂未做（避免半成品开关，故 yml 里没有 `on-fail`）。
+- `threshold`（默认 0.7）— Layer 1 聚合分低于此值才 warn。
+- 接线点：`ChatController./chat` 与 `CategoryChatService`（`/chat/category`）都包了一层 `GroundingService.applyToFreshAnswer(...)`。**`/chat/stream` 流式路径没挂**（流式 grounding 要缓冲整段，跟 `PiiGuardrail` 跳过流式同理）。
+- **诚实弃答跳过校验**：答案命中 `ABSTENTION_MARKERS`（"未在文档中找到"等，跟 `citationPolicy` 契约闭环）时直接放行——弃答无事实断言、无可幻觉。eval 的 `grounding-abstain-quiet` 钉出过这个：弱模型（qwen3:8b）的 Layer 1 checker 会把弃答误判成 `groundedScore=0.0` 触发假告警，故用确定性话术识别兜底，不依赖 checker 在弃答上稳定判 1.0。
+- Layer 1 校验器异常被吞（降级跳过 Layer 1，不影响答案返回）。
 
 ## 多 Agent 协作 / Guardrails / 可观测性
 
@@ -520,16 +533,26 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 ### 跨 endpoint：type dispatch
 
-`EvalCase` 有可选 `type` 字段（默认 `"chat"`），让同一套 harness 覆盖 4 个 endpoint：
+`EvalCase` 有可选 `type` 字段（默认 `"chat"`），让同一套 harness 覆盖 5 个 endpoint：
 
 | type | 调用 | "answer" 喂给 Judge 的形式 | 用途 |
 | --- | --- | --- | --- |
 | `chat`（默认） | `Assistant.chat(...)` | 模型回复原文 | 主对话 |
+| `grounded` | `GroundingService.applyToFreshAnswer(() -> Assistant.chat(...))` | 模型回复原文（命中闸门时末尾带 `⚠️ 可信度提示`） | 测 RAG 事实幻觉的事后校验闸门 |
 | `extract` | `Extractor.extractTicket(question)` | Ticket POJO 序列化的 JSON | 结构化抽取（mustInclude 可查 `"priority":"CRITICAL"` 等字面） |
 | `multi-agent` | `MultiAgentService.run(question)` | `tasks: N\n<子任务列表>\n---\n<finalAnswer>` | 同时校验拆分粒度（mustInclude 查 `tasks: 3`）和最终答案 |
 | `reflexive` | `ReflexiveService.chatReflexive(question)` | `attempts: N, accepted: true\n---\n<finalAnswer>` | 同时校验反思迭代行为（attempts/accepted）和最终答案 |
 
 dispatch 在 `EvaluationRunner.invokeByType()`，加新 type 在 switch 加一支 + 在 EvalCase 文档里登记即可。
+
+**grounded 类型的两条 case 有前置**（`grounding-supported-quiet` / `grounding-abstain-quiet`）：
+
+- 它跟 `chat` 的唯一区别是包了一层 `GroundingService` —— 闸门只在 `app.rag.grounding.enabled=true` 时运行，否则等价于 `chat`（直通）。
+- 两条都依赖检索召回，需 `app.eval.auto-ingest=true`（或先手动 `/rag/ingest`）才有 source 可校验。
+- 都测的是"闸门**不该响**的场景"（充分支撑的答案 / 诚实弃答），用 `mustNotInclude: ["可信度提示"]` 守住 warn 模式最怕的**误报**。`grounding-supported-quiet` 若偶发响了，多半是 Layer 0 引用 id 对不上或 Layer 1 偏严——这是关于闸门松紧的信号，不是测试 bug。
+- 跑法：`mvn spring-boot:run -Dspring-boot.run.arguments="--app.rag.grounding.enabled=true,--app.eval.auto-ingest=true"` 后 `POST /eval/run?runs=3`。
+
+> 注：当前默认黄金集还含 `rag-citation-*` / `rag-no-match` 等依赖 ingest 的 RAG case，所以"开 auto-ingest 跑"本就是 RAG 相关 case 的标准前置。
 
 结构化输出之所以序列化成 string 喂 Judge：
 

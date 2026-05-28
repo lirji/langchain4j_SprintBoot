@@ -1,5 +1,6 @@
 package com.lrj.langchain4j.ai;
 
+import com.lrj.langchain4j.ai.grounding.GroundingService;
 import com.lrj.langchain4j.config.ResolvedAssistantStyle;
 import com.lrj.langchain4j.rag.CategoryContext;
 import org.springframework.stereotype.Service;
@@ -16,23 +17,29 @@ public class CategoryChatService {
 
     private final Assistant assistant;
     private final ResolvedAssistantStyle props;
+    private final GroundingService groundingService;
 
-    public CategoryChatService(Assistant assistant, ResolvedAssistantStyle props) {
+    public CategoryChatService(Assistant assistant,
+                               ResolvedAssistantStyle props,
+                               GroundingService groundingService) {
         this.assistant = assistant;
         this.props = props;
+        this.groundingService = groundingService;
     }
 
     public String chatInCategory(String chatId, String category, String userMessage) {
-        try {
-            CategoryContext.set(category);
-            return assistant.chat(chatId,
-                    props.getLanguage(),
-                    props.getTone(),
-                    props.getCitationPolicy(),
-                    props.getExtra(),
-                    userMessage);
-        } finally {
-            CategoryContext.clear();
-        }
+        return groundingService.applyToFreshAnswer(() -> {
+            try {
+                CategoryContext.set(category);
+                return assistant.chat(chatId,
+                        props.getLanguage(),
+                        props.getTone(),
+                        props.getCitationPolicy(),
+                        props.getExtra(),
+                        userMessage);
+            } finally {
+                CategoryContext.clear();
+            }
+        });
     }
 }

@@ -18,8 +18,11 @@ import java.util.regex.Pattern;
  * On detection asks the model to redact and try again — LC4j retries up to
  * {@code maxRetries} (default in {@code @OutputGuardrails}).
  *
- * <p>{@code @Component}：spring-boot-starter 处理 {@code @OutputGuardrails(PiiGuardrail.class)}
- * 时优先 {@code getBean(Class)}，找到 spring bean 就用 bean（带 audit 注入）；找不到才反射 new。
+ * <p>{@code @Component}：本类有带参构造（需注入 {@code AuditLogger}），靠
+ * {@link com.lrj.langchain4j.config.SpringClassInstanceFactory}（注册的 LangChain4j
+ * {@code ClassInstanceFactory} SPI）在实例化 {@code @OutputGuardrails(PiiGuardrail.class)} 时
+ * 从 Spring 容器取 bean。<strong>没有这个 SPI，LC4j 会反射调无参构造而抛
+ * {@code NoSuchMethodException}</strong>（starter 本身并不做 {@code getBean}）。
  */
 @Component
 public class PiiGuardrail implements OutputGuardrail {

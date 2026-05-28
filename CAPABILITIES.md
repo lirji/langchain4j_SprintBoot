@@ -59,6 +59,7 @@
 | `Planner` + `Worker` + `Synthesizer` | Multi-Agent DAG | ❌ | ❌ | ❌ | `/chat/multi-agent`, `/chat/multi-agent/stream` |
 | `McpAssistant` | 工具来自外部 MCP server | ❌ | ❌ | MCP | `/chat/mcp` |
 | `QueryClassifier` + `Judge` | LLM-as-router / LLM-as-judge | ❌ | ❌ | ❌ | `/chat/auto`, `/eval/run` 内部 |
+| `GroundednessChecker` | RAG faithfulness 校验（temp=0，事后判答案是否被 source 支撑） | ❌ | ❌ | ❌ | `/chat` + `/chat/category` 内部（`app.rag.grounding.enabled=true`） |
 
 ---
 
@@ -131,6 +132,7 @@
 | Hybrid 分词：HanLP | `tokenizer=hanlp` | HanLP portable + 停用词，中文召回好 |
 | PGVector 原生 Hybrid | `app.rag.pgvector.search-mode=HYBRID` | 向量 + `tsvector` 原生 RRF |
 | **Citation 闭环** | 总是开 | `TaggedSourceContentInjector` 把片段包成 `<source id="文件名#片段号">`，配 `citation-policy` 让模型按 `[doc=ID]` 引用 |
+| **事实幻觉事后校验（grounding）** | `app.rag.grounding.enabled` (默认关) + `threshold` (默认 0.7) | `GroundingService`：Layer 0 引用 id 完整性核对（零 LLM）+ Layer 1 `GroundednessChecker` faithfulness（temp=0，RAGAS 拆断言）；命中追加 `⚠️ 可信度提示`（warn 模式，不改写）。挂在 `/chat` + `/chat/category`，流式不挂 |
 
 ### 7.4 文档加载
 
@@ -203,8 +205,9 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 ## 13. 安全 / Guardrails
 
 - `PiiGuardrail` (`OutputGuardrail`)：检测邮箱、中国手机号、18 位身份证号；命中即 `reprompt` 让模型重写为 `[REDACTED]`，`maxRetries=2`
-- 挂在 `Assistant.chat()`；流式 `chatStream` 暂未挂（流式 guardrail 需缓冲整段，按需再加）
-- 扩展位：`@InputGuardrails(...)` 同理可加输入侧
+- `PromptInjectionGuardrail` (`InputGuardrail`)：12 条 bilingual 规则 + 可选 LLM 分类器；BLOCK/SANITIZE/AUDIT 三档
+- 都挂在 `Assistant.chat()`；流式 `chatStream` 暂未挂（流式 guardrail 需缓冲整段，按需再加）
+- **依赖注入靠自定义 SPI**：guardrail 是带参构造的 `@Component`，LC4j 默认反射无参实例化会抛 `NoSuchMethodException`。`config/SpringClassInstanceFactory`（注册 `ClassInstanceFactory` SPI + `SpringContextHolder`）让 LC4j 从 Spring 容器取 bean。**删了这层 guardrail 直接挂掉**，详见 CLAUDE.md 注意事项
 
 ---
 
@@ -234,10 +237,11 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 ### 黄金集
 `src/main/resources/eval/eval-cases.json`，每条：`{id, question, type?, mustInclude[], mustNotInclude[], judgeHint?}`
 
-当前 26 条：
-- 20 条 `chat`：8 happy / 7 adversarial / 3 工具 / 2 格式+语言
+当前 33 条：
+- 23 条 `chat`：happy / adversarial / 工具 / 格式+语言 + 3 条依赖 ingest 的 RAG 引用/拒答（`rag-citation-*` / `rag-no-match`）
+- 2 条 `grounded`：`grounding-supported-quiet`（充分支撑应静默）/ `grounding-abstain-quiet`（诚实弃答应静默）；需 `app.rag.grounding.enabled=true` + `app.eval.auto-ingest=true`
 - 3 条 `extract`：CRITICAL / HIGH / LOW 优先级抽取
-- 2 条 `multi-agent`：多维比较 (tasks=3) / trivial 不过拆 (tasks=1)
+- 4 条 `multi-agent`：多维比较 (tasks=3) / trivial 不过拆 (tasks=1) / DAG (deps) / 不泄漏子任务结构
 - 1 条 `reflexive`：清晰技术定义题，应一次过
 
 ### 端点
@@ -248,11 +252,12 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 返回 `Summary{totalCases, runsPerCase, totalRuns, passedRuns, overallPassRate, averageScore, totalDurationMs, cases:[{caseId, runs, passedCount, passRate, avgScore, scoreStdev, attempts[]}]}`
 
-### Type Dispatch（跨 4 个 endpoint 统一评测）
+### Type Dispatch（跨 5 个 endpoint 统一评测）
 
 | `type` | 内部调用 | 喂给 Judge 的 answer 形式 |
 | --- | --- | --- |
 | `chat`（默认） | `Assistant.chat(...)` | 模型回复原文 |
+| `grounded` | `GroundingService.applyToFreshAnswer(() -> Assistant.chat(...))` | 模型回复原文（命中闸门时末尾带 `⚠️ 可信度提示`） |
 | `extract` | `Extractor.extractTicket(question)` | Ticket POJO 序列化的 JSON |
 | `multi-agent` | `MultiAgentService.run(question)` | `tasks: N\n<子任务>\n---\n<finalAnswer>` |
 | `reflexive` | `ReflexiveService.chatReflexive(question)` | `attempts: N, accepted: true\n---\n<finalAnswer>` |

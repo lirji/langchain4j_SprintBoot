@@ -11,8 +11,10 @@ import org.springframework.stereotype.Component;
  * LangChain4j {@link InputGuardrail} 实现 —— 把 {@link PromptInjectionDetector} 接到
  * {@code @InputGuardrails(PromptInjectionGuardrail.class)} 的 AiService 入口。
  *
- * <p>spring-boot-starter 看见 {@code @InputGuardrails(Foo.class)} 会优先从 spring 容器
- * {@code getBean(Foo.class)} 拿实例（找不到才反射 new）—— 所以 detector 能被注入。
+ * <p>本类有带参构造（需注入 {@code PromptInjectionDetector}）。LangChain4j 实例化
+ * {@code @InputGuardrails(Foo.class)} 引用的类时默认<strong>反射调无参构造</strong>，会抛
+ * {@code NoSuchMethodException}。靠 {@link com.lrj.langchain4j.config.SpringClassInstanceFactory}
+ * （注册的 {@code ClassInstanceFactory} SPI）从 Spring 容器取 bean，detector 才能被注入。
  *
  * <p>action 映射：
  * <ul>

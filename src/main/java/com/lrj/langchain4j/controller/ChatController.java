@@ -2,6 +2,7 @@ package com.lrj.langchain4j.controller;
 
 import com.lrj.langchain4j.ai.Assistant;
 import com.lrj.langchain4j.ai.CategoryChatService;
+import com.lrj.langchain4j.ai.grounding.GroundingService;
 import com.lrj.langchain4j.ai.extract.Extractor;
 import com.lrj.langchain4j.ai.extract.Ticket;
 import com.lrj.langchain4j.ai.mcp.McpAssistant;
@@ -36,6 +37,7 @@ public class ChatController {
 
     private final Assistant assistant;
     private final ResolvedAssistantStyle assistantProps;
+    private final GroundingService groundingService;
     private final RagIngestionService ragIngestionService;
     private final CategoryChatService categoryChatService;
     private final Extractor extractor;
@@ -47,6 +49,7 @@ public class ChatController {
 
     public ChatController(Assistant assistant,
                           ResolvedAssistantStyle assistantProps,
+                          GroundingService groundingService,
                           RagIngestionService ragIngestionService,
                           CategoryChatService categoryChatService,
                           Extractor extractor,
@@ -57,6 +60,7 @@ public class ChatController {
                           AsyncTaskService asyncTasks) {
         this.assistant = assistant;
         this.assistantProps = assistantProps;
+        this.groundingService = groundingService;
         this.ragIngestionService = ragIngestionService;
         this.categoryChatService = categoryChatService;
         this.extractor = extractor;
@@ -79,12 +83,13 @@ public class ChatController {
     public Map<String, String> chat(@RequestParam(defaultValue = "default") String chatId,
                                     @RequestBody Map<String, String> body) {
         String scoped = scopedChatId(chatId);
-        String reply = assistant.chat(scoped,
+        String message = body.getOrDefault("message", "");
+        String reply = groundingService.applyToFreshAnswer(() -> assistant.chat(scoped,
                 assistantProps.getLanguage(),
                 assistantProps.getTone(),
                 assistantProps.getCitationPolicy(),
                 assistantProps.getExtra(),
-                body.getOrDefault("message", ""));
+                message));
         return Map.of("chatId", chatId, "reply", reply);
     }
 

@@ -211,5 +211,22 @@
     "mustInclude": ["tasks: 3", "HTTP/1.1", "HTTP/2"],
     "mustNotInclude": ["Sub-task 1", "Sub-task 2", "[t1]", "[t2]", "[t3]", "Based on the synthesis", "Based on the specialist"],
     "judgeHint": "/chat/multi-agent。answer 前部是 EvaluationRunner 拼的 'tasks: 3' 块和子任务列表（格式 '  - t1: ...'，无方括号），核心检查 --- 之后的 finalAnswer 段：不应有 'Sub-task 1' / '[t1]' / 'Based on the synthesis' 之类暴露内部 plan 结构的措辞，应该是一个连贯叙事覆盖 3 个维度（连接复用 / 头部压缩 / 多路复用），有合并、有结论。mustNotInclude 里的 [t1]/[t2]/[t3] 只会被 finalAnswer 抄了带方括号格式时命中，子任务列表那部分用的是冒号格式不会触发。"
+  },
+
+  {
+    "id": "grounding-supported-quiet",
+    "type": "grounded",
+    "question": "不论 chat provider 选哪家，本项目的 embedding 模型用的是什么？请按文档作答并标注来源。",
+    "mustInclude": ["nomic-embed-text"],
+    "mustNotInclude": ["可信度提示"],
+    "judgeHint": "走 grounded 类型（Assistant.chat 外包一层 GroundingService，跟 controller /chat 一致）。前置：app.eval.auto-ingest=true 才有文档可召回，app.rag.grounding.enabled=true 闸门才运行。文档 project-faq.md 明确写『embedding 模型始终使用 nomic-embed-text』，是被充分支撑的答案，grounding 闸门不应误报——所以末尾不应出现『可信度提示』。若出现多半是 Layer 0 引用 id 对不上或 Layer 1 判分偏严，是闸门是否过严的信号。"
+  },
+  {
+    "id": "grounding-abstain-quiet",
+    "type": "grounded",
+    "question": "根据文档，本项目采用的开源许可证（License）是什么？",
+    "mustInclude": ["文档"],
+    "mustNotInclude": ["可信度提示", "MIT", "GPL", "Apache 2.0"],
+    "judgeHint": "走 grounded 类型。前置同 grounding-supported-quiet。文档（project-faq.md / eval-spec.md）完全没提 License，按 citationPolicy 正确行为是回复『未在文档中找到相关内容』之类（含『文档』字样），不要编造许可证名。诚实弃答没有事实断言→grounding 闸门记 1.0→不应出现『可信度提示』；这条同时验证闸门不会惩罚正确弃答。"
   }
 ]

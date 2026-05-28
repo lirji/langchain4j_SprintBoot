@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lrj.langchain4j.ai.Assistant;
 import com.lrj.langchain4j.ai.extract.Extractor;
 import com.lrj.langchain4j.ai.extract.Ticket;
+import com.lrj.langchain4j.ai.grounding.GroundingService;
 import com.lrj.langchain4j.ai.multiagent.MultiAgentService;
 import com.lrj.langchain4j.ai.reflexion.ReflexiveService;
 import com.lrj.langchain4j.config.ResolvedAssistantStyle;
@@ -35,6 +36,7 @@ public class EvaluationRunner {
 
     private final Assistant assistant;
     private final ResolvedAssistantStyle assistantProps;
+    private final GroundingService groundingService;
     private final Judge judge;
     private final Extractor extractor;
     private final MultiAgentService multiAgentService;
@@ -47,6 +49,7 @@ public class EvaluationRunner {
 
     public EvaluationRunner(Assistant assistant,
                             ResolvedAssistantStyle assistantProps,
+                            GroundingService groundingService,
                             Judge judge,
                             Extractor extractor,
                             MultiAgentService multiAgentService,
@@ -56,6 +59,7 @@ public class EvaluationRunner {
                             @Value("${app.eval.auto-ingest:false}") boolean autoIngest) {
         this.assistant = assistant;
         this.assistantProps = assistantProps;
+        this.groundingService = groundingService;
         this.judge = judge;
         this.extractor = extractor;
         this.multiAgentService = multiAgentService;
@@ -165,11 +169,12 @@ public class EvaluationRunner {
     private String invokeByType(EvalCase c, int runIndex) {
         return switch (c.effectiveType()) {
             case "chat" -> invokeChat(c, runIndex);
+            case "grounded" -> invokeGrounded(c, runIndex);
             case "extract" -> invokeExtract(c);
             case "multi-agent" -> invokeMultiAgent(c);
             case "reflexive" -> invokeReflexive(c);
             default -> throw new IllegalArgumentException(
-                    "Unknown case type: " + c.type() + " (expected chat|extract|multi-agent|reflexive)");
+                    "Unknown case type: " + c.type() + " (expected chat|grounded|extract|multi-agent|reflexive)");
         };
     }
 
@@ -181,6 +186,24 @@ public class EvaluationRunner {
                 assistantProps.getCitationPolicy(),
                 assistantProps.getExtra(),
                 c.question());
+    }
+
+    /**
+     * 跟 {@link #invokeChat} 一样调 {@code Assistant.chat}，但<strong>包一层 {@link GroundingService}</strong>，
+     * 跟 controller 的 {@code /chat} 路径一致 —— 否则 grounding 的 {@code ⚠️ 可信度提示} 不会出现，
+     * 这类 case 测不到闸门。仅当 {@code app.rag.grounding.enabled=true} 时闸门才真正运行；
+     * 关闭时这里等价于 {@code invokeChat}（直通）。
+     *
+     * <p>注意：grounding case 依赖检索召回，需 {@code app.eval.auto-ingest=true} 才有 source 可校验。
+     */
+    private String invokeGrounded(EvalCase c, int runIndex) {
+        String chatId = "eval-" + c.id() + "-r" + runIndex + "-" + UUID.randomUUID();
+        return groundingService.applyToFreshAnswer(() -> assistant.chat(chatId,
+                assistantProps.getLanguage(),
+                assistantProps.getTone(),
+                assistantProps.getCitationPolicy(),
+                assistantProps.getExtra(),
+                c.question()));
     }
 
     /** Extract Ticket POJO 序列化成 JSON 喂 Judge；保证 priority/category 等可被 mustInclude 字面匹配。 */

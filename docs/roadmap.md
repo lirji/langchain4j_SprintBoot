@@ -29,6 +29,7 @@
 | **Re-rank 默认开 + 跑一次 eval 对比** | 项目有 `OllamaLlmScoringModel` / `JinaScoringModel` 但默认关，从没量化过收益 | 30 分钟跑 eval 对比 rerank on/off，看 passRate 漂动 |
 | ~~**跨 endpoint 的 stream response**~~ | ✅ 完成于 2026-05-27：加 `/chat/multi-agent/stream` + `/chat/reflexive/stream`，SSE 按阶段 emit `plan` / `worker-result` / `synthesis-token` / `done`（multi-agent）和 `attempt-start` / `answer-token` / `critique` / `done`（reflexive）。Worker / Critic 仍非流式（结构化输出 + 多 worker 交错难处理）。见 docs/qa.md Q5 | ~~中~~ |
 | ~~**Chunking 策略优化**~~ | ✅ 完成于 2026-05-27：加 `MarkdownHeaderSplitter`（按 `##` 切节，超长 fallback 到 recursive）+ yml 配置化 `app.rag.chunking.{strategy,max-chars,overlap}`。**实测对本项目结构化 markdown 收益显著**：同一 query 答出 provider 数从 2 → 5（完整召回整个 LLM Provider section）。6 个单元测试。见 docs/qa.md Q8 | ~~中~~ |
+| ~~**RAG 事实幻觉事后校验（grounding）warn 模式**~~ | ✅ 完成于 2026-05-28：`app.rag.grounding.*`（默认关）。Layer 0 引用 id 完整性核对（零 LLM）+ Layer 1 `GroundednessChecker` faithfulness（temp=0，RAGAS 拆断言），命中追加 `⚠️ 可信度提示`。挂 `/chat` + `/chat/category`，仅检索到 source 时跑。7 个单元测试 + 2 条 `grounded` eval case。**剩余**：`on-fail=refuse/regenerate`（v1 只 warn）、流式路径、Layer 2 句级 NLU 归因。详见 CLAUDE.md "RAG 事实幻觉事后校验" 节 | ~~中~~ |
 
 **做不做的判断条件**：B 看你下一步项目走向 —— 还在钻 prompt + RAG 就做"Re-rank 跑 eval 对比"（最快出价值），符合本项目反复推的"调一处看变化"方法论。
 

@@ -10,6 +10,9 @@ import java.util.List;
  * <p>{@code type}（默认 {@code "chat"}）决定 {@link EvaluationRunner} dispatch 到哪个 endpoint：
  * <ul>
  *   <li>{@code chat} — 走 {@code Assistant.chat(...)}（默认）</li>
+ *   <li>{@code grounded} — 同 chat，但包一层 {@code GroundingService}（跟 controller {@code /chat} 一致），
+ *       用来测 RAG 事实幻觉的事后校验闸门。需 {@code app.rag.grounding.enabled=true} 闸门才运行、
+ *       {@code app.eval.auto-ingest=true} 才有 source 可校验</li>
  *   <li>{@code extract} — 走 {@code Extractor.extractTicket(...)}，question 当 input text，Ticket 序列化成 JSON 喂 Judge</li>
  *   <li>{@code multi-agent} — 走 {@code MultiAgentService.run(...)}，把 plan 任务数 + finalAnswer 一起拼成 string 评分</li>
  *   <li>{@code reflexive} — 走 {@code ReflexiveService.chatReflexive(...)}，取 {@code finalAnswer} 评分</li>
@@ -25,7 +28,7 @@ public record EvalCase(
         List<String> mustInclude,
         List<String> mustNotInclude,
         String judgeHint,
-        /** "chat" | "extract" | "multi-agent" | "reflexive"；null/blank 视为 "chat"。 */
+        /** "chat" | "grounded" | "extract" | "multi-agent" | "reflexive"；null/blank 视为 "chat"。 */
         String type
 ) {
     public EvalCase(String id, String question, List<String> mustInclude, List<String> mustNotInclude) {

@@ -6,6 +6,7 @@ import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.content.injector.ContentInjector;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -31,13 +32,17 @@ public class TaggedSourceContentInjector implements ContentInjector {
         StringBuilder sb = new StringBuilder();
         sb.append(userMessage.singleText());
         sb.append("\n\n[Retrieved sources — cite the ones you actually use as `[doc=ID]`]:\n");
+        List<RetrievedSourcesContext.Source> collected = new ArrayList<>(contents.size());
         for (int i = 0; i < contents.size(); i++) {
             TextSegment seg = contents.get(i).textSegment();
             String id = inferId(seg, i);
+            collected.add(new RetrievedSourcesContext.Source(id, seg.text()));
             sb.append("<source id=\"").append(id).append("\">\n");
             sb.append(seg.text()).append("\n");
             sb.append("</source>\n");
         }
+        // 暴露给 grounding 后校验（Layer 0 引用核对 + Layer 1 faithfulness）。调用方负责 clear。
+        RetrievedSourcesContext.set(collected);
         return UserMessage.from(sb.toString());
     }
 
