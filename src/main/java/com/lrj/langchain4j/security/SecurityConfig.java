@@ -1,0 +1,84 @@
+package com.lrj.langchain4j.security;
+
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableMethodSecurity
+@EnableConfigurationProperties({SecurityProperties.class, RateLimitProperties.class, TokenBudgetProperties.class})
+public class SecurityConfig {
+
+    @Bean
+    public ApiKeyAuthFilter apiKeyAuthFilter(SecurityProperties props, com.lrj.langchain4j.audit.AuditLogger audit) {
+        return new ApiKeyAuthFilter(props, audit);
+    }
+
+    @Bean
+    public RateLimitFilter rateLimitFilter(RateLimitProperties props, RateLimiterRegistry registry,
+                                           com.lrj.langchain4j.audit.AuditLogger audit) {
+        return new RateLimitFilter(props, registry, audit);
+    }
+
+    @Bean
+    public TokenBudgetGuardFilter tokenBudgetGuardFilter(TokenBudgetProperties props, TokenBudgetTracker tracker,
+                                                         com.lrj.langchain4j.audit.AuditLogger audit) {
+        return new TokenBudgetGuardFilter(props, tracker, audit);
+    }
+
+    /**
+     * 默认链：
+     * <ul>
+     *   <li>{@code /actuator/health/**} / {@code /actuator/prometheus} / {@code /health} 放行
+     *       （监控 / K8s probe / Prometheus scrape 不能带 user key）</li>
+     *   <li>其余全部要求已认证。{@code ApiKeyAuthFilter} 把合法 key 转成已认证 token。</li>
+     *   <li>无 session（STATELESS），CSRF 关（纯 API）。</li>
+     * </ul>
+     *
+     * 设 {@code app.security.enabled=false} 时走 {@link #disabledSecurityFilterChain}：全放行。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "app.security.enabled", havingValue = "true", matchIfMissing = true)
+    public SecurityFilterChain securityFilterChain(HttpSecurity http,
+                                                   ApiKeyAuthFilter apiKeyAuthFilter,
+                                                   RateLimitFilter rateLimitFilter,
+                                                   TokenBudgetGuardFilter tokenBudgetGuardFilter) throws Exception {
+        return http
+                .csrf(csrf -> csrf.disable())
+                .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .authorizeHttpRequests(auth -> auth
+                        .requestMatchers(
+                                "/actuator/health",
+                                "/actuator/health/**",
+                                "/actuator/info",
+                                "/actuator/prometheus",
+                                "/actuator/tokenbudget",
+                                "/health"
+                        ).permitAll()
+                        .anyRequest().authenticated())
+                .addFilterBefore(apiKeyAuthFilter, UsernamePasswordAuthenticationFilter.class)
+                // 顺序：auth → rate-limit (QPS) → token-budget (成本)。
+                // rate-limit 拒绝更便宜（无 I/O），让它先 short-circuit；token-budget 才查 tracker
+                .addFilterAfter(rateLimitFilter, ApiKeyAuthFilter.class)
+                .addFilterAfter(tokenBudgetGuardFilter, RateLimitFilter.class)
+                .httpBasic(b -> b.disable())
+                .formLogin(f -> f.disable())
+                .build();
+    }
+
+    /** 本地 demo 用：彻底跳过 auth；TenantContext 仍是 ANONYMOUS 兜底。限流也跟着关。 */
+    @Bean
+    @ConditionalOnProperty(name = "app.security.enabled", havingValue = "false")
+    public SecurityFilterChain disabledSecurityFilterChain(HttpSecurity http) throws Exception {
+        return http
+                .csrf(csrf -> csrf.disable())
+                .authorizeHttpRequests(auth -> auth.anyRequest().permitAll())
+                .build();
+    }
+}

@@ -1,11 +1,15 @@
 package com.lrj.langchain4j.ai.guardrail;
 
+import com.lrj.langchain4j.audit.AuditEventType;
+import com.lrj.langchain4j.audit.AuditLogger;
 import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.guardrail.OutputGuardrail;
 import dev.langchain4j.guardrail.OutputGuardrailResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
 
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /**
@@ -13,7 +17,11 @@ import java.util.regex.Pattern;
  * (emails, phone numbers, 18-digit IDs that resemble Chinese national IDs).
  * On detection asks the model to redact and try again — LC4j retries up to
  * {@code maxRetries} (default in {@code @OutputGuardrails}).
+ *
+ * <p>{@code @Component}：spring-boot-starter 处理 {@code @OutputGuardrails(PiiGuardrail.class)}
+ * 时优先 {@code getBean(Class)}，找到 spring bean 就用 bean（带 audit 注入）；找不到才反射 new。
  */
+@Component
 public class PiiGuardrail implements OutputGuardrail {
 
     private static final Logger log = LoggerFactory.getLogger(PiiGuardrail.class);
@@ -21,6 +29,12 @@ public class PiiGuardrail implements OutputGuardrail {
     private static final Pattern EMAIL = Pattern.compile("[\\w.+-]+@[\\w-]+\\.[\\w.-]+");
     private static final Pattern PHONE_CN = Pattern.compile("(?<!\\d)1[3-9]\\d{9}(?!\\d)");
     private static final Pattern ID_CN = Pattern.compile("(?<!\\d)\\d{17}[\\dXx](?!\\d)");
+
+    private final AuditLogger audit;
+
+    public PiiGuardrail(AuditLogger audit) {
+        this.audit = audit;
+    }
 
     @Override
     public OutputGuardrailResult validate(AiMessage responseFromLLM) {
@@ -31,6 +45,7 @@ public class PiiGuardrail implements OutputGuardrail {
         if (hit == null) return OutputGuardrailResult.success();
 
         log.warn("PII guardrail blocked output (matched: {})", hit);
+        audit.record(AuditEventType.GUARDRAIL_PII_REDACTED, Map.of("category", hit));
         // reprompt(...) is a default method on OutputGuardrail itself, not a static on the result.
         return reprompt(
                 "Output contained PII (" + hit + ").",

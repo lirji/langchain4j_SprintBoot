@@ -3,6 +3,7 @@ package com.lrj.langchain4j.controller;
 import com.lrj.langchain4j.eval.EvalCase;
 import com.lrj.langchain4j.eval.EvalResult;
 import com.lrj.langchain4j.eval.EvaluationRunner;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -28,12 +29,14 @@ public class EvalController {
      * 真要做 prompt A/B 一般取 runs=3~5。
      */
     @PostMapping("/run")
+    @PreAuthorize("hasAuthority('SCOPE_eval')")
     public EvalResult.Summary run(@RequestParam(defaultValue = "1") int runs) throws IOException {
         return runner.runDefault(runs);
     }
 
     /** 同 {@link #run}，case 集从 body 来；脚本里搞临时回归用。 */
     @PostMapping("/run-cases")
+    @PreAuthorize("hasAuthority('SCOPE_eval')")
     public EvalResult.Summary runCases(@RequestParam(defaultValue = "1") int runs,
                                        @RequestBody List<EvalCase> cases) {
         return runner.run(cases, runs);

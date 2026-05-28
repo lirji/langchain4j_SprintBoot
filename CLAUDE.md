@@ -6,6 +6,7 @@
 
 - `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
 - `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
+- `docs/production-hardening.md` — **业务化基线 #1–#8 完整落地记录**：多租户隔离 / 限流 / token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送。包含设计要点、关键文件、yml 配置、验证脚本、关键设计决定
 - `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
 - `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
 - `docs/grafana-dashboard.json` — 现成的 7 panel dashboard JSON
@@ -400,6 +401,28 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - `Synthesizer` 编织（不是拼接）成最终答案；prompt 含 5 条 synthesis rules + 4 条 forbidden anti-patterns + 1 个完整对比例。明令禁止 `Sub-task 1/[t1]/Based on the synthesis...` 等暴露内部 plan 结构的措辞，要求按用户的 mental model 组织（aspect / 维度 / 步骤），结尾给出 takeaway
 - 子线程通过 `MdcCopyingTaskDecorator` 继承 `traceId`，日志能串起来
 - `dependsOn` **默认空**（flat 全并行）：仅当 sub-task 指令字面引用另一个 sub-task 输出时才填（"基于 t1 的结果..."）。普通多维度比较 / 独立研究题继续 flat —— 合成由 `Synthesizer` 统一处理
+
+**Plan-and-Execute with Replanning** `app.multi-agent.replan.*`：
+
+- `enabled=false`（默认）— `MultiAgentService.run()` 是 one-shot：`Planner → DAG → Synthesizer → done`，跟历史行为一致
+- `enabled=true` — Synthesizer 出 final answer 后**复用 reflexion 的 `Critic`**（temp=0）打 3 维分；加权聚合 < `threshold`（默认 0.75）触发一次 replan
+- `Replanner`（`ai/multiagent/Replanner.java`）独立 AiService，看上一轮 plan JSON + final answer + 3 维分 + `mainIssue` 产出**结构性修订过的** plan，再跑一遍 DAG
+  - prompt 强制实质改动：禁止原样输出旧 plan；内置 1 例 few-shot（漏 aspect → 加 task + 收紧描述）
+  - 系统提示列出 5 种典型修订形态（补 aspect / 写细描述 / 合并重复 / 改 angle / 拆并行）
+  - 跟 Critic / Judge 一样走独立 temp=0 ChatModel（`LlmConfig.buildJudgeChatModel`），不注册 ChatModel Bean 避免类型冲突
+- `max-replans=1`（默认）— 一次重规划已经覆盖绝大多数 "plan 写偏" case；2 接近极限，再多说明问题本身不可解
+- `Run` 结构升级（向后部分兼容）：
+  - 顶层 `plan / workerResults / finalAnswer` 仍存在，指向**最后一次 attempt**（eval harness 查 `tasks: N` 字面的逻辑不破）
+  - 新增 `attempts: List<Attempt>`：每个 `Attempt(n, plan, workerResults, finalAnswer, critique, aggregate)` 含本轮 critique（关闭 replan 时 `critique=null, aggregate=NaN`）
+  - 新增 `acceptedByThreshold: boolean`：replan 关时恒 true；开时表示最后一轮分数是否过阈
+- **stream 端点不接 replan**（`/chat/multi-agent/stream`）：v1 跳过——SSE 表达跨 attempt 的事件流转复杂度高，价值边际；目前 stream 永远只有 1 个 attempt
+- token 成本：开启 = +1 次 Critic call（恒定） + 0~`max-replans` 次 `(Replanner + 一整轮 DAG worker fan-out + Synthesizer)`。粗算 worst case ≈ 2.5× one-shot
+
+何时该开：
+
+- Eval harness 跑 multi-agent case 发现 final answer 经常漏 aspect / 描述太空 / 用户问 3 方面只答 2 个
+- 单次 plan 在某些 corner case 上稳定失败（比如要"先列再深挖"但 Planner 没用 DAG）
+- 不该用作"省 prompt 工程"的便利按钮：先把 Planner / Worker / Synthesizer 的 prompt 调到能过 baseline 再开 replan
 
 **Output Guardrails** `@OutputGuardrails(PiiGuardrail.class, maxRetries=2)`：
 

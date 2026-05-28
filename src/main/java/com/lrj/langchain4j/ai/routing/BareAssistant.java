@@ -19,6 +19,7 @@ import dev.langchain4j.service.guardrail.OutputGuardrails;
  * <p>跟 Assistant 共用同一份 SYSTEM_PROMPT（citationPolicy 的规则 3 覆盖"无检索"场景，
  * 不会瞎吐 [doc=...] 引用），同一 chatMemoryProvider，所以会话连续性保留 —— 同一 chatId
  * 在 Assistant 和 BareAssistant 之间切换不会丢历史。
+ *
  */
 public interface BareAssistant {
 

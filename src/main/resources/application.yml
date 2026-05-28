@@ -17,6 +17,82 @@ spring:
 # 全部 LLM/Embedding 配置都走 app.llm.* 由 LlmConfig 统一装配。
 
 app:
+  security:
+    # API key 鉴权 + 多租户隔离。关掉本地 demo 仍可裸跑（TenantContext 走 ANONYMOUS 兜底）
+    enabled: true
+    # api-key -> { tenant, user, scopes }。生产应换成 DB / Redis；这里 dev seed 两个 key 演示
+    # 调用示例：curl -H "X-Api-Key: dev-key-tenantA-admin" -X POST localhost:8080/chat ...
+    api-keys:
+      dev-key-tenantA-admin:
+        tenant: tenantA
+        user: alice
+        # scopes 会变成 SimpleGrantedAuthority("SCOPE_xxx")，配合 @PreAuthorize("hasAuthority('SCOPE_xxx')")
+        scopes: [chat, ingest, eval]
+      dev-key-tenantB-readonly:
+        tenant: tenantB
+        user: bob
+        scopes: [chat]
+
+  rate-limit:
+    # token bucket 限流，per-(tenantId, endpoint family)，每分钟刷桶。429 + Retry-After
+    enabled: true
+    # 单位：每分钟最大请求数。endpoint family 在 RateLimitFilter.familyOf() 里按 URL 路径映射
+    defaults:
+      chat: 60         # /chat /chat/category /chat/multi-agent /chat/reflexive /chat/auto /chat/mcp /extract/*
+      stream: 20       # /chat/stream /chat/reflexive/stream /chat/multi-agent/stream —— SSE 占连接，限更紧
+      ingest: 5        # /rag/ingest —— 写操作 + 重，必须限紧
+      eval: 5          # /eval/run /eval/run-cases
+      default: 120     # 其余未明确归类的 endpoint
+    # 未鉴权租户（ANONYMOUS）的配额倍率。0.2 表示 anonymous 只享受 default 配额的 20%
+    anonymous-multiplier: 0.2
+    # 大客户单独提配额示例
+    overrides: {}
+    #   tenantA:
+    #     chat: 600
+    #     stream: 100
+
+  async:
+    # 异步任务 store 的 TTL —— 终态 task 保留多久（超时被 @Scheduled cleanup 清掉）
+    task-ttl: PT24H
+    webhook:
+      # task 完成时给客户端回调。客户端在 /chat/multi-agent/async body 里传 webhookUrl 才生效
+      enabled: true
+      # HMAC-SHA256 签名 secret，放 X-Webhook-Signature header。生产从环境变量 / K8s Secret 取
+      hmac-secret: ${WEBHOOK_HMAC_SECRET:dev-secret-change-me}
+      # 单次请求超时（包括 connect + read）
+      timeout: PT5S
+      # 失败重试次数（不计首次）。退避公式：backoff * 3^(attempt-1)。默认 1s/3s/9s 共 3 次
+      max-retries: 3
+      backoff: PT1S
+
+  guardrail:
+    injection:
+      # Prompt-injection 检测 —— LangChain4j InputGuardrail 挂在主 Assistant.chat / chatStream
+      # 检测顺序：规则匹配（免费、即时）→ 可选 LLM 分类器（精准但每条 query 多 1 次 LLM call）
+      enabled: true
+      # block（默认）— fatal 终止调用，调用方拿错误
+      # sanitize — user message 替换为 [QUERY REDACTED]，模型仍执行
+      # audit — 只 warn 日志放行，生产灰度初期用来观察误伤率
+      action: block
+      llm:
+        # 默认关 —— 规则覆盖 95% 已知 jailbreak，启用 LLM 才接 1-shot 模糊攻击。token 成本敏感时不要开
+        enabled: false
+        # LLM 返回 confidence ≥ 此值才判定 injection。0.7 是经验起点；0.5 容易误伤、0.9 容易漏过
+        confidence-threshold: 0.7
+
+  token-budget:
+    # 日 token 预算 —— 跟 rate-limit 是两个维度：限流挡突发，token-budget 控成本
+    # 覆盖 chat / stream / eval family（会触发 LLM 调用）；ingest 走 embedding 暂不计入
+    enabled: true
+    # 日历日重置以哪个时区为准。建议显式配，避免随 server timezone 漂
+    timezone: Asia/Shanghai
+    daily-tokens:
+      default: 100000   # 默认每天 10 万 token / tenant —— 大概 ~50 次 multi-agent 调用
+      overrides: {}
+      #   tenantA: 500000
+    # anonymous 兜底租户的预算倍率。0.05 表示 anonymous 只享受 default 的 5%
+    anonymous-multiplier: 0.05
+
   llm:
     # ollama | openai | anthropic | gemini | deepseek | vllm
     # 切 provider 只影响 chat/streaming-chat；embedding 由 app.embedding.provider 独立控制。
@@ -167,6 +243,21 @@ app:
       correctness: 0.4
       completeness: 0.4
       clarity: 0.2
+
+  multi-agent:
+    replan:
+      # Plan-and-Execute 闭环：Synthesizer 出最终答案后跑 Critic 评分，
+      # 加权聚合 < threshold → 让 Replanner 看着上一轮 plan/answer/mainIssue 出新 plan，
+      # 重跑 DAG。默认关 —— 开启会额外多 1 次 Critic + 可能 1 次 Replanner + 一整轮 worker fan-out。
+      enabled: false
+      threshold: 0.75
+      # 上限 = 多少次"额外"重规划（首次执行不计入）。常见值 1；2 已经接近极限，更多说明 plan 写崩
+      max-replans: 1
+      # 跟 reflexion 同款 3 维加权，独立配置便于未来分别调整
+      weights:
+        correctness: 0.4
+        completeness: 0.4
+        clarity: 0.2
   mcp:
     enabled: false
     # stdio | http
@@ -270,7 +361,8 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,prometheus
+        # tokenbudget：自定义 endpoint，per-tenant 当日 token 用量快照（运维 dashboard 用）
+        include: health,info,metrics,prometheus,tokenbudget
   endpoint:
     health:
       # always 让 K8s probe / 运维直接看到每个 component 详情；actuator 端口通常只对内网开放
@@ -291,4 +383,5 @@ logging:
     dev.langchain4j: INFO
     com.lrj: DEBUG
   pattern:
-    console: "%d{HH:mm:ss.SSS} [%thread] [%X{traceId:-}] %-5level %logger{36} - %msg%n"
+    # ApiKeyAuthFilter 会把 tenantId/userId 灌进 MDC；未挂租户（actuator 等放行路径）显示空
+    console: "%d{HH:mm:ss.SSS} [%thread] [%X{traceId:-}] [%X{tenantId:-}/%X{userId:-}] %-5level %logger{36} - %msg%n"

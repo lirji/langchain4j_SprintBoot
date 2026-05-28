@@ -1,5 +1,10 @@
 package com.lrj.langchain4j.ai.multiagent;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.lrj.langchain4j.ai.reflexion.Critic;
+import com.lrj.langchain4j.ai.reflexion.Critique;
+import com.lrj.langchain4j.config.MultiAgentConfig.PlanExecuteProperties;
 import dev.langchain4j.service.TokenStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,43 +44,139 @@ import java.util.stream.Collectors;
 public class MultiAgentService {
 
     private static final Logger log = LoggerFactory.getLogger(MultiAgentService.class);
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     private final Planner planner;
+    private final Replanner replanner;
     private final Worker worker;
     private final Synthesizer synthesizer;
+    private final Critic critic;
+    private final PlanExecuteProperties replanProps;
     private final Executor executor;
 
     public MultiAgentService(Planner planner,
+                             Replanner replanner,
                              Worker worker,
                              Synthesizer synthesizer,
+                             Critic critic,
+                             PlanExecuteProperties replanProps,
                              @Qualifier("multiAgentExecutor") Executor executor) {
         this.planner = planner;
+        this.replanner = replanner;
         this.worker = worker;
         this.synthesizer = synthesizer;
+        this.critic = critic;
+        this.replanProps = replanProps;
         this.executor = executor;
     }
 
     public record WorkerResult(String taskId, String description, String result) {}
 
-    public record Run(Plan plan, List<WorkerResult> workerResults, String finalAnswer) {}
+    /**
+     * 一轮 plan → execute → synthesize 的产物。replan 关闭时只有 1 个；开启时按时间序，
+     * 最后一个是最终采纳的。{@code critique} 在 replan 关闭时为 null（没评分）。
+     */
+    public record Attempt(int n,
+                          Plan plan,
+                          List<WorkerResult> workerResults,
+                          String finalAnswer,
+                          Critique critique,
+                          double aggregate) {}
+
+    /**
+     * Multi-agent 调用的完整产物。
+     *
+     * <p>{@code finalAnswer} = 最后一个 attempt 的 finalAnswer，方便 controller 直接取。
+     * {@code acceptedByThreshold}：replan 关时恒为 true；开时表示最后一轮分数是否 ≥ threshold。
+     *
+     * <p>顶层 {@code plan} / {@code workerResults} 字段保留指向**最后一个 attempt**，
+     * 兼容旧 eval harness 里查 "tasks: N" 字面的 case。多轮明细看 {@code attempts}。
+     */
+    public record Run(Plan plan,
+                      List<WorkerResult> workerResults,
+                      String finalAnswer,
+                      List<Attempt> attempts,
+                      boolean acceptedByThreshold) {}
 
     public Run run(String question) {
+        List<Attempt> attempts = new ArrayList<>();
         Plan plan = planner.plan(question);
         log.info("planner produced {} sub-tasks", plan.tasks().size());
 
+        Attempt first = executeAndScore(question, plan, 1);
+        attempts.add(first);
+
+        if (!replanProps.isEnabled()) {
+            // 关闭 replan 时不评分（critique=null, aggregate=NaN），保持原 token 成本
+            return finalize(attempts, true);
+        }
+
+        // replan 开启：以阈值为门、按 max-replans 上限循环
+        int n = 1;
+        Attempt last = first;
+        while (last.aggregate() < replanProps.getThreshold() && n - 1 < replanProps.getMaxReplans()) {
+            n++;
+            log.info("attempt {} agg={} below threshold {}, asking Replanner (issue: {})",
+                    n - 1, last.aggregate(), replanProps.getThreshold(),
+                    last.critique() != null ? last.critique().mainIssue() : "n/a");
+            Plan revised = revisePlan(question, last);
+            last = executeAndScore(question, revised, n);
+            attempts.add(last);
+        }
+
+        boolean accepted = last.aggregate() >= replanProps.getThreshold();
+        return finalize(attempts, accepted);
+    }
+
+    /** 跑一轮：DAG 执行 → synthesize → （如果 replan 开启）critique。 */
+    private Attempt executeAndScore(String question, Plan plan, int n) {
+        List<WorkerResult> ordered = executeDag(plan);
+        String formatted = ordered.stream()
+                .map(r -> "[" + r.taskId() + "] " + r.description() + "\n→ " + r.result())
+                .collect(Collectors.joining("\n\n"));
+        String answer = synthesizer.synthesize(question, formatted);
+
+        if (!replanProps.isEnabled()) {
+            return new Attempt(n, plan, ordered, answer, null, Double.NaN);
+        }
+        Critique c = critic.critique(question, answer);
+        double agg = aggregate(c);
+        log.info("attempt {} critique corr={} comp={} clar={} agg={} issue={}",
+                n, c.correctness(), c.completeness(), c.clarity(), agg, c.mainIssue());
+        return new Attempt(n, plan, ordered, answer, c, agg);
+    }
+
+    private Plan revisePlan(String question, Attempt last) {
+        String prevPlanJson;
+        try {
+            prevPlanJson = JSON.writeValueAsString(last.plan());
+        } catch (JsonProcessingException e) {
+            // 极不可能（Plan 是简单 record），兜底用 toString
+            log.warn("failed to serialize previous plan, falling back to toString", e);
+            prevPlanJson = last.plan().toString();
+        }
+        Critique c = last.critique();
+        return replanner.revise(question, prevPlanJson, last.finalAnswer(),
+                c.correctness(), c.completeness(), c.clarity(), c.mainIssue());
+    }
+
+    /** 把 attempts 收口成 Run：顶层字段指向最后一个 attempt（向后兼容 eval harness）。 */
+    private Run finalize(List<Attempt> attempts, boolean accepted) {
+        Attempt last = attempts.get(attempts.size() - 1);
+        return new Run(last.plan(), last.workerResults(), last.finalAnswer(), attempts, accepted);
+    }
+
+    private List<WorkerResult> executeDag(Plan plan) {
         List<List<SubTask>> levels = topologicalLevels(plan.tasks());
         if (levels == null) {
             log.warn("cycle detected in plan, falling back to flat fan-out (deps ignored)");
             levels = List.of(plan.tasks());
         }
-
         Map<String, WorkerResult> byId = new ConcurrentHashMap<>();
         List<WorkerResult> ordered = new ArrayList<>(plan.tasks().size());
-
         for (List<SubTask> level : levels) {
             List<CompletableFuture<WorkerResult>> futures = level.stream()
-                    .map(t -> CompletableFuture.supplyAsync(
-                            () -> runOne(t, byId), executor))
+                    .map(t -> CompletableFuture.supplyAsync(() -> runOne(t, byId), executor))
                     .toList();
             for (CompletableFuture<WorkerResult> f : futures) {
                 WorkerResult r = f.join();
@@ -83,13 +184,19 @@ public class MultiAgentService {
                 ordered.add(r);
             }
         }
+        return ordered;
+    }
 
-        String formatted = ordered.stream()
-                .map(r -> "[" + r.taskId() + "] " + r.description() + "\n→ " + r.result())
-                .collect(Collectors.joining("\n\n"));
-
-        String finalAnswer = synthesizer.synthesize(question, formatted);
-        return new Run(plan, ordered, finalAnswer);
+    /** 加权聚合 Critique 3 维分；权重总和当分母，跟 ReflexiveService 保持一致。 */
+    private double aggregate(Critique c) {
+        PlanExecuteProperties.Weights w = replanProps.getWeights();
+        double sum = w.getCorrectness() + w.getCompleteness() + w.getClarity();
+        if (sum <= 0) {
+            return (c.correctness() + c.completeness() + c.clarity()) / 3.0;
+        }
+        return (w.getCorrectness() * c.correctness()
+                + w.getCompleteness() * c.completeness()
+                + w.getClarity() * c.clarity()) / sum;
     }
 
     /**
@@ -134,13 +241,20 @@ public class MultiAgentService {
                     .map(r -> "[" + r.taskId() + "] " + r.description() + "\n→ " + r.result())
                     .collect(Collectors.joining("\n\n"));
 
+            final Plan finalPlan = plan;
+            final List<WorkerResult> finalOrdered = ordered;
             TokenStream tokens = synthesizer.synthesizeStream(question, formatted);
             tokens
                     .onPartialResponse(token -> safeSend(emitter, "synthesis-token", token))
                     .onCompleteResponse(resp -> {
-                        // 全文一并发一次，方便客户端做最终落盘 / metric 计算
+                        // 全文一并发一次，方便客户端做最终落盘 / metric 计算。
+                        // stream 暂不接 replan 闭环 —— 单 attempt + acceptedByThreshold=true，
+                        // 跟 replan 关闭时的 run() 语义一致。lambda 捕获用 final 别名是为了
+                        // 兼容 "effectively final" 在某些 javac 版本对集合方法调用的检查口径。
                         String text = resp.aiMessage() != null ? resp.aiMessage().text() : "";
-                        safeSend(emitter, "done", new Run(plan, ordered, text));
+                        Attempt only = new Attempt(1, finalPlan, finalOrdered, text, null, Double.NaN);
+                        safeSend(emitter, "done", new Run(finalPlan, finalOrdered, text,
+                                List.of(only), true));
                         emitter.complete();
                     })
                     .onError(err -> {

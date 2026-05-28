@@ -2,6 +2,7 @@ package com.lrj.langchain4j.config;
 
 import com.lrj.langchain4j.rag.CategoryContext;
 import com.lrj.langchain4j.rag.hybrid.DocumentMirror;
+import com.lrj.langchain4j.security.TenantContext;
 import com.lrj.langchain4j.rag.hybrid.HanLpKeywordTokenizer;
 import com.lrj.langchain4j.rag.hybrid.KeywordContentRetriever;
 import com.lrj.langchain4j.rag.hybrid.KeywordTokenizer;
@@ -30,6 +31,7 @@ import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
 import dev.langchain4j.rag.query.router.DefaultQueryRouter;
 import dev.langchain4j.rag.query.router.QueryRouter;
 import dev.langchain4j.store.embedding.EmbeddingStore;
+import dev.langchain4j.store.embedding.filter.Filter;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -55,10 +57,7 @@ public class LangChain4jConfig {
                 .embeddingModel(embeddingModel)
                 .maxResults(topK)
                 .minScore(minScore)
-                .dynamicFilter(query -> {
-                    String category = CategoryContext.get();
-                    return category == null ? null : metadataKey("category").isEqualTo(category);
-                })
+                .dynamicFilter(query -> tenantScopedFilter(CategoryContext.get()))
                 .build();
     }
 
@@ -76,11 +75,22 @@ public class LangChain4jConfig {
                 .embeddingModel(embeddingModel)
                 .maxResults(candidateSize)
                 .minScore(0.3)
-                .dynamicFilter(query -> {
-                    String category = CategoryContext.get();
-                    return category == null ? null : metadataKey("category").isEqualTo(category);
-                })
+                .dynamicFilter(query -> tenantScopedFilter(CategoryContext.get()))
                 .build();
+    }
+
+    /**
+     * 检索时强制 AND 一个 {@code tenantId} filter —— 多租户隔离的兜底。category 仍按
+     * {@link CategoryContext} 可选叠加。
+     *
+     * <p>{@code TenantContext.current()} 在未挂 auth filter 时返回 {@link TenantContext#ANONYMOUS}，
+     * 即"未鉴权也能查到 anonymous 租户的数据"。生产部署确保 {@code app.security.enabled=true}
+     * 即可保证只有合法 key 能匹配到任何片段。
+     */
+    private static Filter tenantScopedFilter(String category) {
+        Filter tenant = metadataKey("tenantId").isEqualTo(TenantContext.current().tenantId());
+        if (category == null) return tenant;
+        return Filter.and(tenant, metadataKey("category").isEqualTo(category));
     }
 
     @Bean
