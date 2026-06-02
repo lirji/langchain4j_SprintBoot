@@ -7,7 +7,8 @@
 - `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
 - `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
 - `docs/production-hardening.md` — **业务化基线 #1–#8 完整落地记录**：多租户隔离 / 限流 / token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送。包含设计要点、关键文件、yml 配置、验证脚本、关键设计决定
-- `docs/workflow-integration.md` — **业务落地接入设计（规划/实施中）**：客服场景的工作流编排（Flowable BPMN + 人工审批 + 状态持久化）/ SSO·OAuth（暂缓）/ 渠道接入（飞书样板）。含阶段决策、Flowable 三个坑、退款审批样板流程、待确认 TODO
+- `docs/workflow-integration.md` — **业务落地接入设计（规划/实施中）**：客服场景的工作流编排（Flowable BPMN 7.1.0 + 人工审批 + 状态持久化）/ SSO·OAuth（暂缓）/ 渠道接入（飞书样板）。含阶段决策、Flowable 三个坑、退款审批样板流程、待确认 TODO
+- `docs/nl2sql.md` — **NL2SQL / ChatBI（Milestone 2.A 已落地并验证）**：自然语言→SQL→只读执行→解读的受控链路。核心是 6 层 SQL 安全护栏（L1 只读账号 / L2 语句白名单 / L3 表白名单 / L4 强制 LIMIT / L5 超时 / L6 租户谓词）+ Schema 注入（含中文枚举 distinct 值）+ few-shot。`POST /chat/sql`，MySQL demo 库，`app.nl2sql.*` 默认关，需 tool-calling 模型。含本地验证记录（4 用例全过）+ 待做的 2.B（自修环 / 数字 grounding / eval `type:"sql"`）
 - `docs/knowledge-base.md` — **企业知识库问答系统落地**：Milvus 持久化 + Apache Tika 解析 PDF/Office 上传 + `kb` profile（`application-kb.yml`）+ 端到端验证（多租户隔离 / 重启持久化 / 版本覆盖）
 - `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
 - `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
@@ -89,7 +90,7 @@ src/main/
 documents/                                 RAG 文档目录（.txt/.md/.pdf 等）
 ```
 
-> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）。详见对应 `docs/*.md`。
+> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）、`nl2sql`（NL2SQL/ChatBI：6 层 SQL 安全护栏 + 只读执行，默认关）。详见对应 `docs/*.md`。
 
 ## 构建 / 测试 / 打包
 
@@ -120,6 +121,7 @@ mvn package -DskipTests
 - `eval/CaseAggregateTest` — multi-run 聚合（passRate / avgScore / σ）算法
 - `ai/multiagent/MultiAgentServiceTest` — DAG 拓扑排序 / 环检测降级
 - `ai/grounding/GroundingServiceTest` — Layer 0 编造引用检测 / 弃答跳过
+- `nl2sql/SqlGuardTest` — NL2SQL 安全护栏（18 case）：注入拦截 / 只读 / 表白名单 / 强制 LIMIT / 租户谓词
 
 没有 lint / formatter / 覆盖率插件配置（pom 里只有 `spring-boot-maven-plugin`）。**LLM 行为回归靠 eval harness（见末尾「评测 Harness」节），不是 JUnit** —— JUnit 只覆盖确定性的纯逻辑，凡是要连模型的断言都走 `/eval/run`。
 
@@ -174,6 +176,7 @@ DEEPSEEK_API_KEY=sk-... mvn spring-boot:run -Dspring-boot.run.arguments=--app.ll
 
 注意：
 
+- **多参数覆盖优先用环境变量，别堆逗号**：`-Dspring-boot.run.arguments=--a=x,--b=y` 实测有过"只有第一个参数生效、第二个被静默丢弃"的情况（NL2SQL 落地时 `--app.nl2sql.enabled=true,--app.llm.ollama.model-name=qwen3:14b` 第二个没生效，排查良久）。要同时覆盖多个 key 时改用 env var（relaxed binding 稳）：`APP_NL2SQL_ENABLED=true APP_LLM_OLLAMA_MODEL_NAME=qwen3:14b mvn spring-boot:run`。单参数用 `-Dspring-boot.run.arguments` 没问题。
 - **EmbeddingModel 由独立开关装配**（`app.embedding.provider`），跟 chat provider 完全解耦 —— 见下面 "切换 Embedding Provider" 节。切换 chat 不影响 RAG 已入库的向量。
 - `application.yml` 里**不要**再添加 `langchain4j.ollama.chat-model` / `langchain4j.<provider>.chat-model` 块，否则 LangChain4j starter 会和 `LlmConfig` 各创建一个 `ChatModel` Bean → 启动冲突。所有 chat/streaming 配置都走 `app.llm.<provider>.*`。
 - Tool calling 在 Gemini / DeepSeek-V3 上行为略有差异；`@AiService` 接口代码无需改。
@@ -251,6 +254,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | POST | `/chat/multi-agent/stream` | SSE 流式 multi-agent：按阶段 emit `plan` / `worker-result` / `synthesis-token` / `done`。**Synthesizer 那 10-20s 一次性等变成 token-by-token 立刻看** |
 | POST | `/chat/mcp` | 由 MCP server 的工具驱动的对话（需 `app.mcp.enabled=true`） |
 | POST | `/chat/auto` | LLM-as-router：classifier 分类成 RAG/TOOL/CHAT 分别走 Assistant 或 BareAssistant（需 `app.query-router.enabled=true`）；返回 `{decision, reply, classifyMs, answerMs}` |
+| POST | `/chat/sql` | NL2SQL / ChatBI：自然语言 → 只读 SELECT → 执行 → 解读（需 `app.nl2sql.enabled=true`）；返回 `{question, sql, rowCount, rows, answer, guardBlocked}`。需 tool-calling 模型。见 `docs/nl2sql.md` |
 | POST | `/eval/run?runs=N` | 跑 `resources/eval/eval-cases.json` 黄金集，每 case 跑 N 次（默认 1）；返回 per-case avg/σ/passRate + 整体 |
 | POST | `/eval/run-cases?runs=N` | body 传 `EvalCase[]` 跑临时集（N 同上） |
 | GET  | `/actuator/health` | Spring Boot Actuator |

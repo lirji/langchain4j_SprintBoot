@@ -11,6 +11,11 @@ spring:
       timeout: PT2S
       lettuce:
         shutdown-timeout: PT0S
+  # NL2SQL 的 demo 库种子由 Nl2SqlConfig 手动跑（ResourceDatabasePopulator），
+  # 关掉 Spring Boot 的 schema.sql/data.sql 自动初始化，避免它包住我们的 DataSource。
+  sql:
+    init:
+      mode: never
 
 # 不要在 langchain4j.* 下加任何 chat-model / streaming-chat-model / embedding-model 配置块，
 # 否则 LangChain4j starter 会和 LlmConfig 各创建一份 Bean → 启动冲突。
@@ -370,6 +375,43 @@ app:
       metric: cosine
       create-table: true
       buckets: 4
+
+  # NL2SQL / ChatBI（POST /chat/sql）。默认关；开启需 spring-boot-starter-jdbc + mysql-connector-j（已在 pom）。
+  # 自然语言 → SQL → 只读执行 → 解读。安全靠 6 层护栏（见 docs/nl2sql.md）：
+  #   L1 只读 DB 账号 / L2 单语句+关键字黑名单 / L3 表白名单 / L4 强制 LIMIT / L5 超时 / L6 租户谓词
+  # 前置：① 本机 MySQL（默认 localhost:3306），admin（默认 root）有建库/建用户/授权权限；
+  #       ② Ollama 起一个支持 tool-calling 的模型（llama3.1 / qwen2.5+ / qwen3），默认 chat 模型见 app.llm.ollama。
+  # 本地验证（env var 传参最稳，避免 -Dspring-boot.run.arguments 逗号分隔只生效第一个的坑）：
+  #   NL2SQL_DB_PASSWORD=root APP_NL2SQL_ENABLED=true APP_LLM_OLLAMA_MODEL_NAME=qwen3:14b mvn spring-boot:run
+  #   curl -X POST localhost:8080/chat/sql -H 'Content-Type: application/json' \
+  #        -H 'X-Api-Key: dev-key-tenantA-admin' \
+  #        -d '{"question":"退款金额最高的3个客户，列出名字和退款总额"}'
+  nl2sql:
+    enabled: false
+    datasource:
+      # admin：建库（createDatabaseIfNotExist）/ 建表 / 种子 / 内省 schema（useInformationSchema 让列注释可读）
+      url: "jdbc:mysql://localhost:3306/nl2sql_demo?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&useInformationSchema=true"
+      # 只读池：不带 createDatabaseIfNotExist（只读账号无建库权限）。留空则与 admin 共用 url
+      readonly-url: "jdbc:mysql://localhost:3306/nl2sql_demo?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&useInformationSchema=true"
+      admin-username: root          # 建表 / 种子 / 建只读账号；密码走环境变量
+      admin-password: "${NL2SQL_DB_PASSWORD:}"
+      readonly-username: nl2sql_ro  # SqlQueryTool 实际执行（只 GRANT SELECT，L1）
+      readonly-password: nl2sql_ro
+      seed-script: db/nl2sql-demo.sql   # classpath；接真实库时置空（不建 demo 表）
+    max-rows: 1000                  # L4：无 LIMIT 时强制追加
+    query-timeout-seconds: 5        # L5：statement 超时
+    allow-tables:                   # L3 表白名单（也是 SchemaProvider 暴露范围）
+      - orders
+      - customers
+      - refunds
+    tenant-scoped-tables:           # L6：这些表必须带 tenant_id 过滤
+      - orders
+      - customers
+      - refunds
+    enforce-tenant-predicate: true  # L6 开关（demo 想省事可关）
+    enum-columns:                   # 坑3：把 distinct 值带进 schema，帮模型用对中文枚举
+      orders:
+        - status
 
 management:
   endpoints:

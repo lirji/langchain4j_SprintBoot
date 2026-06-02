@@ -23,7 +23,9 @@ public enum AuditEventType {
     ASYNC_TASK_CANCELLED("task.cancelled"),
 
     WEBHOOK_DELIVERED("webhook.delivered"),
-    WEBHOOK_FAILED("webhook.failed");
+    WEBHOOK_FAILED("webhook.failed"),
+
+    NL2SQL_QUERY("nl2sql.query");
 
     private final String wire;
 

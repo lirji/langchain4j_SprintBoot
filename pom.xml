@@ -177,6 +177,15 @@
             <version>8.4.0</version>
         </dependency>
 
+        <!-- NL2SQL（app.nl2sql.*，默认关）：JdbcTemplate 执行只读查询。
+             DataSource 由 Nl2SqlConfig 手动构建（@ConditionalOnProperty），
+             DataSourceAutoConfiguration 已在主 App 排除，保持默认启动无 datasource。
+             demo 库走 MySQL（驱动复用上面的 mysql-connector-j）。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

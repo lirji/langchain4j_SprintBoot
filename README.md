@@ -11,3 +11,8 @@
 | `docs/qa.md` | 概念性问答记录（路由 / 决策权 / 设计取舍） |
 | `docs/grafana-dashboard.json` | 现成 7-panel dashboard |
 | `CAPABILITIES.md` | 本文档：能力清单（参考/checklist） |
+
+
+# 项目场景
+
+- 引入企业知识库落地场景。（2026-06-02）

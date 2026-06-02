@@ -4,6 +4,13 @@
 区别于 `docs/production-hardening.md`（已落地的业务平台基线 #1–#8），本文是 **下一阶段的接入规划**，
 目前处于"设计已定、分块实施中"状态。
 
+> **场景规划定位（2026-06-02）**：本项目下一阶段落地**两个并行业务场景** ——
+> **#1 智能客服全闭环（本文）** + **#2 NL2SQL / ChatBI（`docs/nl2sql.md`）**。
+> #2 更独立（纯 `@Tool` 扩展、无新有状态依赖），建议**先 #2 后 #1**；但两者解耦，顺序可调。
+> 本文工作流（Milestone 1.A）→ 飞书渠道（Milestone 1.B）两段也可独立交付。
+> **注意**：#1 的 Flowable 与 #2 的只读库都要引 `spring.datasource`，两特性同开时第二 DataSource
+> 必须 `@Qualifier` 显式区分（建议主 DataSource = Flowable，NL2SQL 用命名 Bean）——详见 `docs/nl2sql.md` 坑 1。
+
 > 触发背景：production-hardening 已经把 auth / 限流 / 配额 / 文档生命周期 / 审计 / 异步 / 推送
 > 这套 SaaS 平台层做完了。要真正落到"客服 + 知识库"业务，还差三块对外接入：
 > **① 工作流编排（人工审批 / 状态持久化）② SSO/OAuth ③ 渠道（企微/钉钉/飞书/Web/IVR）**。
@@ -68,7 +75,9 @@ Controller ──► Assistant.chat (RAG + 记忆 + guardrail, 已有)
 **坑 1：项目当前没有主 SQL 数据源，但 Flowable 强依赖。**
 现有持久化是 Redis（ChatMemory）+ 向量库 + `mysql-connector-j`（仅给 Doris 走 MySQL 协议）。
 Flowable 引擎需要一个 JDBC `DataSource`，启动时自动建 ~25 张 `ACT_*` 表。处理：
-- 引 `flowable-spring-boot-starter-process`（**7.x** 才兼容 Spring Boot 3.3.5 / Java 21；6.x 是 Spring Boot 2）
+- 引 `flowable-spring-boot-starter-process:7.1.0`（**7.x** 才兼容 Spring Boot 3.3.5 / Java 21；6.x 是 Spring Boot 2）。
+  **版本已钉死 7.1.0**：7.x 系专为 Spring Boot 3 / Spring 6 / Java 17 而生；最新 7.2.0 也兼容 SB3，但
+  已知 **7.2.0 不兼容 Spring Boot 4**，本项目在 3.3.5，选保守稳妥的 7.1.0。升级 SB 到 4.x 时再评估 Flowable 8
 - 配 `spring.datasource.*`：**dev 用 H2 内存**（零运维），**prod 用 MySQL/PG**
 - 这是新引入的**有状态依赖**，跟 production-hardening "内存起步"风格不同，需单独记一笔
 
@@ -161,9 +170,8 @@ src/main/resources/processes/refund-approval.bpmn20.xml
 
 ### 待确认 / 实施前 TODO
 
-- [ ] **Flowable 版本钉定**：确认 `flowable-spring-boot-starter-process` 与 Spring Boot 3.3.5 兼容的
-      具体 7.x 版本（查 Maven Central，避免 pom 写错浪费构建）
-- [ ] H2（dev）依赖 + `spring.datasource` 配置
+- [x] **Flowable 版本钉定**：`flowable-spring-boot-starter-process:7.1.0`（SB 3.3.5 稳妥；7.2.0 不兼容 SB4，故不选最新）
+- [ ] H2（dev）依赖 + `spring.datasource` 配置（与 #2 NL2SQL 的只读库用 `@Qualifier` 区分，见 `docs/nl2sql.md` 坑 1）
 - [ ] `@ConditionalOnProperty(app.workflow.enabled)` 包住整套，默认关，不影响现有启动
 - [ ] BPMN 部署方式：classpath 自动部署 vs 启动时 `repositoryService.createDeployment()`
 

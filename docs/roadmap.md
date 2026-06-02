@@ -62,6 +62,13 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 > 把"持久化向量库（Milvus）+ 持久化记忆（Redis）+ grounding"一次性拧到生产基线 —— 上面"多实例化/持久化"
 > 相关 ⏳ 在知识库场景下已给出落地路径。详见 `docs/knowledge-base.md`。
 
+> **下一阶段两个业务场景（2026-06-02）**：
+> - **#2 NL2SQL / ChatBI** → `docs/nl2sql.md`（自然语言查库 + 6 层 SQL 安全护栏）。**✅ Milestone 2.A 已落地并验证**
+>   （MySQL demo 库 + 18 个 SqlGuard 单测 + 4 条端到端用例全过）。2.B（自修环 / 数字 grounding / eval `type:"sql"`）待按信号补
+> - **#1 智能客服全闭环** → `docs/workflow-integration.md`（Flowable 7.1.0 工作流 + 人工审批 + 飞书渠道；设计已定，待实施）
+>
+> 两者解耦、各自 `@ConditionalOnProperty` 默认关。剩余顺序 **#1.A（工作流）→ #1.B（飞书）**。
+
 ---
 
 ## D. 现有 prompt 自身还能再调
