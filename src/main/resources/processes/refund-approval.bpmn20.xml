@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xmlns:flowable="http://flowable.org/bpmn"
+             targetNamespace="http://www.flowable.org/processdef">
+
+    <!--
+      退款审批样板流程（docs/workflow-integration.md）。
+      assess(抽工单) → 网关(priority 高?) → [UserTask 人工审批] → 网关(批准?) → resolve / reject → End
+
+      ServiceTask 用 flowable:expression 调 Spring bean serviceTaskDelegates 的方法（见 ServiceTaskDelegates）。
+      v1 async executor 关：所有 ServiceTask 在触发线程同步执行，故 start() 返回时流程已到 End 或停在 UserTask。
+      租户隔离不靠 BPMN——发起时把 tenantId 写成流程变量，WorkflowService 按变量过滤待办。
+    -->
+    <process id="refundApproval" name="退款审批" isExecutable="true">
+
+        <startEvent id="start"/>
+        <sequenceFlow id="flowStartAssess" sourceRef="start" targetRef="assess"/>
+
+        <!-- 抽工单：写 priority / category / summary -->
+        <serviceTask id="assess" name="抽工单"
+                     flowable:expression="${serviceTaskDelegates.assess(execution)}"/>
+        <sequenceFlow id="flowAssessGw" sourceRef="assess" targetRef="needApprovalGw"/>
+
+        <!-- 是否需要人工审批：HIGH / CRITICAL 走审批，其余自动受理 -->
+        <exclusiveGateway id="needApprovalGw" default="flowToResolveAuto"/>
+        <sequenceFlow id="flowToApprove" sourceRef="needApprovalGw" targetRef="approveRefund">
+            <conditionExpression xsi:type="tFormalExpression">
+                ${priority == 'HIGH' || priority == 'CRITICAL'}
+            </conditionExpression>
+        </sequenceFlow>
+        <sequenceFlow id="flowToResolveAuto" sourceRef="needApprovalGw" targetRef="resolve"/>
+
+        <!-- 人工审批：挂起等人。完成时带 approved(boolean) / comment -->
+        <userTask id="approveRefund" name="审批退款"/>
+        <sequenceFlow id="flowApproveGw" sourceRef="approveRefund" targetRef="approvedGw"/>
+
+        <!-- 批准? -->
+        <exclusiveGateway id="approvedGw" default="flowToReject"/>
+        <sequenceFlow id="flowToResolve" sourceRef="approvedGw" targetRef="resolve">
+            <conditionExpression xsi:type="tFormalExpression">${approved}</conditionExpression>
+        </sequenceFlow>
+        <sequenceFlow id="flowToReject" sourceRef="approvedGw" targetRef="reject"/>
+
+        <!-- 受理：生成答复，写 reply -->
+        <serviceTask id="resolve" name="生成答复"
+                     flowable:expression="${serviceTaskDelegates.resolve(execution)}"/>
+        <sequenceFlow id="flowResolveEnd" sourceRef="resolve" targetRef="end"/>
+
+        <!-- 驳回：写驳回话术 reply -->
+        <serviceTask id="reject" name="驳回"
+                     flowable:expression="${serviceTaskDelegates.reject(execution)}"/>
+        <sequenceFlow id="flowRejectEnd" sourceRef="reject" targetRef="end"/>
+
+        <endEvent id="end"/>
+    </process>
+</definitions>

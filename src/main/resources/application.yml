@@ -37,6 +37,11 @@ app:
         tenant: tenantB
         user: bob
         scopes: [chat]
+      # 审批人 key：可发起对话 + 审批工作流（SCOPE_approve 守 /workflow/tasks*）
+      dev-key-tenantA-approver:
+        tenant: tenantA
+        user: carol
+        scopes: [chat, approve]
 
   rate-limit:
     # token bucket 限流，per-(tenantId, endpoint family)，每分钟刷桶。429 + Retry-After
@@ -412,6 +417,62 @@ app:
     enum-columns:                   # 坑3：把 distinct 值带进 schema，帮模型用对中文枚举
       orders:
         - status
+
+  # 工作流编排（POST /workflow/*）。默认关；开启需一个可用的 MySQL（建 ~25 张 ACT_* 表）。
+  # 客服长流程：抽工单 → priority 高则人工审批（UserTask 挂起等人，DB 持久化）→ 通过/驳回 → 生成答复。
+  # 详见 docs/workflow-integration.md。本地验证（env var 传参最稳）：
+  #   WORKFLOW_DB_PASSWORD=root APP_WORKFLOW_ENABLED=true mvn spring-boot:run
+  #   # 发起（任意已认证 key）
+  #   curl -X POST localhost:8080/workflow/refund/start -H 'Content-Type: application/json' \
+  #        -H 'X-Api-Key: dev-key-tenantA-admin' -d '{"message":"我要退款，订单一直发不了货，急","chatId":"u1"}'
+  #   # 审批人查待办 + 完成（需 SCOPE_approve）
+  #   curl localhost:8080/workflow/tasks -H 'X-Api-Key: dev-key-tenantA-approver'
+  #   curl -X POST localhost:8080/workflow/tasks/{taskId}/complete -H 'Content-Type: application/json' \
+  #        -H 'X-Api-Key: dev-key-tenantA-approver' -d '{"approved":true,"comment":"同意退款"}'
+  workflow:
+    enabled: false
+    # 审批超时：UserTask 挂起超过此时长被 ApprovalTimeoutSweeper 自动驳回（防永久挂起，F 节 🔴 一档 #1）。
+    # ISO-8601 Duration；本地验证可压成 PT20S。env override：APP_WORKFLOW_APPROVAL_TIMEOUT
+    approval-timeout: PT24H
+    # 超时扫描间隔（毫秒），默认 60s。env override：APP_WORKFLOW_TIMEOUT_SWEEP_INTERVAL_MS
+    timeout-sweep-interval-ms: 60000
+    # #3 事务边界 + 补偿：ServiceTask 内 LLM（抽工单 / 生成答复）的最大尝试次数（含首次）。
+    # complete() 在同一 Flowable 事务里同步跑 resolve；LLM 抛异常会回滚已记录的人工审批决定。
+    # 故重试耗尽后不抛异常，改写降级兜底答复、事务照常提交（用户总能拿到终态回复）。
+    llm-max-attempts: 2
+    llm-retry-backoff-ms: 500
+    # #4 历史表无限增长：已结束且早于保留期的 ACT_HI_* 历史实例 + WF_REPLY 行由 WorkflowHistoryCleaner 定期删。
+    # 审计留痕另走 logs/audit.jsonl，Flowable 历史只为流程态查询，可短留。ISO-8601 Duration。
+    history-retention: P30D
+    history-cleanup-interval-ms: 3600000
+    # #8 终态回推可靠投递：start 传了 webhookUrl 才入队。补 WebhookDispatcher 内存重试"进程一挂就丢"的缺口。
+    # 签名/超时复用 app.async.webhook.*。投递成功→DELIVERED；4xx 或重试耗尽→DEAD（DLQ，人工捞 WF_OUTBOX 表）。
+    outbox:
+      poll-interval-ms: 30000   # 重投扫描间隔
+      batch-size: 50            # 单轮最多投递条数
+      max-attempts: 6           # 含首次，超过进 DEAD
+      base-backoff-ms: 5000     # 指数退避基数：第 n 次失败后下次 = now + base*3^(n-1)
+    datasource:
+      # 默认本机 MySQL，首次启动自动建 flowable 库；密码走环境变量。接已有库时去掉 createDatabaseIfNotExist。
+      url: "jdbc:mysql://localhost:3306/flowable?createDatabaseIfNotExist=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai&nullCatalogMeansCurrent=true"
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      username: root
+      password: "${WORKFLOW_DB_PASSWORD:}"
+
+  # 渠道接入（Milestone 1.B）。默认关。飞书样板：入站意图路由（退款/投诉→工作流，其余→对话）+ 5s ack + 异步回推。
+  # 回调端点 POST /channel/feishu/event（SecurityConfig 已放行，用飞书自带验签解密，不带 X-Api-Key）。
+  # 凭据来自飞书开放平台开发者后台；走环境变量，yml 留空。详见 docs/workflow-integration.md「渠道（飞书）」。
+  channel:
+    feishu:
+      enabled: false
+      app-id: "${FEISHU_APP_ID:}"
+      app-secret: "${FEISHU_APP_SECRET:}"
+      verification-token: "${FEISHU_VERIFICATION_TOKEN:}"   # 留空=明文模式不校验 token
+      encrypt-key: "${FEISHU_ENCRYPT_KEY:}"                 # 留空=事件订阅未开加密（回调明文）
+      base-url: https://open.feishu.cn                      # Lark 国际版换 open.larksuite.com
+      tenant: tenantA                                       # 飞书应用映射到的内部租户（对齐 seed 的审批人 key）
+      approver-chat-id: "${FEISHU_APPROVER_CHAT_ID:}"       # 高风险审批卡片推送目标会话；留空则不推卡片
+      http-timeout-ms: 5000
 
 management:
   endpoints:

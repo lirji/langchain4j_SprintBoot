@@ -25,7 +25,24 @@ public enum AuditEventType {
     WEBHOOK_DELIVERED("webhook.delivered"),
     WEBHOOK_FAILED("webhook.failed"),
 
-    NL2SQL_QUERY("nl2sql.query");
+    NL2SQL_QUERY("nl2sql.query"),
+
+    WORKFLOW_STARTED("workflow.started"),
+    APPROVAL_REQUESTED("approval.requested"),
+    APPROVAL_GRANTED("approval.granted"),
+    APPROVAL_REJECTED("approval.rejected"),
+    APPROVAL_TIMEOUT("approval.timeout"),
+    WORKFLOW_COMPLETED("workflow.completed"),
+    // LLM 在 ServiceTask 内重试耗尽后写降级兜底答复（#3 失败补偿：不回滚人工决定，改为降级落地）
+    REPLY_DEGRADED("reply.degraded"),
+    // 历史实例 + WF_REPLY 行按保留期清理（#4 历史表无限增长）
+    WORKFLOW_HISTORY_PRUNED("workflow.history_pruned"),
+    // 终态回推可靠投递（#8 outbox）：投递成功 / 单次失败待重试 / 重试耗尽进 DLQ
+    WORKFLOW_PUSH_DELIVERED("workflow.push_delivered"),
+    WORKFLOW_PUSH_FAILED("workflow.push_failed"),
+    WORKFLOW_PUSH_DEAD("workflow.push_dead"),
+    // 按 chatId 清除某租户的工作流持久化数据（#10 PII 合规删除）
+    WORKFLOW_DATA_PURGED("workflow.data_purged");
 
     private final String wire;
 

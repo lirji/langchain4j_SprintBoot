@@ -5,6 +5,7 @@
 ## 配套文档
 
 - `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
+- `docs/scenarios.md` — **业务场景落地总览**：把已落地/规划中的业务场景汇总在一处（① 企业知识库问答 ✅ / ② 智能客服：NL2SQL ✅、工作流编排 🚧、渠道 🚧），含各场景状态、核心端点、关键文件、怎么跑，是场景层的导航入口
 - `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
 - `docs/production-hardening.md` — **业务化基线 #1–#8 完整落地记录**：多租户隔离 / 限流 / token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送。包含设计要点、关键文件、yml 配置、验证脚本、关键设计决定
 - `docs/workflow-integration.md` — **业务落地接入设计（规划/实施中）**：客服场景的工作流编排（Flowable BPMN 7.1.0 + 人工审批 + 状态持久化）/ SSO·OAuth（暂缓）/ 渠道接入（飞书样板）。含阶段决策、Flowable 三个坑、退款审批样板流程、待确认 TODO
@@ -90,7 +91,7 @@ src/main/
 documents/                                 RAG 文档目录（.txt/.md/.pdf 等）
 ```
 
-> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）、`nl2sql`（NL2SQL/ChatBI：6 层 SQL 安全护栏 + 只读执行，默认关）。详见对应 `docs/*.md`。
+> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）、`nl2sql`（NL2SQL/ChatBI：6 层 SQL 安全护栏 + 只读执行，默认关）、`workflow`（Flowable BPMN 工作流编排：退款审批样板 + 人工审批 + MySQL 持久化。上生产硬化 #1–#10 全落地：`ApprovalTimeoutSweeper` 超时自动驳回（#1）+ `dedupeId`/businessKey 幂等（#2）+ `ServiceTaskDelegates.withRetry` LLM 失败降级补偿/事务边界（#3）+ `WorkflowHistoryCleaner` 历史表按保留期清理/history=audit（#4）+ `WorkflowReplyStore` reply 出流程变量落 `WF_REPLY` 业务表（#5）+ 版本分布日志（#6）+ claim/unclaim + 并发审批 409（#7）+ `WorkflowOutbox`/`WorkflowOutboxDispatcher` 终态回推持久 outbox + DLQ（#8）+ `WorkflowMetrics` 接 Micrometer（#9）+ `purge` PII 合规删除（#10），默认关）、`channel/feishu`（飞书渠道 Milestone 1.B：`FeishuController` 回调 + `FeishuCrypto` AES 解密/验签 + `FeishuIntent` 意图分类 + `FeishuClient` 出站/token 缓存 + `FeishuChannelService` 意图路由[退款→工作流/其余→对话] + `FeishuReplyListener` 监听 `WorkflowTerminalEvent` 回推，5s ack + 异步回推 + 审批卡片闭环，默认关）。详见对应 `docs/*.md`。
 
 ## 构建 / 测试 / 打包
 
@@ -255,6 +256,13 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | POST | `/chat/mcp` | 由 MCP server 的工具驱动的对话（需 `app.mcp.enabled=true`） |
 | POST | `/chat/auto` | LLM-as-router：classifier 分类成 RAG/TOOL/CHAT 分别走 Assistant 或 BareAssistant（需 `app.query-router.enabled=true`）；返回 `{decision, reply, classifyMs, answerMs}` |
 | POST | `/chat/sql` | NL2SQL / ChatBI：自然语言 → 只读 SELECT → 执行 → 解读（需 `app.nl2sql.enabled=true`）；返回 `{question, sql, rowCount, rows, answer, guardBlocked}`。需 tool-calling 模型。见 `docs/nl2sql.md` |
+| POST | `/workflow/refund/start` | 退款审批工作流：抽工单 → 高优先级人工审批 → 通过/驳回 → 答复（需 `app.workflow.enabled=true` + MySQL）；body 可选 `dedupeId`（按 `tenant:chatId:dedupeId` 幂等去重）/ `webhookUrl`（终态经 outbox 可靠回推）；返回 `{instanceId, status, reply, taskId, priority, deduplicated}`。见 `docs/workflow-integration.md` |
+| GET  | `/workflow/tasks` | 本租户待审任务列表（需 `SCOPE_approve`），含 `assignee` |
+| POST | `/workflow/tasks/{taskId}/claim` `/unclaim` | 认领 / 取消认领任务（需 `SCOPE_approve`）；已被他人领 → 409 |
+| POST | `/workflow/tasks/{taskId}/complete` | 完成审批 body `{approved, comment}`（需 `SCOPE_approve`）→ 同步跑 resolve/reject → 返回 `{reply}`；并发双重审批 → 409 |
+| GET  | `/workflow/instances/{instanceId}` | 工作流实例状态 + reply |
+| DELETE | `/workflow/data?chatId=` | PII 合规删除：清本租户该 chatId 的运行/历史实例 + reply + outbox（需 `SCOPE_approve`） |
+| POST | `/channel/feishu/event` | 飞书事件订阅 / 卡片回调入口（需 `app.channel.feishu.enabled=true`）：URL 握手回 challenge + 消息事件（意图路由：退款/投诉→工作流，其余→对话）+ 审批卡片回调。安全链放行（飞书自带验签，不带 X-Api-Key）。见 `docs/workflow-integration.md`「渠道（飞书）」 |
 | POST | `/eval/run?runs=N` | 跑 `resources/eval/eval-cases.json` 黄金集，每 case 跑 N 次（默认 1）；返回 per-case avg/σ/passRate + 整体 |
 | POST | `/eval/run-cases?runs=N` | body 传 `EvalCase[]` 跑临时集（N 同上） |
 | GET  | `/actuator/health` | Spring Boot Actuator |

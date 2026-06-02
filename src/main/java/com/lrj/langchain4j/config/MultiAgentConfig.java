@@ -123,7 +123,7 @@ public class MultiAgentConfig {
      * 同时透传到子线程。multi-agent worker fan-out 和 eval 子任务都依赖这个 ——
      * 没有它，子线程拿不到 tenant 就会越权或在 RAG 检索时 fail-fast 到 anonymous。
      */
-    static class MdcCopyingTaskDecorator implements TaskDecorator {
+    public static class MdcCopyingTaskDecorator implements TaskDecorator {
         @Override
         public Runnable decorate(Runnable runnable) {
             Map<String, String> context = MDC.getCopyOfContextMap();

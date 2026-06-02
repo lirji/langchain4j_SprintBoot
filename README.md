@@ -5,6 +5,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | `CLAUDE.md` | 本仓库给 AI 协作者用的总览（含技术栈/扩展点/注意事项） |
+| `docs/scenarios.md` | 业务场景落地总览（知识库问答 / 智能客服，各场景状态与接入入口） |
 | `PROMPT_JOURNEY.md` | Prompt 工程 + eval harness + 生产化的完整演化日志 |
 | `docs/roadmap.md` | 待完善项 / ROI 分档 / 决策表 |
 | `docs/observability.md` | Prometheus / Grafana / Health Check 接入 |
@@ -16,3 +17,6 @@
 # 项目场景
 
 - 引入企业知识库落地场景。（2026-06-02）
+- 引入智能客服落地场景（NL2SQL/ChatBI 已落地；工作流编排 + 渠道接入规划中）。（2026-06-02）
+
+> 场景落地总览见 `docs/scenarios.md`。

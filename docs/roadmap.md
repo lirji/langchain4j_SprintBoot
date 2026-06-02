@@ -3,7 +3,7 @@
 项目已经"够生产用"。下面这些是从"能跑"到"完善"的差距，按 ROI 分档。
 每条带工作量估计和**做不做的判断条件** —— 不是 todo 越多越好，是为了避免"觉得该做但没做"的隐性焦虑。
 
-最后更新：2026-05-28（业务化基线 #1–#8 落地后）。
+最后更新：2026-06-02（工作流 Milestone 1.A + 1.A.1/1.A.2/1.A.3 落地 — 上生产 gap #1–#10 全清）。
 
 ---
 
@@ -65,9 +65,11 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 > **下一阶段两个业务场景（2026-06-02）**：
 > - **#2 NL2SQL / ChatBI** → `docs/nl2sql.md`（自然语言查库 + 6 层 SQL 安全护栏）。**✅ Milestone 2.A 已落地并验证**
 >   （MySQL demo 库 + 18 个 SqlGuard 单测 + 4 条端到端用例全过）。2.B（自修环 / 数字 grounding / eval `type:"sql"`）待按信号补
-> - **#1 智能客服全闭环** → `docs/workflow-integration.md`（Flowable 7.1.0 工作流 + 人工审批 + 飞书渠道；设计已定，待实施）
+> - **#1 智能客服全闭环** → `docs/workflow-integration.md`。**✅ M1.A 工作流（含上生产硬化 #1–#10）+ M1.B 飞书渠道
+>   （意图路由 + 验签解密 + 5s ack + 异步回推 + 审批卡片闭环）均已落地**（飞书出站/卡片回调需真应用联调）。
 >
-> 两者解耦、各自 `@ConditionalOnProperty` 默认关。剩余顺序 **#1.A（工作流）→ #1.B（飞书）**。
+> 两者解耦、各自 `@ConditionalOnProperty` 默认关。客服闭环 #1.A（工作流）→ #1.B（飞书）已按序交付；
+> 后续：企微/钉钉/Web/IVR 复制飞书范式 + 飞书多租户 tenant_key 映射。
 
 ---
 
@@ -81,6 +83,30 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 | **few-shot 例子换成 production 数据** | 现有 Extractor / Planner 例子是手写，可以从真实业务案例里挑 3-5 个真实场景 |
 
 **做不做的判断条件**：D 适合 prompt 工程兴趣不减的时候做。当前 eval 信号在大部分 case 都是 1.0，扩 case 集是让 Judge 重新有"扣分空间"的最直接方式。
+
+---
+
+## F. 工作流上生产前待补（Milestone 1.A 后）
+
+Milestone 1.A（Flowable 退款审批）已端到端跑通,但那是 **curl happy path**。下面是审批类长流程
+**上线后真正咬人**、当前实现尚未覆盖的 gap,按"会不会真出事故"分三档。**#1–#10 已全部落地（M1.A.1 超时/幂等 + M1.A.2 事务补偿/历史表/大变量/版本化 + M1.A.3 并发审批/回推 outbox/可观测性/PII 删除）**,工作流上生产硬化清零,接飞书渠道前无阻塞。
+完整的"触发信号 → 该做什么"明细见 `docs/workflow-integration.md`「上生产前待补的工作流问题」节,此处只做 ROI 总览。
+
+| 档 | 项 | 一句话 | ROI / 触发条件 |
+| --- | --- | --- | --- |
+| 🔴 一档 | ~~**审批超时 / SLA / 升级**~~ | ✅ 完成于 2026-06-02（M1.A.1）：`ApprovalTimeoutSweeper`（`@Scheduled` 扫挂起超 `app.workflow.approval-timeout` 的 UserTask）→ `WorkflowService.expireTask` 自动驳回 + 审计 `approval.timeout`。**刻意不用 BPMN boundary timer**（那要 `asyncExecutorActivate=true`，会重开坑 2）。日志跨事件串联靠流程变量 `startTraceId` |
+| 🔴 一档 | ~~**幂等 / 重复启动**~~ | ✅ 完成于 2026-06-02（M1.A.1）：`start` 加 `dedupeId` → Flowable `businessKey`（`tenant:chatId:dedupeId`）+ start 前查重复用既有实例。无 dedupeId 走随机 UUID（不去重）。残留查-建竞态记了 Redis SETNX 升级点 |
+| 🔴 一档 | ~~**`complete` 同步跑 LLM 的事务 / 补偿**~~ | ✅ 完成于 2026-06-02（M1.A.2）：`ServiceTaskDelegates.withRetry` 给 assess/resolve LLM 调用加有界重试 + 降级补偿——**绝不向 Flowable 抛异常**（那会回滚已记录的人工审批决定），耗尽则写降级兜底答复、事务照常提交。事务边界 = 「人工决定 + 一定有终态 reply」原子。延迟仍在（同步等 LLM），彻底去延迟留待渠道阶段异步化 |
+| 🟡 二档 | ~~**历史表无限增长**~~ | ✅ 完成于 2026-06-02（M1.A.2）：`WorkflowConfig.setHistory("audit")`（不用 full）+ `WorkflowHistoryCleaner` `@Scheduled` 删超 `app.workflow.history-retention`（默 P30D）已结束历史实例 + `WF_REPLY` 行 |
+| 🟡 二档 | ~~**大文本进流程变量**~~ | ✅ 完成于 2026-06-02（M1.A.2）：`reply` 挪到业务表 `WF_REPLY`（`WorkflowReplyStore`，建在 workflow 数据源、写 join 同事务 → 原子 + 持久），同时服务 #3 补偿落点。priority/summary 等短字段仍留流程变量 |
+| 🟡 二档 | ~~**流程定义版本化 / in-flight 实例**~~ | ✅ 完成于 2026-06-02（M1.A.2）：续旧版是 Flowable 原生默认；`WorkflowConfig.logVersionTopology` 启动打印各版本在途实例数；策略——微调直接重部署，结构性改动换 `process id`（新 key） |
+| 🟢 三档 | ~~**任务分配粒度 + 并发双重审批**~~ | ✅ M1.A.3（2026-06-02）：`claim`/`unclaim` 端点 + assignee；`complete`/`expireTask` 竞态 `FlowableObjectNotFoundException`→**409**（不再 500）；`TaskView` 加 assignee。未做 candidateGroup（assignee 够用） |
+| 🟢 三档 | ~~**回推"最后一公里"可靠性**~~ | ✅ M1.A.3：持久化 `WF_OUTBOX` + `WorkflowOutboxDispatcher` @Scheduled 重投（指数退避，4xx/超阈→DEAD DLQ），补 `WebhookDispatcher` 内存重试"进程一挂就丢"的缺口。`start` 传 `webhookUrl` 终态入队，复用 `WebhookSigner`。target 现指 webhook、将来指飞书回调 |
+| 🟢 三档 | ~~**工作流可观测性**~~ | ✅ M1.A.3：`WorkflowMetrics` 接 Micrometer——挂起 gauge / 审批耗时 timer / 各终态 counter / 超时 counter，同走 `/actuator/prometheus` |
+| 🟢 三档 | ~~**PII 合规删除**~~ | ✅ M1.A.3：`purge(chatId)` 删运行/历史实例 + `WF_REPLY` + `WF_OUTBOX`；`DELETE /workflow/data`（`SCOPE_approve`）；审计 `workflow.data_purged` |
+
+**做不做的判断条件**：这些 gap 的共性是 **curl happy path 测不出来** —— 全是"挂起期间出意外 / 渠道重试 / 跑久了 / 多人并发"才暴露。
+**至此 #1–#10 全部落地（M1.A.1/1.A.2/1.A.3）**，工作流上生产硬化清单清零；剩下的工作流增量是渠道阶段的多 pod 调度加锁（outbox `SKIP LOCKED`）、飞书卡片 payload 等，归到渠道里做。
 
 ---
 
@@ -114,6 +140,13 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 | 真上 vLLM 看到偶发 5xx | C 的"熔断" |
 | 真开始烧云端 API 钱 | C 的"Token 配额 → cost-based 升级（USD）" |
 | 部署到多 pod 出现状态不一致 | C 的"多实例化（Redis-backed state）" |
+| **准备接飞书/任意渠道到工作流** | ✅ F 的 🔴 一档全清：超时 + 幂等（M1.A.1）+ 事务/补偿（M1.A.2）已落地；渠道阶段可直接开工 |
+| 审批工单挂起后没人处理、用户干等 | ✅ F 的"审批超时 / SLA / 升级"（M1.A.1 已落地：`ApprovalTimeoutSweeper` 自动驳回） |
+| Flowable `ACT_HI_*` 表膨胀 / 查询变慢 | ✅ F 的"历史表无限增长 + 大变量落业务表"（M1.A.2：history=audit + `WorkflowHistoryCleaner` + reply 落 `WF_REPLY`） |
+| 多审批人同租户互踩 / 并发 complete 报 500 | ✅ F 的"任务分配粒度 + 并发双重审批"（M1.A.3：claim/unclaim + 竞态 409） |
+| 终态回推失败用户干等 / 需可靠投递 | ✅ F 的"回推最后一公里"（M1.A.3：`WF_OUTBOX` 持久 outbox + 重投 + DLQ） |
+| 要看工作流挂起数/审批时长/超时率 | ✅ F 的"工作流可观测性"（M1.A.3：`WorkflowMetrics` 接 Micrometer） |
+| 个保法"删除我的数据"落到工作流表 | ✅ F 的"PII 合规删除"（M1.A.3：`DELETE /workflow/data` purge） |
 
 没出现的信号就不做。
 
@@ -123,6 +156,7 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 
 - 项目历史 → `PROMPT_JOURNEY.md`（看每一轮怎么做的）
 - 业务化基线 #1–#7 落地 → `docs/production-hardening.md`
+- 工作流接入设计 + 上生产 gap 明细 → `docs/workflow-integration.md`
 - 已完成的运营基建 → `docs/observability.md`
 - 问答 → `docs/qa.md`
 - 项目导航 → `CLAUDE.md`

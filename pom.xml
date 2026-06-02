@@ -186,6 +186,20 @@
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
 
+        <!-- 工作流编排（app.workflow.*，默认关）：Flowable BPMN 引擎。
+             刻意用 flowable-spring（core + Spring 集成）而非 flowable-spring-boot-starter-process：
+             starter 的自动装配只要在 classpath 就会触发、强依赖一个自动装配的主 DataSource，而本项目
+             DataSourceAutoConfiguration 已在主 App 排除（默认无主 SQL 源）→ starter 会让默认启动报错。
+             flowable-spring 无 spring-boot autoconfig，引擎由 WorkflowConfig 在 @ConditionalOnProperty
+             下手动 buildProcessEngine()，关闭时零开销 —— 跟 LlmConfig 绕开 ollama starter、
+             Nl2SqlConfig 手动建 DataSource 同一套路。版本钉 7.1.0（SB 3.3.5 / Spring 6 / Java 21 稳妥）。
+             引擎数据源走 MySQL（驱动复用下面已声明的 mysql-connector-j），建 ~25 张 ACT_* 表。 -->
+        <dependency>
+            <groupId>org.flowable</groupId>
+            <artifactId>flowable-spring</artifactId>
+            <version>7.1.0</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
