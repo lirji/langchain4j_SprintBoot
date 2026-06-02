@@ -7,7 +7,7 @@
 
 ---
 
-## A. 真该做（短期内可能踩坑）
+## A. 真该做
 
 **✅ 全部完成于 2026-05-27**。
 
@@ -57,6 +57,10 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 | 多实例化（Redis-backed state） | ⏳ | 真上多实例 / K8s 多 pod 部署。Token tracker / Document registry / Task store 当前是内存，注释里已写好切 Redis 的扩展点 |
 
 **做不做的判断条件**：剩下的 ⏳ 仍是"等真正需要再加"。每条触发条件明确，等到了再做就行。
+
+> **知识库落地（2026-06-02）**：新增 `kb` profile（`application-kb.yml`）+ Apache Tika 解析 PDF/Office 上传。
+> 把"持久化向量库（Milvus）+ 持久化记忆（Redis）+ grounding"一次性拧到生产基线 —— 上面"多实例化/持久化"
+> 相关 ⏳ 在知识库场景下已给出落地路径。详见 `docs/knowledge-base.md`。
 
 ---
 

@@ -10,7 +10,7 @@ import java.time.Instant;
  * @param docId        SHA-256(tenantId + ":" + displayName) 前 16 hex，URL-safe，同名重传保持稳定
  * @param tenantId     租户隔离 key
  * @param displayName  上传时的文件名 / title
- * @param contentType  MIME，目前限 text/plain / text/markdown
+ * @param contentType  MIME（上传时透传，仅回显；正文由 Apache Tika 解析，支持 PDF/Office/text 等）
  * @param sizeBytes    原始字节数（统计用）
  * @param segmentCount 切片数量
  * @param version      第几次上传同名文档，从 1 开始

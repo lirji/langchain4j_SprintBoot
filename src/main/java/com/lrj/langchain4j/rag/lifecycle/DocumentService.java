@@ -99,6 +99,10 @@ public class DocumentService {
                 .put("tenantId", tenantId)
                 .put("docId", docId)
                 .put("displayName", displayName)
+                // file_name 是 TaggedSourceContentInjector.inferId 优先读的 key（跟
+                // FileSystemDocumentLoader 的默认 key 对齐）—— 不写它，上传文档的引用会退化成
+                // 通用 [doc=doc#N]，而不是 [doc=<文件名>#N]。splitter 会把 doc metadata 复制进每个 segment。
+                .put("file_name", displayName)
                 .put("version", String.valueOf(nextVersion));
         if (category != null && !category.isBlank()) {
             doc.metadata().put("category", category);

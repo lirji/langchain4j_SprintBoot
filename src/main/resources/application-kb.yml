@@ -1,0 +1,69 @@
+# ============================================================================
+# 企业知识库问答系统 —— 生产 profile
+#
+# 激活：mvn spring-boot:run -Dspring-boot.run.arguments=--spring.profiles.active=kb
+#       或 java -jar app.jar --spring.profiles.active=kb
+#
+# 只覆盖默认 application.yml 里「为了本地开发而设的非生产取向」开关，把它们一次性拧到
+# 知识库生产基线：持久化向量库 + 持久化会话记忆 + 幻觉提示 + 收得下真实 PDF。
+# 其余开关（rerank / hybrid / query-expansion 等）默认保持关，按需在下方放开。
+#
+# 前置依赖：
+#   docker run -d -p 19530:19530 milvusdb/milvus:v2.4.10 milvus run standalone
+#   docker run -d -p 6379:6379 redis
+#   ollama 已起（默认 chat=llama3.1 / embedding=nomic-embed-text）
+# ============================================================================
+
+spring:
+  servlet:
+    multipart:
+      # 默认 1MB 装不下真实 PDF/Office；知识库上传放大到 20MB。
+      max-file-size: 20MB
+      max-request-size: 20MB
+  data:
+    redis:
+      # 生产改成实际 Redis 地址（或用环境变量覆盖）。默认走本机容器。
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+app:
+  security:
+    # 知识库必须鉴权 —— 租户隔离（检索 dynamicFilter 强制 AND tenantId）依赖 TenantContext 有真实身份。
+    # 关掉会退到 ANONYMOUS 租户，所有人共享一份库。生产钉死开。
+    enabled: true
+
+  memory:
+    # 持久化会话记忆，多实例/重启安全（默认 in-memory 重启即丢）。
+    store: redis
+
+  rag:
+    # 持久化向量库。默认 in-memory 重启丢整个知识库 —— 生产必须换。
+    store: milvus
+    # 文档元数据注册表也走持久化 —— 否则向量在 Milvus 里活着，但 GET /rag/documents 重启后列空。
+    # 跟 store: milvus 配套，避免"向量还在但列表空"的割裂。
+    registry:
+      store: redis
+    milvus:
+      host: ${MILVUS_HOST:localhost}
+      port: ${MILVUS_PORT:19530}
+      collection: document_embeddings
+      # 小规模 FLAT 精确召回即可；语料上百万 chunk 再换 IVF_FLAT / HNSW。
+      index-type: FLAT
+      metric-type: COSINE
+
+    grounding:
+      # 知识库场景开启事实幻觉事后校验：答案命中检索 source 时，Layer 0 核对引用 id 完整性 +
+      # Layer 1 faithfulness 拆断言比对，疑似未被支撑就在末尾追加 ⚠️ 可信度提示（warn 模式，不改写不拒答）。
+      enabled: true
+      threshold: 0.7
+
+# ---------------------------------------------------------------------------
+# 维度坑（务必知道）：
+#   embedding 维度 = Milvus collection 维度。默认 nomic-embed-text=768。
+#   若切 bge-m3(1024)（app.embedding.provider=openai-compat），必须先 drop 旧 collection 再重建，
+#   否则维度不匹配启动/检索报错。详见 CLAUDE.md「切换 Embedding Provider」节。
+#
+# 可选增强（默认不开，控成本；要开就在启动参数或本文件追加）：
+#   --app.rag.rerank.enabled=true --app.rag.rerank.type=jina   # 提精度，需 JINA_API_KEY
+#   --app.rag.hybrid.enabled=true --app.rag.hybrid.tokenizer=hanlp  # 中文召回提升
+# ---------------------------------------------------------------------------

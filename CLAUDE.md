@@ -7,6 +7,8 @@
 - `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
 - `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
 - `docs/production-hardening.md` — **业务化基线 #1–#8 完整落地记录**：多租户隔离 / 限流 / token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送。包含设计要点、关键文件、yml 配置、验证脚本、关键设计决定
+- `docs/workflow-integration.md` — **业务落地接入设计（规划/实施中）**：客服场景的工作流编排（Flowable BPMN + 人工审批 + 状态持久化）/ SSO·OAuth（暂缓）/ 渠道接入（飞书样板）。含阶段决策、Flowable 三个坑、退款审批样板流程、待确认 TODO
+- `docs/knowledge-base.md` — **企业知识库问答系统落地**：Milvus 持久化 + Apache Tika 解析 PDF/Office 上传 + `kb` profile（`application-kb.yml`）+ 端到端验证（多租户隔离 / 重启持久化 / 版本覆盖）
 - `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
 - `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
 - `docs/grafana-dashboard.json` — 现成的 7 panel dashboard JSON
@@ -86,6 +88,40 @@ src/main/
     └── controller/ChatController.java     /chat, /chat/stream, /rag/ingest, /health
 documents/                                 RAG 文档目录（.txt/.md/.pdf 等）
 ```
+
+> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）。详见对应 `docs/*.md`。
+
+## 构建 / 测试 / 打包
+
+```bash
+# 编译
+mvn compile
+
+# 跑全部单测（src/test/java，纯 JVM，不需要起 Ollama）
+mvn test
+
+# 跑单个测试类
+mvn test -Dtest=MarkdownHeaderSplitterTest
+
+# 跑单个测试方法
+mvn test -Dtest=MarkdownHeaderSplitterTest#simpleMarkdown_oneSegmentPerSection
+
+# 打可执行 jar（target/*.jar，含 spring-boot repackage）
+mvn package
+
+# 跳过测试打包
+mvn package -DskipTests
+```
+
+现有单测（JUnit 5，spring-boot-starter-test，**全是纯逻辑单测、不拉起 Spring context、不连模型**）：
+
+- `config/AssistantPropertiesTest` — provider override 解析成 `ResolvedAssistantStyle` 的 fallback 逻辑
+- `rag/MarkdownHeaderSplitterTest` — markdown-header chunking 切分行为
+- `eval/CaseAggregateTest` — multi-run 聚合（passRate / avgScore / σ）算法
+- `ai/multiagent/MultiAgentServiceTest` — DAG 拓扑排序 / 环检测降级
+- `ai/grounding/GroundingServiceTest` — Layer 0 编造引用检测 / 弃答跳过
+
+没有 lint / formatter / 覆盖率插件配置（pom 里只有 `spring-boot-maven-plugin`）。**LLM 行为回归靠 eval harness（见末尾「评测 Harness」节），不是 JUnit** —— JUnit 只覆盖确定性的纯逻辑，凡是要连模型的断言都走 `/eval/run`。
 
 ## 运行
 

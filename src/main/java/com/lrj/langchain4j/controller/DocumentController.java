@@ -2,6 +2,7 @@ package com.lrj.langchain4j.controller;
 
 import com.lrj.langchain4j.rag.lifecycle.DocumentInfo;
 import com.lrj.langchain4j.rag.lifecycle.DocumentService;
+import com.lrj.langchain4j.rag.lifecycle.DocumentTextExtractor;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -17,7 +18,6 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -37,27 +37,31 @@ import java.util.Optional;
 public class DocumentController {
 
     private final DocumentService documents;
+    private final DocumentTextExtractor extractor;
 
-    public DocumentController(DocumentService documents) {
+    public DocumentController(DocumentService documents, DocumentTextExtractor extractor) {
         this.documents = documents;
+        this.extractor = extractor;
     }
 
     /**
-     * Multipart 上传。file 的原始 filename 作为 displayName，content-type 自动取。
-     * MVP 只接受 text/* —— 二进制 PDF 等需要 LangChain4j 的 parser 模块，后续再加。
+     * Multipart 上传。file 的原始 filename 作为 displayName，content-type 透传仅用于回显。
+     * 正文交给 Apache Tika（{@link DocumentTextExtractor}）解析 —— PDF / Word / Excel / PPT /
+     * HTML / 纯文本等几乎所有常见格式都吃，按内容嗅探类型不靠后缀。
      */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @PreAuthorize("hasAuthority('SCOPE_ingest')")
     public ResponseEntity<DocumentInfo> uploadFile(@RequestPart("file") MultipartFile file,
                                                    @RequestParam(required = false) String category) throws IOException {
-        if (file.isEmpty()) return ResponseEntity.badRequest().build();
+        if (file.isEmpty()) return ResponseEntity.badRequest().header("X-Error", "empty file").build();
         String displayName = file.getOriginalFilename();
         String contentType = file.getContentType();
-        if (contentType != null && !contentType.startsWith("text/")) {
-            return ResponseEntity.badRequest().header("X-Error",
-                    "only text/* MIME supported; got " + contentType).build();
+        String text;
+        try {
+            text = extractor.extract(file.getInputStream(), displayName);
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().header("X-Error", e.getMessage()).build();
         }
-        String text = new String(file.getBytes(), StandardCharsets.UTF_8);
         DocumentInfo info = documents.upload(displayName, contentType, text, category);
         return ResponseEntity.ok(info);
     }
