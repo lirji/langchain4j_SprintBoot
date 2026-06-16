@@ -69,9 +69,9 @@ public class RagIngestionService {
                 .build()
                 .ingest(documents);
         documentMirror.add(segments);
-        log.info("Ingested {} documents ({} segments, strategy={} max-chars={} overlap={}) from {} (tenant={} category={})",
-                documents.size(), segments.size(), splitterFactory.strategy(),
-                splitterFactory.maxChars(), splitterFactory.overlap(),
+        log.info("Ingested {} documents ({} segments, strategy={} unit={} max-size={} overlap={}) from {} (tenant={} category={})",
+                documents.size(), segments.size(), splitterFactory.strategy(), splitterFactory.unit(),
+                splitterFactory.maxSize(), splitterFactory.overlap(),
                 documentsDir.toAbsolutePath(), tenantId, category);
         return documents.size();
     }

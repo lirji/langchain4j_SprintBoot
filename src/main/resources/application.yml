@@ -1,5 +1,5 @@
 server:
-  port: 8080
+  port: 8089
 
 spring:
   application:
@@ -281,6 +281,17 @@ app:
     http:
       url: http://localhost:3001/mcp
     log-events: true
+  a2a:
+    # A2A（Agent2Agent）Server。默认关 —— 开启后挂 POST /a2a（JSON-RPC）+ GET /.well-known/agent-card.json
+    # 三种调用方式：message/send（chat 同步）、message/stream（chat SSE 流式）、
+    # message/send + tasks/pushNotificationConfig/set（multi-agent 异步 + webhook 回推）
+    enabled: false
+    agent-name: LangChain4j Assistant
+    agent-description: A LangChain4j + Spring Boot agent exposing chat (sync/streaming) and multi-agent research over the A2A protocol.
+    # Agent Card 里对外暴露的 endpoint 前缀（生产填外部可达地址）；card.url = base-url + /a2a
+    base-url: http://localhost:8080
+    version: 1.0.0
+    # 异步任务的 push 回推复用 app.async.webhook.*（HMAC secret / timeout / 重试），无需重复配
   rag:
     documents-dir: ./documents
     # 文档元数据注册表（GET /rag/documents 列表/详情/版本从这里读）的存储后端：
@@ -291,11 +302,19 @@ app:
     # 召回截断（rerank 关闭时直接作为返回数；rerank 开启时由 reranker 作为最终 top-k）
     top-k: 5
     chunking:
-      # recursive（默认）— 按字符数硬切 + overlap，简单粗暴，适合任何文档
+      # recursive（默认）— 按 unit 硬切 + overlap，简单粗暴，适合任何文档
       # markdown-header — 按 ## section 切，每个 chunk 是完整主题；超长 section fallback 到 recursive
       strategy: recursive
-      max-chars: 300       # recursive 的目标 chunk 大小；markdown-header 的 section 长度阈值
-      overlap: 50          # recursive 模式 chunk 重叠字符数（markdown-header 模式只在 fallback 时用到）
+      # 计量单位 chars（默认）| tokens
+      #   chars  — max-size/overlap 按字符数，零依赖；但同样字符数下中英文真实 token 数差 2~3 倍
+      #   tokens — 给 splitter 挂 OpenAI tokenizer（tiktoken），max-size/overlap 单位变 token。
+      #            LLM context 与计费都按 token 算，更贴生产。本地模型不暴露 tokenizer，用 OpenAI
+      #            估算（偏差 ~10-15%，chunk 软目标可接受）。必须保证 max-size+overlap ≤ embedding 模型 max input
+      unit: chars
+      max-size: 300        # recursive 的目标 chunk 大小；markdown-header 的 section 长度阈值（单位由 unit 决定）
+      overlap: 50          # recursive 模式 chunk 重叠（markdown-header 模式只在 fallback 时用到）
+      # tokens 模式下计数用的 tokenizer（OpenAiTokenCountEstimator）；chars 模式忽略
+      tokenizer-model: gpt-4o-mini
 
     grounding:
       # RAG 事实幻觉的事后校验（仅作用于触发了检索的回答）。两层叠加：

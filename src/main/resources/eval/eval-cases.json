@@ -194,6 +194,13 @@
     "mustNotInclude": ["MongoDB 是", "确实使用"],
     "judgeHint": "前置同上。文档里没提 MongoDB，按 citationPolicy 应回复『未在文档中找到相关内容』之类；不要肯定地编『是 MongoDB』。允许说明文档实际提到的数据库（如 PostgreSQL/MySQL）。"
   },
+  {
+    "id": "rag-recall-all-providers",
+    "question": "根据文档，本项目支持哪些 chat provider？请完整列出全部可选值，并标注来源。",
+    "mustInclude": ["ollama", "openai", "anthropic", "gemini", "deepseek", "[doc="],
+    "mustNotInclude": [],
+    "judgeHint": "召回完整性 case：project-faq.md『## 2. 支持的 LLM Provider』把全部 5 个 provider 列在同一个 section 里，是对 chunking 切分边界最敏感的内容——切分若把该 section 切碎，召回只会命中其中 2~3 个，5 选项就列不全 → mustInclude 任一缺失即 fail。专门用来验证不同 chunking 配置（尤其 token 模式 app.rag.chunking.unit=tokens）切分后召回不掉。auto-ingest 会用当前 chunking 配置入库，所以 unit 和 auto-ingest 必须同时在启动设。注意 CLAUDE.md 记录的坑：多参数用 -Dspring-boot.run.arguments 逗号拼会静默丢第二个，要同时覆盖多 key 改用 env var。跑法：`APP_RAG_CHUNKING_UNIT=tokens APP_EVAL_AUTO_INGEST=true mvn spring-boot:run` 起服务，再 POST /eval/run?runs=3 看本 case passRate。对照组：`APP_RAG_CHUNKING_UNIT=chars` 同跑一遍，两者都应 1.0；若 token 模式掉了说明 max-size 设太小把 section 切碎了。"
+  },
 
   {
     "id": "multiagent-dag",

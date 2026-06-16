@@ -12,6 +12,11 @@
 - `docs/nl2sql.md` — **NL2SQL / ChatBI（Milestone 2.A 已落地并验证）**：自然语言→SQL→只读执行→解读的受控链路。核心是 6 层 SQL 安全护栏（L1 只读账号 / L2 语句白名单 / L3 表白名单 / L4 强制 LIMIT / L5 超时 / L6 租户谓词）+ Schema 注入（含中文枚举 distinct 值）+ few-shot。`POST /chat/sql`，MySQL demo 库，`app.nl2sql.*` 默认关，需 tool-calling 模型。含本地验证记录（4 用例全过）+ 待做的 2.B（自修环 / 数字 grounding / eval `type:"sql"`）
 - `docs/knowledge-base.md` — **企业知识库问答系统落地**：Milvus 持久化 + Apache Tika 解析 PDF/Office 上传 + `kb` profile（`application-kb.yml`）+ 端到端验证（多租户隔离 / 重启持久化 / 版本覆盖）
 - `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
+- `docs/recall-verification.md` — **召回验证与召回率计算**：`rag-recall-all-providers` 强召回 case（靶点「5 provider 列在同一 section」，回归 chunking 切分后召回完整性，含 token 模式跑法）+ 厘清本项目 `passRate`（规则匹配 + Judge）vs 经典 `Recall@k`（需标注黄金集）的区别与各自算法
+- `docs/rag-interview-notes.md` — **RAG 面试速答稿**：Chunking 选型决策表（含 chars/tokens 计量单位）/ 多路·混合召回 / RRF / 召回评估，按「怎么做 + 为什么 + 踩坑」组织
+- `docs/token-control-interview.md` — **Token 控制面试速答稿**：8 题按 AI Agent 岗提问方式组织（ChatMemory 三种滑窗 / tokenizer 估算偏差 / per-tenant 日 token 预算三组件闭环 / 多副本 Redis 演进 / multi-agent fan-out 成本 + 租户归属 / 输出侧短板 / token 指标 / 降本 roadmap），每题含代码锚点
+- `docs/a2a-interview.md` — **A2A 协议面试速答稿**：三种调用方式（message/send 同步 · message/stream SSE 流式 · pushNotificationConfig Webhook 异步推）/ 三种传输 binding（JSON-RPC/gRPC/REST）/ Agent Card 发现 / Task 状态机（含 input-required）/ A2A vs MCP 对比 / 本项目落地答法
+- `docs/a2a.md` — **A2A（Agent2Agent）Server 落地**：`a2a` 包，`app.a2a.enabled`（默认关），零新依赖。三种调用方式（`message/send` chat 同步 / `message/stream` chat SSE 流式 / multi-agent 异步 Task + `pushNotificationConfig` webhook 回推）+ `tasks/get|cancel`。复用 `async` Task 引擎 + 安全/多租户/配额链；A2A push 与现有 `WebhookDispatcher` 双通道隔离。含协议↔内部模型映射、关键文件、怎么跑
 - `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
 - `docs/grafana-dashboard.json` — 现成的 7 panel dashboard JSON
 
@@ -91,7 +96,7 @@ src/main/
 documents/                                 RAG 文档目录（.txt/.md/.pdf 等）
 ```
 
-> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）、`nl2sql`（NL2SQL/ChatBI：6 层 SQL 安全护栏 + 只读执行，默认关）、`workflow`（Flowable BPMN 工作流编排：退款审批样板 + 人工审批 + MySQL 持久化。上生产硬化 #1–#10 全落地：`ApprovalTimeoutSweeper` 超时自动驳回（#1）+ `dedupeId`/businessKey 幂等（#2）+ `ServiceTaskDelegates.withRetry` LLM 失败降级补偿/事务边界（#3）+ `WorkflowHistoryCleaner` 历史表按保留期清理/history=audit（#4）+ `WorkflowReplyStore` reply 出流程变量落 `WF_REPLY` 业务表（#5）+ 版本分布日志（#6）+ claim/unclaim + 并发审批 409（#7）+ `WorkflowOutbox`/`WorkflowOutboxDispatcher` 终态回推持久 outbox + DLQ（#8）+ `WorkflowMetrics` 接 Micrometer（#9）+ `purge` PII 合规删除（#10），默认关）、`channel/feishu`（飞书渠道 Milestone 1.B：`FeishuController` 回调 + `FeishuCrypto` AES 解密/验签 + `FeishuIntent` 意图分类 + `FeishuClient` 出站/token 缓存 + `FeishuChannelService` 意图路由[退款→工作流/其余→对话] + `FeishuReplyListener` 监听 `WorkflowTerminalEvent` 回推，5s ack + 异步回推 + 审批卡片闭环，默认关）。详见对应 `docs/*.md`。
+> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）、`nl2sql`（NL2SQL/ChatBI：6 层 SQL 安全护栏 + 只读执行，默认关）、`workflow`（Flowable BPMN 工作流编排：退款审批样板 + 人工审批 + MySQL 持久化。上生产硬化 #1–#10 全落地：`ApprovalTimeoutSweeper` 超时自动驳回（#1）+ `dedupeId`/businessKey 幂等（#2）+ `ServiceTaskDelegates.withRetry` LLM 失败降级补偿/事务边界（#3）+ `WorkflowHistoryCleaner` 历史表按保留期清理/history=audit（#4）+ `WorkflowReplyStore` reply 出流程变量落 `WF_REPLY` 业务表（#5）+ 版本分布日志（#6）+ claim/unclaim + 并发审批 409（#7）+ `WorkflowOutbox`/`WorkflowOutboxDispatcher` 终态回推持久 outbox + DLQ（#8）+ `WorkflowMetrics` 接 Micrometer（#9）+ `purge` PII 合规删除（#10），默认关）、`channel/feishu`（飞书渠道 Milestone 1.B：`FeishuController` 回调 + `FeishuCrypto` AES 解密/验签 + `FeishuIntent` 意图分类 + `FeishuClient` 出站/token 缓存 + `FeishuChannelService` 意图路由[退款→工作流/其余→对话] + `FeishuReplyListener` 监听 `WorkflowTerminalEvent` 回推，5s ack + 异步回推 + 审批卡片闭环，默认关）、`a2a`（A2A Server Milestone：`A2aController` JSON-RPC 单端点 `/a2a` + `/.well-known/agent-card.json` 发现 + `A2aService` 分派[chat 同步/multi-agent 异步] + `A2aStreamService` SSE 流式 + `A2aMapper` 状态翻译 + `A2aPushNotifier`/`A2aPushNotificationStore` webhook 回推 + `a2a/protocol/*` 手写 record 协议类型，复用 `async`/安全/配额，零新依赖，默认关）。详见对应 `docs/*.md`。
 
 ## 构建 / 测试 / 打包
 
@@ -263,6 +268,8 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | GET  | `/workflow/instances/{instanceId}` | 工作流实例状态 + reply |
 | DELETE | `/workflow/data?chatId=` | PII 合规删除：清本租户该 chatId 的运行/历史实例 + reply + outbox（需 `SCOPE_approve`） |
 | POST | `/channel/feishu/event` | 飞书事件订阅 / 卡片回调入口（需 `app.channel.feishu.enabled=true`）：URL 握手回 challenge + 消息事件（意图路由：退款/投诉→工作流，其余→对话）+ 审批卡片回调。安全链放行（飞书自带验签，不带 X-Api-Key）。见 `docs/workflow-integration.md`「渠道（飞书）」 |
+| POST | `/a2a` | A2A（Agent2Agent）JSON-RPC 2.0 单端点（需 `app.a2a.enabled=true`）：`message/send`（chat 同步 / multi-agent 异步建 Task）、`message/stream`（chat SSE 流式）、`tasks/get`·`tasks/cancel`、`tasks/pushNotificationConfig/set`·`/get`。需 `X-Api-Key`。见 `docs/a2a.md` |
+| GET  | `/.well-known/agent-card.json` | A2A 服务发现：Agent Card（skills / endpoint / capabilities / securitySchemes）。安全链放行，免鉴权 |
 | POST | `/eval/run?runs=N` | 跑 `resources/eval/eval-cases.json` 黄金集，每 case 跑 N 次（默认 1）；返回 per-case avg/σ/passRate + 整体 |
 | POST | `/eval/run-cases?runs=N` | body 传 `EvalCase[]` 跑临时集（N 同上） |
 | GET  | `/actuator/health` | Spring Boot Actuator |
@@ -408,11 +415,13 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 **Chunking 策略** `app.rag.chunking.*`:
 
-- `strategy=recursive`（默认）— `DocumentSplitters.recursive(max-chars, overlap)`，按字符数硬切 + overlap，简单粗暴适合任何文档
+- `strategy=recursive`（默认）— `DocumentSplitters.recursive(max-size, overlap)`，按 unit 硬切 + overlap，简单粗暴适合任何文档
 - `strategy=markdown-header` — `MarkdownHeaderSplitter` 自实现：按 `(?m)(?=^##+ )` 切 section，每个 chunk 是完整主题；超长 section fallback 到 recursive
-- `max-chars: 300` — recursive 模式的 chunk 大小目标；markdown-header 模式的 section 长度阈值
+- `unit=chars`（默认）| `tokens` — **计量单位开关**（`DocumentSplitterFactory`）。`chars` 按字符数，零依赖；`tokens` 给 splitter 挂 `OpenAiTokenCountEstimator`（tiktoken），用 `DocumentSplitters.recursive(size, overlap, estimator)` 三参重载，`max-size`/`overlap` 单位变 token，`MarkdownHeaderSplitter` 的 section 阈值也透传同一 estimator（按 token 计量，不再 char/token 混用）。本地模型（Ollama/bge-m3）不暴露 tokenizer，用 OpenAI 估算（偏差 ~10-15%，chunk 软目标可接受）。**token 模式必须保证 `max-size + overlap ≤ embedding 模型 max input`，否则尾部静默截断**。复用了 `ChatMemoryConfig` 里 `TokenWindowChatMemory` 同款 estimator 思路
+- `max-size: 300`（兼容旧 key `max-chars`，`max-size` 优先、缺省回退 `max-chars`）— recursive 模式 chunk 大小目标 / markdown-header section 阈值；单位由 `unit` 决定
 - `overlap: 50` — recursive 模式 chunk 重叠（markdown-header 只在 fallback 时用到）
-- markdown-header 给 segment 加 metadata：`section` 标题 + `index` 顺序号，引用 `[doc=file.md#3]` 对应"第 3 个 section"而不是"第 3 个 300-char 块"
+- `tokenizer-model: gpt-4o-mini` — `tokens` 模式计数用的 tokenizer；`chars` 模式忽略
+- markdown-header 给 segment 加 metadata：`section` 标题 + `index` 顺序号，引用 `[doc=file.md#3]` 对应"第 3 个 section"而不是"第 3 个块"
 - 实测对本项目（5 个 chat provider 列在 1 个 `## Section` 里）的可见提升：recursive(300) 召回不全只列 2 个 provider，markdown-header(600) 召回完整 5 个
 
 **History-aware retrieval** `app.rag.history-aware.*`:

@@ -29,7 +29,7 @@ public class TokenBudgetGuardFilter extends OncePerRequestFilter {
     private static final Logger log = LoggerFactory.getLogger(TokenBudgetGuardFilter.class);
 
     /** LLM-touching endpoint family —— 这些请求才需要预检。 */
-    private static final Set<String> LLM_FAMILIES = Set.of("chat", "stream", "eval");
+    private static final Set<String> LLM_FAMILIES = Set.of("chat", "stream", "eval", "a2a");
 
     private final TokenBudgetProperties props;
     private final TokenBudgetTracker tracker;

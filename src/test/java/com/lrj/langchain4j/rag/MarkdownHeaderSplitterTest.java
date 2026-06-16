@@ -4,6 +4,8 @@ import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.splitter.DocumentSplitters;
 import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.model.TokenCountEstimator;
+import dev.langchain4j.model.openai.OpenAiTokenCountEstimator;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -93,6 +95,25 @@ class MarkdownHeaderSplitterTest {
                 """;
         List<TextSegment> segs = splitter.split(Document.from(md));
         assertThat(segs).hasSize(3);
+    }
+
+    @Test
+    void tokenUnit_thresholdMeasuredInTokens_notChars() {
+        // 同一段英文：char 数 >> token 数（1 token ≈ 4 char）。
+        // 阈值 30，section 约 120 char / ~25 token。
+        //   - char 计量：120 > 30 → 触发 fallback 切多段
+        //   - token 计量：~25 < 30 → 不切，整段 1 个 segment
+        // 用这个差异证明 token estimator 路径真的生效（按 token 数比阈值，不是字符数）。
+        String body = "The quick brown fox jumps over the lazy dog again and again to fill the section body.";
+        String md = "## S\n\n" + body;
+        TokenCountEstimator estimator = new OpenAiTokenCountEstimator("gpt-4o-mini");
+
+        DocumentSplitter charMode = new MarkdownHeaderSplitter(30, DocumentSplitters.recursive(20, 5));
+        DocumentSplitter tokenMode = new MarkdownHeaderSplitter(
+                30, DocumentSplitters.recursive(20, 5, estimator), estimator);
+
+        assertThat(charMode.split(Document.from(md))).hasSizeGreaterThan(1);   // 按字符超阈 → fallback
+        assertThat(tokenMode.split(Document.from(md))).hasSize(1);             // 按 token 不超 → 整段
     }
 
     @Test
