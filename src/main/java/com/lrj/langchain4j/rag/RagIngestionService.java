@@ -1,7 +1,9 @@
 package com.lrj.langchain4j.rag;
 
+import com.lrj.langchain4j.rag.graph.GraphIngestor;
 import com.lrj.langchain4j.rag.hybrid.DocumentMirror;
 import com.lrj.langchain4j.security.TenantContext;
+import org.springframework.beans.factory.ObjectProvider;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.document.loader.FileSystemDocumentLoader;
@@ -28,17 +30,21 @@ public class RagIngestionService {
     private final EmbeddingModel embeddingModel;
     private final DocumentMirror documentMirror;
     private final DocumentSplitterFactory splitterFactory;
+    // GraphRAG 软依赖：app.rag.graph.enabled=false 时 Bean 不存在 → getIfAvailable() 返 null，零开销
+    private final ObjectProvider<GraphIngestor> graphIngestorProvider;
     private final Path documentsDir;
 
     public RagIngestionService(EmbeddingStore<TextSegment> embeddingStore,
                                EmbeddingModel embeddingModel,
                                DocumentMirror documentMirror,
                                DocumentSplitterFactory splitterFactory,
+                               ObjectProvider<GraphIngestor> graphIngestorProvider,
                                @Value("${app.rag.documents-dir}") String documentsDir) {
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
         this.documentMirror = documentMirror;
         this.splitterFactory = splitterFactory;
+        this.graphIngestorProvider = graphIngestorProvider;
         this.documentsDir = Paths.get(documentsDir);
     }
 
@@ -69,6 +75,11 @@ public class RagIngestionService {
                 .build()
                 .ingest(documents);
         documentMirror.add(segments);
+        // GraphRAG：开启时同步抽三元组建图（一次性、可能多次 LLM 调用，仅 graph.enabled 时跑）
+        GraphIngestor graphIngestor = graphIngestorProvider.getIfAvailable();
+        if (graphIngestor != null) {
+            graphIngestor.ingest(segments);
+        }
         log.info("Ingested {} documents ({} segments, strategy={} unit={} max-size={} overlap={}) from {} (tenant={} category={})",
                 documents.size(), segments.size(), splitterFactory.strategy(), splitterFactory.unit(),
                 splitterFactory.maxSize(), splitterFactory.overlap(),

@@ -51,7 +51,7 @@ public class TaggedSourceContentInjector implements ContentInjector {
      * 退到 {@code source} / {@code absolute_directory_path} 文件名，再退到 "doc"。
      * chunk 标号优先用 metadata 的 {@code index}（部分 splitter 会放），退到列表顺序号。
      */
-    private String inferId(TextSegment seg, int fallbackIndex) {
+    public static String inferId(TextSegment seg, int fallbackIndex) {
         var meta = seg.metadata();
         String name = firstNonBlank(
                 meta.getString("file_name"),

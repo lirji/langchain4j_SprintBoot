@@ -4,6 +4,7 @@ import dev.langchain4j.model.chat.listener.ChatModelErrorContext;
 import dev.langchain4j.model.chat.listener.ChatModelListener;
 import dev.langchain4j.model.chat.listener.ChatModelRequestContext;
 import dev.langchain4j.model.chat.listener.ChatModelResponseContext;
+import dev.langchain4j.model.anthropic.AnthropicTokenUsage;
 import dev.langchain4j.model.chat.response.ChatResponseMetadata;
 import dev.langchain4j.model.output.TokenUsage;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -50,6 +51,19 @@ public class MetricsChatModelListener implements ChatModelListener {
             if (tu.outputTokenCount() != null) {
                 registry.counter("gen_ai.client.token.usage", tags.and("type", "output"))
                         .increment(tu.outputTokenCount());
+            }
+            // Anthropic prompt caching：cache_read = 命中缓存的输入 token（计费约 1 折），
+            // cache_write = 建缓存的输入 token（计费约 1.25 倍）。这两个本来已算进 inputTokenCount，
+            // 单独打 tag 才能算缓存命中率 / 量化省了多少。OpenAI 系无此字段，instanceof 自然跳过。
+            if (tu instanceof AnthropicTokenUsage atu) {
+                if (atu.cacheReadInputTokens() != null) {
+                    registry.counter("gen_ai.client.token.usage", tags.and("type", "cache_read"))
+                            .increment(atu.cacheReadInputTokens());
+                }
+                if (atu.cacheCreationInputTokens() != null) {
+                    registry.counter("gen_ai.client.token.usage", tags.and("type", "cache_write"))
+                            .increment(atu.cacheCreationInputTokens());
+                }
             }
         }
     }

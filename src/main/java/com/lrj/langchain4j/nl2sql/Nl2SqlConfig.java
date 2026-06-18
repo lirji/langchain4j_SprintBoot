@@ -79,12 +79,12 @@ public class Nl2SqlConfig {
                                          AuditLogger audit) {
         SqlGuard guard = new SqlGuard(props.getAllowTables(), props.getTenantScopedTables(),
                 props.getMaxRows(), props.isEnforceTenantPredicate());
-        SqlQueryTool tool = new SqlQueryTool(nl2sqlReadOnlyJdbc, guard);
+        SqlQueryTool tool = new SqlQueryTool(nl2sqlReadOnlyJdbc, guard, props.getMaxToolCalls());
         SqlAssistant assistant = AiServices.builder(SqlAssistant.class)
                 .chatModel(chatModel)
                 .tools(tool)
                 .build();
-        return new NlToSqlService(assistant, nl2sqlSchemaProvider, audit);
+        return new NlToSqlService(assistant, nl2sqlSchemaProvider, audit, props.isNumberGrounding());
     }
 
     private static HikariDataSource pool(String url, String user, String pass, boolean readOnly, String name) {

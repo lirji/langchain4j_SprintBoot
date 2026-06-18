@@ -44,6 +44,7 @@ public class DocumentSplitterFactory {
     private final String unit;
     private final int maxSize;
     private final int overlap;
+    private final int minSectionSize;
     private final String tokenizerModel;
 
     public DocumentSplitterFactory(
@@ -52,11 +53,15 @@ public class DocumentSplitterFactory {
             // 兼容旧 key：max-size 优先，缺省回退 max-chars（默认 300）
             @Value("${app.rag.chunking.max-size:${app.rag.chunking.max-chars:300}}") int maxSize,
             @Value("${app.rag.chunking.overlap:50}") int overlap,
+            // markdown-header 极小 section 合并阈值（单位同 unit）；0 = 关闭合并。代码默认 0（保守），
+            // 随 application.yml 默认开（见 app.rag.chunking.min-section-size）。
+            @Value("${app.rag.chunking.min-section-size:0}") int minSectionSize,
             @Value("${app.rag.chunking.tokenizer-model:gpt-4o-mini}") String tokenizerModel) {
         this.strategy = strategy == null ? "recursive" : strategy.trim().toLowerCase();
         this.unit = unit == null ? "chars" : unit.trim().toLowerCase();
         this.maxSize = maxSize;
         this.overlap = overlap;
+        this.minSectionSize = Math.max(0, minSectionSize);
         this.tokenizerModel = tokenizerModel;
     }
 
@@ -70,15 +75,16 @@ public class DocumentSplitterFactory {
 
         DocumentSplitter result = switch (strategy) {
             case "recursive" -> recursive;
-            // markdown-header 的 section 阈值也按同一单位计量（estimator 透传，null=按字符）
-            case "markdown-header" -> new MarkdownHeaderSplitter(maxSize, recursive, estimator);
+            // markdown-header 的 section 阈值也按同一单位计量（estimator 透传，null=按字符）；
+            // minSectionSize 启用极小 section 合并（自适应标题层级 + breadcrumb 注入是 splitter 内置行为）
+            case "markdown-header" -> new MarkdownHeaderSplitter(maxSize, recursive, estimator, minSectionSize);
             default -> {
                 log.warn("Unknown app.rag.chunking.strategy '{}', falling back to recursive", strategy);
                 yield recursive;
             }
         };
-        log.info("Chunking: strategy={} unit={} max-size={} overlap={}{}",
-                strategy, unit, maxSize, overlap,
+        log.info("Chunking: strategy={} unit={} max-size={} overlap={} min-section={}{}",
+                strategy, unit, maxSize, overlap, minSectionSize,
                 tokenMode ? " tokenizer~" + tokenizerModel : "");
         return result;
     }

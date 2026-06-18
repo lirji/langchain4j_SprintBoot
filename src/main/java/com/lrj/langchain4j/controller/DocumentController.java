@@ -2,7 +2,8 @@ package com.lrj.langchain4j.controller;
 
 import com.lrj.langchain4j.rag.lifecycle.DocumentInfo;
 import com.lrj.langchain4j.rag.lifecycle.DocumentService;
-import com.lrj.langchain4j.rag.lifecycle.DocumentTextExtractor;
+import com.lrj.langchain4j.rag.lifecycle.MultimodalDocumentExtractor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
@@ -31,23 +32,31 @@ import java.util.Optional;
  *   <li>{@code multipart/form-data}：{@code POST /rag/documents} with file part {@code file}</li>
  *   <li>{@code application/json}：{@code POST /rag/documents} body {@code {title, text, contentType?, category?}}</li>
  * </ul>
+ *
+ * <p>multipart 路径支持<strong>多模态</strong>：上传图片（png/jpg…）时，若 {@code app.vision.enabled=true}，
+ * 会用视觉模型把图像描述 + 文字 OCR 转写成文本再入库；其余格式仍走 Tika。见 {@link MultimodalDocumentExtractor}。
  */
 @RestController
 @RequestMapping("/rag/documents")
 public class DocumentController {
 
     private final DocumentService documents;
-    private final DocumentTextExtractor extractor;
+    private final MultimodalDocumentExtractor extractor;
+    /** 图片上传字节上限（仅对图片路径生效），与 {@code app.vision.max-image-bytes} 对齐。 */
+    private final long maxImageBytes;
 
-    public DocumentController(DocumentService documents, DocumentTextExtractor extractor) {
+    public DocumentController(DocumentService documents,
+                              MultimodalDocumentExtractor extractor,
+                              @Value("${app.vision.max-image-bytes:10485760}") long maxImageBytes) {
         this.documents = documents;
         this.extractor = extractor;
+        this.maxImageBytes = maxImageBytes;
     }
 
     /**
      * Multipart 上传。file 的原始 filename 作为 displayName，content-type 透传仅用于回显。
-     * 正文交给 Apache Tika（{@link DocumentTextExtractor}）解析 —— PDF / Word / Excel / PPT /
-     * HTML / 纯文本等几乎所有常见格式都吃，按内容嗅探类型不靠后缀。
+     * 正文交给 {@link MultimodalDocumentExtractor}：图片走视觉描述/OCR，其余格式交给 Apache Tika
+     * （PDF / Word / Excel / PPT / HTML / 纯文本等，按内容嗅探类型不靠后缀）。
      */
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @PreAuthorize("hasAuthority('SCOPE_ingest')")
@@ -56,9 +65,15 @@ public class DocumentController {
         if (file.isEmpty()) return ResponseEntity.badRequest().header("X-Error", "empty file").build();
         String displayName = file.getOriginalFilename();
         String contentType = file.getContentType();
+        if (file.getSize() > maxImageBytes
+                && MultimodalDocumentExtractor.isImage(contentType, displayName)) {
+            return ResponseEntity.badRequest()
+                    .header("X-Error", "image too large: " + file.getSize() + " > " + maxImageBytes + " bytes")
+                    .build();
+        }
         String text;
         try {
-            text = extractor.extract(file.getInputStream(), displayName);
+            text = extractor.extract(file.getBytes(), displayName, contentType);
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest().header("X-Error", e.getMessage()).build();
         }

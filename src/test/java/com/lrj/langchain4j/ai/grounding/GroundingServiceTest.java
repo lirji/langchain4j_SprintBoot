@@ -2,10 +2,14 @@ package com.lrj.langchain4j.ai.grounding;
 
 import com.lrj.langchain4j.config.GroundingProperties;
 import com.lrj.langchain4j.rag.RetrievedSourcesContext;
+import dev.langchain4j.data.document.Metadata;
+import dev.langchain4j.data.segment.TextSegment;
+import dev.langchain4j.rag.content.Content;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.ObjectProvider;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -125,6 +129,39 @@ class GroundingServiceTest {
                         new RetrievedSourcesContext.Source("real.md#0", "真实内容")));
         // Layer 1 异常被吞，Layer 0 通过 → 原样返回
         assertThat(out).isEqualTo("答案见 [doc=real.md#0]");
+    }
+
+    /** 用 file_name + index metadata 造 Content，inferId 会得到 "file#index" 形式的稳定 id。 */
+    private static Content content(String fileName, String index, String text) {
+        return Content.from(TextSegment.from(text, Metadata.from(Map.of("file_name", fileName, "index", index))));
+    }
+
+    @Test
+    void streamWarning_fabricatedCitation_returnsSuffix() {
+        // 流式路径：source 由 onRetrieved 捕获的 Content 传入（非 ThreadLocal）
+        var svc = new GroundingService(props(true, 0.7), provide((s, a) -> new GroundednessReport(1.0, List.of())));
+        String suffix = svc.streamWarningOrNull(
+                List.of(content("real.md", "0", "真实内容")),
+                "答案见 [doc=ghost.md#9]");
+        assertThat(suffix).isNotNull().contains(WARN_MARK).contains("ghost.md#9");
+    }
+
+    @Test
+    void streamWarning_validCitation_null() {
+        var svc = new GroundingService(props(true, 0.7), provide((s, a) -> new GroundednessReport(1.0, List.of())));
+        String suffix = svc.streamWarningOrNull(
+                List.of(content("real.md", "0", "真实内容")),
+                "答案见 [doc=real.md#0]");
+        assertThat(suffix).isNull();
+    }
+
+    @Test
+    void streamWarning_disabledOrNoRetrieval_null() {
+        var off = new GroundingService(props(false, 0.7), provide(null));
+        assertThat(off.streamWarningOrNull(List.of(content("real.md", "0", "c")), "[doc=ghost.md#9]")).isNull();
+        var on = new GroundingService(props(true, 0.7), provide(null));
+        assertThat(on.streamWarningOrNull(List.of(), "[doc=ghost.md#9]")).isNull();
+        assertThat(on.streamWarningOrNull(null, "x")).isNull();
     }
 
     @Test

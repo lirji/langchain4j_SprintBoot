@@ -14,11 +14,13 @@
 | **② 智能客服** | NL2SQL / ChatBI | ✅ 已落地并验证 | `docs/nl2sql.md` | `POST /chat/sql` |
 | **② 智能客服** | 工作流编排（Flowable 审批） | ✅ 已落地并端到端验证 | `docs/workflow-integration.md` | `POST /workflow/refund/start` |
 | **② 智能客服** | 渠道接入（飞书样板，M1.B） | ✅ 已落地（代码就位，默认关；出站/卡片需真应用联调） | `docs/workflow-integration.md` | `POST /channel/feishu/event` |
+| **② 智能客服** | 语音渠道（turn-based 语音 Agent） | ✅ 已落地（代码就位，默认关；ASR/TTS 需配 provider key 联调） | `docs/voice-agent.md` | `POST /voice/chat` |
 
 > **说明**：「客服场景」是一个由多块拼成的闭环。**已落地**：NL2SQL/ChatBI（自然语言查业务库）、工作流编排
-> （退款等需人工审批的长流程）、飞书渠道（入站意图路由：退款/投诉→工作流，其余→对话 + 5s ack + 异步回推 + 审批卡片闭环）。
-> 飞书渠道代码就位、纯逻辑（验签解密/意图）已单测，但出站发消息/卡片回调需接真飞书应用 + 公网回调联调（见对应文档清单）。
-> 企微/钉钉/Web/IVR 靠复制飞书范式，尚未编码。以本表「状态」列为准。
+> （退款等需人工审批的长流程）、飞书渠道（入站意图路由：退款/投诉→工作流，其余→对话 + 5s ack + 异步回推 + 审批卡片闭环）、
+> 语音渠道（turn-based：音频→ASR→**共享客服大脑** `CustomerServiceBrain`→TTS→音频，复用同一套意图路由/工作流/RAG）。
+> 飞书与语音两个渠道共用大脑：飞书代码就位但出站需真应用联调；语音代码就位 + 编排单测，但 ASR/TTS 需配 provider（云 OpenAI / 本地 whisper+tts）联调。
+> 企微/钉钉/Web 靠复制飞书范式、实时全双工/电话 IVR 是语音的未来项，尚未编码。以本表「状态」列为准。
 
 ---
 

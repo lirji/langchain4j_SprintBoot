@@ -23,11 +23,14 @@ public class NlToSqlService {
     private final SqlAssistant sqlAssistant;
     private final SchemaProvider schemaProvider;
     private final AuditLogger audit;
+    private final boolean numberGrounding;
 
-    public NlToSqlService(SqlAssistant sqlAssistant, SchemaProvider schemaProvider, AuditLogger audit) {
+    public NlToSqlService(SqlAssistant sqlAssistant, SchemaProvider schemaProvider, AuditLogger audit,
+                          boolean numberGrounding) {
         this.sqlAssistant = sqlAssistant;
         this.schemaProvider = schemaProvider;
         this.audit = audit;
+        this.numberGrounding = numberGrounding;
     }
 
     /** {@code sql}/{@code rows} 取本轮最后一次成功执行；模型若拒答（没查库）则为 null/空。 */
@@ -44,6 +47,17 @@ public class NlToSqlService {
             boolean guardBlocked = SqlExecutionContext.get().stream().anyMatch(SqlExecutionContext.Execution::rejected);
             String sql = last == null ? null : last.sql();
             List<Map<String, Object>> rows = last == null ? List.of() : last.rows();
+
+            // 数字 grounding（确定性、warn 模式）：仅在有数据可对照时跑（lastSuccessful 且非空）。
+            if (numberGrounding && last != null && !rows.isEmpty()) {
+                List<String> unsupported = NumberGrounding.unsupportedNumbers(answer, rows, question, rows.size());
+                if (!unsupported.isEmpty()) {
+                    log.warn("NL2SQL 数字核对告警（tenant={}）：答案数字未在结果中找到 {} | sql={}",
+                            tenantId, unsupported, sql);
+                    answer = answer + "\n\n⚠️ 数字核对提示：答案中的 "
+                            + String.join("、", unsupported) + " 未在查询结果中找到，请以查询结果为准。";
+                }
+            }
 
             audit.record(AuditEventType.NL2SQL_QUERY, auditFields(question, sql, rows.size(), guardBlocked));
             return new Result(question, sql, rows.size(), rows, answer, guardBlocked);

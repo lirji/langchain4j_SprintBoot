@@ -117,6 +117,79 @@ class MarkdownHeaderSplitterTest {
     }
 
     @Test
+    void h1Only_splitsOnSingleHash_whenNoH2Present() {
+        // 纯 # 分级的文档：历史行为是一刀不切成巨块，现在退而按 # 切
+        String md = """
+                # Alpha
+
+                Alpha body.
+
+                # Beta
+
+                Beta body.
+                """;
+        List<TextSegment> segs = splitter.split(Document.from(md));
+        assertThat(segs).hasSize(2);
+        assertThat(segs.get(0).metadata().getString("section")).isEqualTo("Alpha");
+        assertThat(segs.get(1).metadata().getString("section")).isEqualTo("Beta");
+    }
+
+    @Test
+    void h2Present_h1IsNotABoundary_unchanged() {
+        // 有 ## 时，# 仍不作边界（# Title 跟内容直到 ## A 之前是一段）—— 跟历史一致
+        String md = "# Title\n\n## A\na\n## B\nb\n";
+        List<TextSegment> segs = splitter.split(Document.from(md));
+        assertThat(segs).hasSize(3);
+        assertThat(segs.get(0).text()).startsWith("# Title");
+    }
+
+    @Test
+    void deepHeadings_getBreadcrumbPath() {
+        String md = """
+                ## Top
+                top body
+                ### Sub
+                sub body
+                #### SubSub
+                subsub body
+                """;
+        List<TextSegment> segs = splitter.split(Document.from(md));
+        assertThat(segs).hasSize(3);
+        // 顶层无父，深度 1 → 不注入 breadcrumb；section 叶子标题不变
+        assertThat(segs.get(0).metadata().getString("breadcrumb")).isNull();
+        assertThat(segs.get(0).metadata().getString("section")).isEqualTo("Top");
+        assertThat(segs.get(1).metadata().getString("breadcrumb")).isEqualTo("Top > Sub");
+        assertThat(segs.get(2).metadata().getString("breadcrumb")).isEqualTo("Top > Sub > SubSub");
+    }
+
+    @Test
+    void tinySections_mergedWhenMinSizeSet() {
+        // 一串极小 section，min-size 合并开启后并成更少的块
+        DocumentSplitter merging = new MarkdownHeaderSplitter(
+                600, DocumentSplitters.recursive(300, 50), null, 40);
+        String md = "## A\na\n## B\nb\n## C\nc\n## D\nd\n";
+        // 不合并：4 段
+        assertThat(splitter.split(Document.from(md))).hasSize(4);
+        // 合并（每段 ~4 char，min 40）：全并成 1 段
+        List<TextSegment> merged = merging.split(Document.from(md));
+        assertThat(merged).hasSize(1);
+        assertThat(merged.get(0).text()).contains("## A").contains("## D");
+    }
+
+    @Test
+    void largeSections_eachStaysStandalone_notMerged() {
+        // 两个各自 >min 的大 section：合并开启也不会被并到一起，各成一块
+        DocumentSplitter merging = new MarkdownHeaderSplitter(
+                10_000, DocumentSplitters.recursive(300, 50), null, 40);
+        String big = "x".repeat(200);
+        String md = "## Big1\n" + big + "\n## Big2\n" + big + "\n";
+        List<TextSegment> segs = merging.split(Document.from(md));
+        assertThat(segs).hasSize(2);
+        assertThat(segs.get(0).text()).startsWith("## Big1");
+        assertThat(segs.get(1).text()).startsWith("## Big2");
+    }
+
+    @Test
     void emptySections_skipped() {
         // ## A 后面紧跟 ## B，A 是空 section（只有 heading）—— 仍 emit 不跳
         // 但 leading 空白（## 出现前的空内容）被 strip 后跳过

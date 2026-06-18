@@ -200,6 +200,17 @@
             <version>7.1.0</version>
         </dependency>
 
+        <!-- Browser-use（深度 Agent 的 AgentAction，app.deep-agent.browser.enabled，默认关）：
+             Playwright 驱动无头 Chromium 做网页导航/读取。jar 只是客户端，浏览器二进制需首次
+             用 `mvn exec:java -e -D exec.mainClass=com.microsoft.playwright.CLI -D exec.args="install chromium"`
+             或代码 launch() 时自动下载。会话由 PlaywrightBrowserSession 在开关开启时按线程懒加载，
+             关闭时整条 browser 链不装配、Playwright 不被触碰，零开销/零浏览器下载。 -->
+        <dependency>
+            <groupId>com.microsoft.playwright</groupId>
+            <artifactId>playwright</artifactId>
+            <version>1.47.0</version>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>

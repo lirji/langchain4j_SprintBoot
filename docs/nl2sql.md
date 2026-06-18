@@ -4,8 +4,9 @@
 **「`@Tool` 描述即模型决策依据」**（让模型知道何时该查库、怎么查）+ **「grounding 防幻觉」**
 （答案里的数字必须来自查询结果，不许编）。
 
-> 状态：**Milestone 2.A 已落地并本地验证通过（2026-06-02）**。整套 `@ConditionalOnProperty(app.nl2sql.enabled)`
-> 默认关，不影响现有启动路径。2.B（自修环 / 数字 grounding / eval `type:"sql"`）待按信号补。
+> 状态：**Milestone 2.A 已落地并本地验证通过（2026-06-02）；2.B 已落地（2026-06-17）**。整套
+> `@ConditionalOnProperty(app.nl2sql.enabled)` 默认关，不影响现有启动路径。2.B（自修环轮数上限 /
+> 数字 grounding / eval `type:"sql"`）见下「Milestone 2.B」节。
 > 与 `docs/workflow-integration.md`（#1 智能客服）并列为下一阶段两个业务场景。
 
 ---
@@ -156,13 +157,15 @@ demo 种子的两个租户对齐 production-hardening 的两个 demo key：`tena
 4. **只读账号连 in-mem 用 H2 时** 会撞 admin-only 的 `SET DB_CLOSE_DELAY`——这也是最终选 MySQL 的诱因之一；
    MySQL 下 admin url 带 `createDatabaseIfNotExist`、只读 url 不带即可。
 
-### Milestone 2.B — 准确性与可信（看信号再加）
+### Milestone 2.B — 准确性与可信（✅ 已落地于 2026-06-17）
 
-| 增强 | 复用 | 触发信号 |
+| 增强 | 状态 | 落地说明 |
 | --- | --- | --- |
-| **SQL 自修环** | Reflexion `Critic`/replan 思路：执行报错→错误喂回 LLM 自修一次（`app.nl2sql.repair.enabled`） | demo 里复杂 join 经常一次生成跑不通 |
-| **数字 grounding** | grounding Layer 0：答案里的数字 ∈ rows，否则追加 `⚠️ 可信度提示`，走 `QueryResultContext` | 模型解读时把数字记串/四舍五入编造 |
-| **eval 纳入回归** | `EvalCase` 加 `type:"sql"` dispatch（`EvaluationRunner.invokeByType` 加一支）；黄金集放几条 NL→断言 | 想 A/B schema prompt / few-shot 改动的真实差异 |
+| **SQL 自修环 + 轮数上限** | ✅ | 自修环地基本就在（`SqlQueryTool` 护栏拒/执行报错时**返回错误文本而非抛异常**，模型下回合自行改写重试）；本轮补**轮数上限** `app.nl2sql.max-tool-calls`（默 5）：本轮 run_sql 调用数达上限直接返回终止指令、不再执行，防坏 SQL 反复重试烧 token |
+| **数字 grounding** | ✅ | `NumberGrounding`（纯函数，仿 grounding Layer 0 的确定性套路）：核对答案里的「数据数字」∈ 查询结果 ∪ 行数 ∪ 问题数字，否则末尾追加 `⚠️ 数字核对提示`（warn 模式，零 LLM）。豁免序数(≤10)/年份压假阳性，归一千分位+小数尾零。`app.nl2sql.number-grounding`（默开）。读 `SqlExecutionContext` 的 rows，不必新建 `QueryResultContext` |
+| **eval 纳入回归** | ✅ | `EvalCase` 加 `type:"sql"` dispatch（`EvaluationRunner.invokeByType`）；黄金集 `eval/eval-cases-sql.json`（注入拦截 / 越权表 / 中文枚举聚合 / 租户 top-N，4 case），`/eval/run?set=sql` 跑。详见 `CLAUDE.md`「评测 Harness」节 + `docs/roadmap.md`「已落地优化 2026-06-17（二/三）」 |
+
+> 数字 grounding 单测：`NumberGroundingTest`（8 case）确定性覆盖受支撑来源 / 豁免类 / 归一。自修环上限是 `SqlQueryTool` 内基于 `SqlExecutionContext.get().size()` 的计数。
 
 ---
 

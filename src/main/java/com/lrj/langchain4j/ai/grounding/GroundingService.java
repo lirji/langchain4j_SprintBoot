@@ -2,6 +2,8 @@ package com.lrj.langchain4j.ai.grounding;
 
 import com.lrj.langchain4j.config.GroundingProperties;
 import com.lrj.langchain4j.rag.RetrievedSourcesContext;
+import com.lrj.langchain4j.rag.TaggedSourceContentInjector;
+import dev.langchain4j.rag.content.Content;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
@@ -73,16 +75,38 @@ public class GroundingService {
     }
 
     private String verifyAndWarn(String answer) {
-        List<RetrievedSourcesContext.Source> sources = RetrievedSourcesContext.get();
+        String suffix = warningSuffixOrNull(answer, RetrievedSourcesContext.get());
+        return suffix == null ? answer : answer + suffix;
+    }
+
+    /**
+     * 流式路径的 grounding 后校验入口。流式回调线程拿不到 {@link RetrievedSourcesContext}（ThreadLocal 在
+     * 别的线程），改由调用方用 {@code TokenStream.onRetrieved} 捕获的 {@link Content} 列表传入。
+     * 返回要<strong>追加</strong>的可信度提示后缀（token 已发出无法重写），无告警返回 null。
+     */
+    public String streamWarningOrNull(List<Content> retrieved, String answer) {
+        if (!props.isEnabled() || retrieved == null || retrieved.isEmpty()) {
+            return null;
+        }
+        List<RetrievedSourcesContext.Source> sources = new ArrayList<>(retrieved.size());
+        for (int i = 0; i < retrieved.size(); i++) {
+            var seg = retrieved.get(i).textSegment();
+            sources.add(new RetrievedSourcesContext.Source(TaggedSourceContentInjector.inferId(seg, i), seg.text()));
+        }
+        return warningSuffixOrNull(answer, sources);
+    }
+
+    /** 算出要追加的可信度提示后缀（含前导换行），无告警返回 null。同步/流式两条路径共用。 */
+    private String warningSuffixOrNull(String answer, List<RetrievedSourcesContext.Source> sources) {
         if (sources == null || sources.isEmpty()) {
-            return answer; // 本轮没走 RAG，无可校验
+            return null; // 本轮没走 RAG，无可校验
         }
 
         // 诚实弃答（"未在文档中找到…"）没有事实断言 —— 无可幻觉，不该触发可信度提示。
         // 即便检索返回了不相关片段，弃答也是正确行为。靠 citationPolicy 契约里的固定话术识别，
         // 比依赖 Layer 1 checker 在弱模型上稳定判 1.0 可靠（实测 qwen3:8b 会把弃答误判成 0.0）。
         if (isAbstention(answer)) {
-            return answer;
+            return null;
         }
 
         List<String> warnings = new ArrayList<>();
@@ -111,10 +135,10 @@ public class GroundingService {
         }
 
         if (warnings.isEmpty()) {
-            return answer;
+            return null;
         }
         log.warn("RAG grounding warning ({} sources): {}", sources.size(), warnings);
-        return answer + "\n\n⚠️ 可信度提示：" + String.join("；", warnings) + "。请以原始资料为准。";
+        return "\n\n⚠️ 可信度提示：" + String.join("；", warnings) + "。请以原始资料为准。";
     }
 
     /** 是否是诚实弃答（无事实断言）。命中 {@link #ABSTENTION_MARKERS} 任一即算。 */

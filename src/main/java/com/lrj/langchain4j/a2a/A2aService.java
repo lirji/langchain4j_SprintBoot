@@ -4,14 +4,17 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.lrj.langchain4j.a2a.protocol.A2aMessage;
 import com.lrj.langchain4j.a2a.protocol.A2aTask;
+import com.lrj.langchain4j.a2a.protocol.A2aTaskStatus;
 import com.lrj.langchain4j.a2a.protocol.AgentCard;
 import com.lrj.langchain4j.a2a.protocol.JsonRpcError;
 import com.lrj.langchain4j.a2a.protocol.JsonRpcResponse;
 import com.lrj.langchain4j.a2a.protocol.MessageSendParams;
 import com.lrj.langchain4j.a2a.protocol.TaskPushNotificationConfig;
 import com.lrj.langchain4j.a2a.protocol.TaskQueryParams;
+import com.lrj.langchain4j.a2a.protocol.TaskState;
 import com.lrj.langchain4j.ai.Assistant;
 import com.lrj.langchain4j.ai.grounding.GroundingService;
+import com.lrj.langchain4j.ai.guardrail.StreamGuard;
 import com.lrj.langchain4j.async.AsyncTask;
 import com.lrj.langchain4j.async.AsyncTaskService;
 import com.lrj.langchain4j.config.ResolvedAssistantStyle;
@@ -107,13 +110,24 @@ public class A2aService {
             return JsonRpcResponse.success(id, mapper.toA2aTask(task));
         }
 
-        // 默认 chat skill：同步，复用主 Assistant（guardrail + grounding 自动生效），返回 agent Message
+        // 默认 chat skill：同步，复用主 Assistant（guardrail + grounding 自动生效）
         String contextId = (msg.contextId() != null && !msg.contextId().isBlank())
                 ? msg.contextId() : UUID.randomUUID().toString();
         String reply = grounding.applyToFreshAnswer(() -> assistant.chat(
                 scopedChatId(contextId),
                 style.getLanguage(), style.getTone(), style.getCitationPolicy(), style.getExtra(),
                 text));
+        // input-required：回复像澄清式提问时，返回 input-required 状态的 Task（带澄清问题在 status.message），
+        // 而非普通 completed Message —— 给客户端标准多轮续问语义。跟 stream 路径同款判定。
+        if (props.isDetectInputRequired() && StreamGuard.looksLikeClarifyingQuestion(reply)) {
+            String taskId = UUID.randomUUID().toString();
+            A2aTask task = new A2aTask(taskId, contextId,
+                    new A2aTaskStatus(TaskState.INPUT_REQUIRED,
+                            A2aMessage.agentText(reply, taskId, contextId),
+                            java.time.Instant.now().toString()),
+                    null, null);
+            return JsonRpcResponse.success(id, task);
+        }
         return JsonRpcResponse.success(id, A2aMessage.agentText(reply, null, contextId));
     }
 

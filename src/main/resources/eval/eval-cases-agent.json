@@ -1,0 +1,26 @@
+[
+  {
+    "id": "agent-time-tool",
+    "type": "agent",
+    "question": "Asia/Shanghai 现在几点？只要时间，用一句话回答。",
+    "mustInclude": ["stopReason: DONE"],
+    "mustNotInclude": ["stopReason: LOOP", "stopReason: ERROR"],
+    "judgeHint": "answer 形如 'stopReason: X\\nsteps: N\\n---\\n<最终答案>'。深度 Agent 应调用 current_time 动作拿到上海时间后 finish。判分看最终答案是否给出了一个合理的当前时间（含时:分），stopReason 应为 DONE。"
+  },
+  {
+    "id": "agent-trivial-finish",
+    "type": "agent",
+    "question": "用一句话解释什么是 HTTP 状态码 404。",
+    "mustInclude": ["stopReason: DONE"],
+    "mustNotInclude": ["stopReason: MAX_STEPS", "stopReason: LOOP"],
+    "judgeHint": "这是常识问题，无需任何动作。深度 Agent 应第一步就 finish（steps: 0 或很小），不要为了用满步数瞎调动作。判分看最终答案是否正确解释了 404（资源未找到），且 stopReason=DONE。"
+  },
+  {
+    "id": "agent-time-compare",
+    "type": "agent",
+    "question": "比较一下 Asia/Shanghai 和 UTC 现在的时间相差几个小时？给出结论。",
+    "mustInclude": ["stopReason: DONE"],
+    "mustNotInclude": ["stopReason: ERROR"],
+    "judgeHint": "answer 形如 'stopReason: X\\nsteps: N\\n---\\n<最终答案>'。深度 Agent 可能多步：分别查两个时区时间再比较。判分看最终结论是否指出上海比 UTC 早 8 小时（UTC+8），stopReason 应为 DONE。允许它用 1~3 步。"
+  }
+]

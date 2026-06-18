@@ -26,10 +26,13 @@ public class SqlQueryTool {
 
     private final JdbcTemplate readOnlyJdbc;
     private final SqlGuard guard;
+    /** 自修环上限：本轮已发生的 run_sql 调用（含拒/失败）达到此数后不再执行，返回终止指令。 */
+    private final int maxToolCalls;
 
-    public SqlQueryTool(JdbcTemplate readOnlyJdbc, SqlGuard guard) {
+    public SqlQueryTool(JdbcTemplate readOnlyJdbc, SqlGuard guard, int maxToolCalls) {
         this.readOnlyJdbc = readOnlyJdbc;
         this.guard = guard;
+        this.maxToolCalls = maxToolCalls > 0 ? maxToolCalls : 5;
     }
 
     @Tool("""
@@ -53,6 +56,12 @@ public class SqlQueryTool {
             """)
     public String runSql(@P("A single read-only SELECT statement") String sql) {
         String tenantId = TenantContext.current().tenantId();
+        // 自修环上限：达到上限直接终止，避免坏 SQL 在工具回合里反复重试烧 token。
+        if (SqlExecutionContext.get().size() >= maxToolCalls) {
+            log.warn("NL2SQL 自修环达上限 {}（tenant={}），终止重试 | sql={}", maxToolCalls, tenantId, sql);
+            return "Maximum SQL attempts (" + maxToolCalls + ") reached for this question. "
+                    + "Stop calling run_sql and tell the user the query could not be completed.";
+        }
         SqlGuard.GuardResult gr = guard.check(sql, tenantId);
         if (!gr.allowed()) {
             SqlExecutionContext.add(new SqlExecutionContext.Execution(sql, List.of(), true, gr.reason()));

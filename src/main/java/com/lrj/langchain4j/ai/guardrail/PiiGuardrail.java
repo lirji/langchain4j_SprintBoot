@@ -10,7 +10,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /**
  * Blocks responses that look like they leak personally identifiable information
@@ -29,10 +28,6 @@ public class PiiGuardrail implements OutputGuardrail {
 
     private static final Logger log = LoggerFactory.getLogger(PiiGuardrail.class);
 
-    private static final Pattern EMAIL = Pattern.compile("[\\w.+-]+@[\\w-]+\\.[\\w.-]+");
-    private static final Pattern PHONE_CN = Pattern.compile("(?<!\\d)1[3-9]\\d{9}(?!\\d)");
-    private static final Pattern ID_CN = Pattern.compile("(?<!\\d)\\d{17}[\\dXx](?!\\d)");
-
     private final AuditLogger audit;
 
     public PiiGuardrail(AuditLogger audit) {
@@ -44,7 +39,7 @@ public class PiiGuardrail implements OutputGuardrail {
         String text = responseFromLLM.text();
         if (text == null) return OutputGuardrailResult.success();
 
-        String hit = firstHit(text);
+        String hit = PiiDetector.firstHit(text);
         if (hit == null) return OutputGuardrailResult.success();
 
         log.warn("PII guardrail blocked output (matched: {})", hit);
@@ -55,12 +50,5 @@ public class PiiGuardrail implements OutputGuardrail {
                 "Your previous answer contained personally identifiable information ("
                         + hit + "). Rewrite the answer with the PII redacted as [REDACTED]."
         );
-    }
-
-    private static String firstHit(String text) {
-        if (EMAIL.matcher(text).find()) return "email";
-        if (PHONE_CN.matcher(text).find()) return "phone";
-        if (ID_CN.matcher(text).find()) return "id-card";
-        return null;
     }
 }

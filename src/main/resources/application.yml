@@ -131,6 +131,11 @@ app:
       timeout: PT60S
       log-requests: false
       log-responses: false
+      # prompt caching（Anthropic 专属）：缓存长 system prompt 前缀 + 工具定义，
+      # 后续同前缀请求的输入 token 按 cache-read 计费（约 1 折）。OpenAI 系是服务端
+      # 自动缓存、无需开关。改 system prompt / 工具会让缓存失效、下次重新建缓存。
+      cache-system-messages: true
+      cache-tools: true
     gemini:
       api-key: ${GOOGLE_AI_GEMINI_API_KEY:}
       # 常见可选：gemini-2.0-flash / gemini-1.5-flash / gemini-1.5-pro
@@ -229,9 +234,29 @@ app:
     summary:
       # summary 模式下保留多少条最近消息不被压缩
       keep-recent: 6
+      # 压缩是否异步（后台 daemon 线程池跑摘要 LLM，不阻塞请求）。false = 同步（请求路径上压缩）
+      async: true
+      # token 触发预算：>0 时除条数阈值（max-messages）外，估算 token 超此值也触发压缩
+      # （治「几条超大消息撑爆上下文但条数没超」）。0 = 关闭，仅按条数。估算复用 tokenizer-model
+      max-tokens: 0
+      # 摘要膨胀上限（字符）：压出的摘要超此长度截断兜底，防多轮累积压缩越滚越大。0 = 不限
+      max-summary-chars: 2000
     redis:
       key-prefix: "chat:mem:"
       ttl: PT24H
+    profile:
+      # 长期记忆 / 用户画像（跨会话）：正交于上面的会话内滑窗记忆。chat 前召回该用户的 durable 事实
+      # （偏好/稳定属性/反复诉求）注入上下文，chat 后异步抽取更新。默认关 → 对话链零变化。
+      # 端点 POST /chat/memory、GET/DELETE /memory/profile。详见 docs/long-term-memory.md
+      enabled: false
+      # in-memory（默认，重启即丢）| redis（持久化升级路径，按信号补）
+      store: in-memory
+      # 每用户记忆上限，超出淘汰最旧
+      max-items: 50
+      # chat 前注入时召回最近多少条
+      recall-limit: 12
+      # 观察（抽取+入库）是否异步，默认 true 不阻塞 chat 响应
+      async: true
   eval:
     # /eval/run 第一次被调时是否自动跑一次 /rag/ingest（之后不再重复）。
     # 默认关 —— 不想被 eval 误改向量库。开了能避免「RAG case 召回空 → 假 fail」浪费排查。
@@ -291,6 +316,9 @@ app:
     # Agent Card 里对外暴露的 endpoint 前缀（生产填外部可达地址）；card.url = base-url + /a2a
     base-url: http://localhost:8080
     version: 1.0.0
+    # message/stream 收口时，若 agent 回复像「澄清式提问」（保守启发式：明确澄清话术+问号结尾+较短），
+    # 把终态置为 input-required 而非 completed，给客户端标准的多轮续问语义。噪声大可关。
+    detect-input-required: true
     # 异步任务的 push 回推复用 app.async.webhook.*（HMAC secret / timeout / 重试），无需重复配
   rag:
     documents-dir: ./documents
@@ -301,6 +329,10 @@ app:
       store: in-memory
     # 召回截断（rerank 关闭时直接作为返回数；rerank 开启时由 reranker 作为最终 top-k）
     top-k: 5
+    # 召回侧 cosine 相似度阈值：低于此分的片段不召回。治"召回什么"。
+    # 注意：中文 query + nomic-embed-text 下相似度普遍偏低，0.6 之类高阈值会几乎召不回来，
+    # eval 把这个钉出来过 —— 默认 0.3 是中文小模型下的折衷。换强 embedding 可调高。
+    min-score: 0.3
     chunking:
       # recursive（默认）— 按 unit 硬切 + overlap，简单粗暴，适合任何文档
       # markdown-header — 按 ## section 切，每个 chunk 是完整主题；超长 section fallback 到 recursive
@@ -313,6 +345,10 @@ app:
       unit: chars
       max-size: 300        # recursive 的目标 chunk 大小；markdown-header 的 section 长度阈值（单位由 unit 决定）
       overlap: 50          # recursive 模式 chunk 重叠（markdown-header 模式只在 fallback 时用到）
+      # markdown-header 专用：把连续的、单独不足该阈值的极小 section（如「## 标题」+ 一行）向后合并成
+      # 一块，避免碎块单独入库污染检索。单位同 unit（chars 时按字符，tokens 时按 token，tokens 模式建议
+      # 调小到 ~30）。0 = 关闭合并。仅对 strategy=markdown-header 生效，recursive 忽略。
+      min-section-size: 120
       # tokens 模式下计数用的 tokenizer（OpenAiTokenCountEstimator）；chars 模式忽略
       tokenizer-model: gpt-4o-mini
 
@@ -342,6 +378,10 @@ app:
       # 关闭则普通向量检索；开启则在 EmbeddingStore 召回 candidate-size 条后再排
       enabled: false
       candidate-size: 20
+      # 重排后再卡一道分数门槛。治"重排后留什么"，跟召回侧 min-score 正交。
+      # 0.0（默认）= 不丢，保留 reranker 排序后的全部 top-k；
+      # 调高（如 0.5）= 重排打分低于阈值的候选直接剔除，避免无关 chunk 占满 top-k。
+      min-score: 0.0
       # llm（本地 Ollama 当 reranker，慢但零依赖）| jina（云 API，快+多语言，需 api-key）
       type: llm
       jina:
@@ -352,6 +392,40 @@ app:
       enabled: false
       # simple（按字 + 标点切，零依赖）| hanlp（自带词典，中文召回明显更好）
       tokenizer: simple
+    graph:
+      # GraphRAG：入库时抽「实体-关系」三元组建图，检索时从 query 命中实体做 N 跳遍历，
+      # 作为第三路 retriever 并联进 router（vector/keyword/graph），RRF 融合。补向量召回的多跳/关系盲区。
+      # 默认关 → 检索链与历史完全一致。需结构化输出能力的模型。详见 docs/graphrag.md
+      enabled: false
+      # in-memory（默认，零依赖、重启即丢）| jdbc（MySQL 边表持久化，重启不丢，见 jdbc 块）
+      store: in-memory
+      # 遍历跳数。1 够大多数关系问题；2 召回更全但噪声/成本涨，调前先跑 eval 对照
+      max-hops: 1
+      # 单次召回三元组上限，挡高连通实体把 context 撑爆
+      max-triples: 30
+      # token（默认，零 LLM，query 分词匹配实体名）| llm（抽 query 实体再锚定图中实体，更准，每 query 多 1 次 LLM）
+      entity-linking: token
+      # 建图是否投后台异步（G3）：true 时入库不被 N 次抽取 LLM 调用阻塞，大语料建议开
+      async: false
+      # 别名规范化表（G4 轻量实体消歧）：表面形式 → canonical。入库时套用，避免同实体裂成多节点
+      # aliases:
+      #   张三经理: 张三
+      #   老张: 张三
+      extract:
+        # 单 chunk 抽取三元组上限，兜底防模型把每个名词都连成边
+        max-triples-per-chunk: 12
+        # 受限 schema（G4）：非空时只保留 relation 在白名单内的边，并把允许集喂进抽取 prompt。空 = 开放抽取
+        relation-types: []
+        #  - 隶属于
+        #  - 负责
+        #  - 处理
+      # store=jdbc 时用（MySQL 边表持久化）
+      jdbc:
+        url: jdbc:mysql://localhost:3306/graph?useUnicode=true&characterEncoding=utf8
+        username: root
+        password: ${GRAPH_DB_PASSWORD:}
+        table: graph_triple
+        create-table: true
     # in-memory | pgvector | milvus | chroma | qdrant | doris
     store: in-memory
     pgvector:
@@ -424,6 +498,8 @@ app:
       seed-script: db/nl2sql-demo.sql   # classpath；接真实库时置空（不建 demo 表）
     max-rows: 1000                  # L4：无 LIMIT 时强制追加
     query-timeout-seconds: 5        # L5：statement 超时
+    max-tool-calls: 5               # 自修环上限：单次问答 run_sql 最多调几次（含拒/失败重试），防坏 SQL 反复烧 token
+    number-grounding: true          # 数字 grounding（确定性、warn 模式）：核对答案数字 ∈ 查询结果，否则末尾追加核对提示
     allow-tables:                   # L3 表白名单（也是 SchemaProvider 暴露范围）
       - orders
       - customers
@@ -492,6 +568,63 @@ app:
       tenant: tenantA                                       # 飞书应用映射到的内部租户（对齐 seed 的审批人 key）
       approver-chat-id: "${FEISHU_APPROVER_CHAT_ID:}"       # 高风险审批卡片推送目标会话；留空则不推卡片
       http-timeout-ms: 5000
+
+  voice:
+    # 语音客服 Agent（turn-based）：音频 → ASR → 客服大脑（意图路由/工作流/RAG 对话）→ TTS → 音频。
+    # 默认关 → voice 相关 Bean 全不装配。详见 docs/voice-agent.md。POST /voice/chat（multipart 音频）
+    enabled: false
+    provider: openai                       # 目前仅 openai 兼容；base-url 可指云 OpenAI / Azure / 本地 whisper+tts 网关
+    base-url: https://api.openai.com/v1
+    api-key: ${OPENAI_API_KEY:}
+    asr-model: whisper-1                   # 或 gpt-4o-transcribe；本地可填 faster-whisper 模型名
+    tts-model: tts-1                       # 或 gpt-4o-mini-tts
+    tts-voice: alloy
+    tts-format: mp3                        # mp3 | wav | opus | aac | flac | pcm（决定回复 content-type）
+    language: ""                           # ASR 语言提示（如 zh），留空自动检测
+    timeout-seconds: 30
+    max-audio-bytes: 26214400              # 上传音频上限 25MB，挡超大文件
+    # SSE 半流式 /voice/chat/stream：一句最小字数，低于此不单独切句 TTS（防过短句听感碎、省调用）
+    stream-sentence-min-chars: 8
+
+  vision:
+    # 多模态文档理解：图片/扫描件 → 视觉模型「描述 + OCR 转写」→ 文本 → 走现有 RAG 全链。
+    # 默认关 → vision 相关 Bean 全不装配（VisionConfig / VisionController 条件化）。详见 docs/multimodal.md。
+    #   ① 文档入库：POST /rag/documents 上传图片 → 自动转描述/OCR 入库（开关开启时）
+    #   ② 视觉对话：POST /chat/vision（multipart image + message）→ 看图直接作答、不入库
+    # 跟 app.llm.provider（chat）/ app.embedding.provider（向量化）完全解耦——视觉模型单独选后端。
+    enabled: false
+    provider: openai-compat                # openai-compat（云 OpenAI/Azure/vLLM）| ollama（本地 llava/qwen2.5-vl）
+    base-url: https://api.openai.com/v1
+    api-key: ${OPENAI_API_KEY:}
+    model-name: gpt-4o-mini                # 需多模态能力：gpt-4o / gpt-4o-mini / qwen2.5-vl / llava / llama3.2-vision
+    temperature: 0.2                        # 看图转写偏确定性，压低减少漂移
+    timeout-seconds: 60
+    max-retries: 3
+    max-image-bytes: 10485760              # 单图上限 10MB
+    caption-cache-size: 256                # caption 结果按图 SHA-256 去重缓存条数；同图重复上传不重复烧视觉调用。0=关
+    log-requests: false
+    log-responses: false
+    # caption/OCR 指令（入库 + /chat/vision 留空问题时用的默认）。一次调用同时覆盖图像理解与文字转写。
+    # 留空走 VisionProperties 内置中文默认；要改语气/语言在这里覆盖即可。
+#    caption-prompt: ""
+
+  deep-agent:
+    # 深度 Agent：开放式 plan→act→observe 循环（区别于 multiagent 的固定 DAG）。
+    # 默认关 → DeepAgentService / AgentBrain / 示例动作全不装配。详见 docs/deep-agent.md。
+    # POST /agent/run body {"goal":"..."} → 返回整条 trace（steps/finalAnswer/stopReason）
+    enabled: false
+    max-steps: 8                 # 单次 run 硬预算（步数上限），跑满判 MAX_STEPS 终止，挡 runaway
+    max-repeats: 3               # 连续重复同一(动作,入参)达此次数 → 判 LOOP 卡死，提前终止
+    max-scratchpad-chars: 4000   # 跨步工作记忆字符上限，超出截断（保留最新结论），防 prompt 膨胀
+    history-window: 6            # 注入 prompt 的最近步数窗口，控每步 prompt 体积
+    allow-delegation: true       # 是否允许 delegate 动作（派生子 Agent 跑子目标）
+    max-depth: 1                 # delegate 最大递归深度（挡无限自我派生）
+    browser:
+      # Browser-use：把 Playwright 无头 Chromium 网页自动化做成 AgentAction（browser_open / browser_click）
+      # 插进深度 Agent 循环。默认关 → browser 动作与 PlaywrightBrowserSession 全不装配、Chromium 不下载。
+      # 开启后首次需装浏览器二进制：mvn exec:java -Dexec.mainClass=com.microsoft.playwright.CLI \
+      #   -Dexec.args="install chromium"（或代码 launch() 时自动下载）。详见 docs/deep-agent.md。
+      enabled: false
 
 management:
   endpoints:

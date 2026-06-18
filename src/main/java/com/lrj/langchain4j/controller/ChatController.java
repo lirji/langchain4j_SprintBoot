@@ -2,6 +2,7 @@ package com.lrj.langchain4j.controller;
 
 import com.lrj.langchain4j.ai.Assistant;
 import com.lrj.langchain4j.ai.CategoryChatService;
+import com.lrj.langchain4j.ai.guardrail.StreamGuard;
 import com.lrj.langchain4j.ai.grounding.GroundingService;
 import com.lrj.langchain4j.ai.extract.Extractor;
 import com.lrj.langchain4j.ai.extract.Ticket;
@@ -15,6 +16,7 @@ import com.lrj.langchain4j.config.ResolvedAssistantStyle;
 import com.lrj.langchain4j.rag.RagIngestionService;
 import com.lrj.langchain4j.security.TenantContext;
 import org.springframework.beans.factory.ObjectProvider;
+import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.service.TokenStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +30,10 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @RestController
 public class ChatController {
@@ -97,6 +102,16 @@ public class ChatController {
     public SseEmitter chatStream(@RequestParam(defaultValue = "default") String chatId,
                                  @RequestBody Map<String, String> body) {
         SseEmitter emitter = new SseEmitter(120_000L);
+        // 缓冲完整答案做收口后处理（PII 告警）；cancelled 标记客户端断开后停止转发。
+        // 注意：langchain4j 1.13 的 TokenStream.start() 返回 void、不暴露取消句柄，所以断开后
+        // 只能停止向 emitter 转发 + 跳过后处理，无法真正中止上游 LLM 生成（生成仍会跑完）。
+        StringBuilder full = new StringBuilder();
+        AtomicBoolean cancelled = new AtomicBoolean(false);
+        AtomicReference<List<Content>> retrieved = new AtomicReference<>();
+        emitter.onCompletion(() -> cancelled.set(true));
+        emitter.onTimeout(() -> { cancelled.set(true); emitter.complete(); });
+        emitter.onError(e -> cancelled.set(true));
+
         TokenStream tokenStream = assistant.chatStream(scopedChatId(chatId),
                 assistantProps.getLanguage(),
                 assistantProps.getTone(),
@@ -105,15 +120,32 @@ public class ChatController {
                 body.getOrDefault("message", ""));
 
         tokenStream
+                // 捕获本轮检索片段（流式回调线程拿不到 RetrievedSourcesContext ThreadLocal，改这里捕获）
+                .onRetrieved(retrieved::set)
                 .onPartialResponse(token -> {
+                    if (cancelled.get()) return;   // 客户端已断开，停止转发
+                    full.append(token);
                     try {
                         emitter.send(SseEmitter.event().data(token));
                     } catch (IOException e) {
+                        cancelled.set(true);
                         emitter.completeWithError(e);
                     }
                 })
                 .onCompleteResponse(resp -> {
+                    if (cancelled.get()) return;
                     try {
+                        // 流式后处理：token 已发出无法重写，命中只能追加 warning 事件
+                        String answer = full.toString();
+                        String pii = StreamGuard.piiWarningOrNull(answer);
+                        if (pii != null) {
+                            log.warn("PII detected in streamed answer (warn-only, cannot redact post-stream)");
+                            emitter.send(SseEmitter.event().name("warning").data(pii));
+                        }
+                        String grounding = groundingService.streamWarningOrNull(retrieved.get(), answer);
+                        if (grounding != null) {
+                            emitter.send(SseEmitter.event().name("grounding-warning").data(grounding.strip()));
+                        }
                         emitter.send(SseEmitter.event().name("done").data(""));
                     } catch (IOException ignored) {
                         // emitter may already be closed

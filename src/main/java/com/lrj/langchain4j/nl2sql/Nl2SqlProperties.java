@@ -42,6 +42,10 @@ public class Nl2SqlProperties {
     private List<String> tenantScopedTables = new ArrayList<>(List.of("orders", "customers", "refunds"));
     private boolean enforceTenantPredicate = true;
     private Map<String, List<String>> enumColumns = new LinkedHashMap<>();
+    /** 自修环上限：单次问答里 run_sql 工具最多调几次（含被护栏拒/执行失败的重试）。防坏 SQL 反复重试烧 token。 */
+    private int maxToolCalls = 5;
+    /** 数字 grounding（确定性、零 LLM、warn 模式）：核对答案里的数字 ∈ 查询结果，否则末尾追加核对提示。 */
+    private boolean numberGrounding = true;
 
     public static class Datasource {
         /** admin 连接：建库（createDatabaseIfNotExist）/ 建表 / 种子 / 内省 schema（useInformationSchema 让 getColumns 返回列注释）。 */
@@ -92,4 +96,8 @@ public class Nl2SqlProperties {
     public void setEnforceTenantPredicate(boolean enforceTenantPredicate) { this.enforceTenantPredicate = enforceTenantPredicate; }
     public Map<String, List<String>> getEnumColumns() { return enumColumns; }
     public void setEnumColumns(Map<String, List<String>> enumColumns) { this.enumColumns = enumColumns; }
+    public int getMaxToolCalls() { return maxToolCalls; }
+    public void setMaxToolCalls(int maxToolCalls) { this.maxToolCalls = maxToolCalls; }
+    public boolean isNumberGrounding() { return numberGrounding; }
+    public void setNumberGrounding(boolean numberGrounding) { this.numberGrounding = numberGrounding; }
 }

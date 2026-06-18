@@ -57,6 +57,20 @@ app:
       enabled: true
       threshold: 0.7
 
+    graph:
+      # GraphRAG：默认仍关（建图是 N 次抽取 LLM 调用，按需开）。要在知识库里补多跳/关系问答，
+      # 开 enabled 并建议 store=jdbc（重启不丢，跟 Milvus/Redis 一样持久）+ async（不阻塞上传）。
+      enabled: false
+      store: jdbc
+      async: true
+      max-hops: 1
+      jdbc:
+        url: ${GRAPH_DB_URL:jdbc:mysql://localhost:3306/graph?useUnicode=true&characterEncoding=utf8}
+        username: ${GRAPH_DB_USER:root}
+        password: ${GRAPH_DB_PASSWORD:}
+        table: graph_triple
+        create-table: true
+
 # ---------------------------------------------------------------------------
 # 维度坑（务必知道）：
 #   embedding 维度 = Milvus collection 维度。默认 nomic-embed-text=768。
