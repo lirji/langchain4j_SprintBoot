@@ -11,6 +11,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 /**
@@ -19,8 +21,9 @@ import java.util.List;
  * run 结束由 {@code closeForThread} 关闭。条件化在 {@code app.deep-agent.browser.enabled=true}：
  * 关闭时本 Bean 与 browser 动作全不装配，Playwright 不被触碰、Chromium 不下载。
  *
- * <p>v1 能力：导航 + 按链接文本点击 + 读取渲染后文本（相对纯 HTTP fetch 的价值在于<strong>执行 JS</strong>）。
- * 表单输入 / 截图 / 坐标点击 = 未来项。首次使用需先装 Chromium 二进制（见 pom 注释 / docs）。
+ * <p>能力：导航 + 按链接文本点击 + 读取渲染后文本（相对纯 HTTP fetch 的价值在于<strong>执行 JS</strong>）
+ * + 表单输入（{@code type}，CSS 选择器定位）+ 整页截图（{@code screenshot}，存临时文件返回路径，
+ * 不回传 base64 撑爆 prompt）。坐标点击 / OCR 截图理解 = 未来项。首次使用需先装 Chromium 二进制（见 pom 注释 / docs）。
  */
 @Component
 @ConditionalOnProperty(name = "app.deep-agent.browser.enabled", havingValue = "true")
@@ -88,6 +91,61 @@ public class PlaywrightBrowserSession implements BrowserSession {
             return "no link matching '" + linkText + "'. " + linksLine(page);
         } catch (Exception e) {
             return "click failed for '" + linkText + "': " + e.getMessage();
+        }
+    }
+
+    @Override
+    public String clickAt(double x, double y) {
+        Holder h = holder.get();
+        if (h == null) return "no page open yet; use browser_open first";
+        try {
+            Page page = h.page();
+            page.mouse().click(x, y);
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED);
+            return "clicked at (" + x + ", " + y + ").\n" + render(page);
+        } catch (Exception e) {
+            return "click-at failed for (" + x + ", " + y + "): " + e.getMessage();
+        }
+    }
+
+    @Override
+    public String type(String selector, String text) {
+        if (selector == null || selector.isBlank()) return "no selector given";
+        Holder h = holder.get();
+        if (h == null) return "no page open yet; use browser_open first";
+        try {
+            Page page = h.page();
+            page.fill(selector.trim(), text == null ? "" : text);
+            return "filled '" + selector.trim() + "'.\n" + render(page);
+        } catch (Exception e) {
+            return "type failed for selector '" + selector + "': " + e.getMessage()
+                    + "（确认选择器命中一个可输入控件）";
+        }
+    }
+
+    @Override
+    public String screenshot() {
+        Holder h = holder.get();
+        if (h == null) return "no page open yet; use browser_open first";
+        try {
+            Page page = h.page();
+            Path out = Files.createTempFile("agent-screenshot-", ".png");
+            byte[] bytes = page.screenshot(new Page.ScreenshotOptions().setPath(out).setFullPage(true));
+            return "截图已保存：" + out.toAbsolutePath() + " (" + bytes.length + " bytes, " + safe(page.url()) + ")";
+        } catch (Exception e) {
+            return "screenshot failed: " + e.getMessage();
+        }
+    }
+
+    @Override
+    public byte[] screenshotBytes() {
+        Holder h = holder.get();
+        if (h == null) return new byte[0];
+        try {
+            return h.page().screenshot(new Page.ScreenshotOptions().setFullPage(true));
+        } catch (Exception e) {
+            log.debug("screenshotBytes failed: {}", e.toString());
+            return new byte[0];
         }
     }
 

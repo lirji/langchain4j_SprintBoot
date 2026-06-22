@@ -60,6 +60,9 @@ public class DeepAgentService {
                     }
                 }
             }
+            // 清掉中断标志（若本次 run 是被取消的），避免污染线程池里复用本线程的下一个任务。
+            // 在最外层 finally 统一清：run 期间标志保持置位，使所有嵌套 depth 都能侦测到取消并退出。
+            Thread.interrupted();
         }
     }
 
@@ -71,6 +74,12 @@ public class DeepAgentService {
         int repeat = 0;
 
         for (int n = 1; n <= props.getMaxSteps(); n++) {
+            // 取消感知：异步 run 被 Future.cancel(true) 取消时 worker 线程被 interrupt。
+            // 每步开头侦测到就提前退出（当前若已在跑某步则跑完——无法中止上游 LLM 生成，与流式同理）。
+            if (Thread.currentThread().isInterrupted()) {
+                log.info("agent cancelled (interrupted) before step {} (depth={})", n, depth);
+                return new Run(goal, steps, bestEffort(scratchpad), "CANCELLED", depth);
+            }
             AgentDecision d;
             try {
                 d = brain.decide(goal, actionsDesc, scratchpadOrNone(scratchpad), renderHistory(steps));
@@ -197,7 +206,8 @@ public class DeepAgentService {
     /**
      * 一次 run 的结果。
      *
-     * @param stopReason DONE（正常 finish）/ MAX_STEPS（跑满预算）/ LOOP（卡死重复）/ ERROR（brain 异常）
+     * @param stopReason DONE（正常 finish）/ MAX_STEPS（跑满预算）/ LOOP（卡死重复）/ ERROR（brain 异常）/
+     *                   CANCELLED（被取消、线程 interrupt）
      */
     public record Run(String goal, List<Step> steps, String finalAnswer, String stopReason, int depth) {}
 

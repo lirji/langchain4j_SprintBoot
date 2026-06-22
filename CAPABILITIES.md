@@ -9,7 +9,7 @@
 
 - Java 21、Spring Boot 3.3.5、Maven（含 `./mvnw` wrapper，无需本机装 Maven）
 - LangChain4j 1.13.1（BOM 统一管理，部分子模块 pin 到 `1.13.1-beta23` / `1.13.1`）
-- 61 个 Java 源文件，`./mvnw compile` 通过
+- 237 个 Java 源文件，`./mvnw compile` 通过；约 35 个确定性单测类（纯逻辑、不连模型）
 - HTTP client 显式锁定为 JDK 实现（`LangChain4jApplication.main()` 里设系统属性，避免与 Spring RestClient SPI 冲突）
 
 ---
@@ -48,7 +48,7 @@
 
 ---
 
-## 4. AI Service 形态（共 7 套，按职责拆分）
+## 4. AI Service 形态（共 12 套，按职责拆分）
 
 | AiService | 行为 | 带记忆 | 带 RAG | 带 Tool | 入口 |
 | --- | --- | --- | --- | --- | --- |
@@ -56,10 +56,16 @@
 | `BareAssistant` | 不走 RAG 的轻量主对话（router 备选） | ✅ | ❌ | ✅ | 由 `/chat/auto` 路由触发 |
 | `Extractor` | 一次性结构化抽取 → `Ticket` POJO | ❌ | ❌ | ❌ | `/extract/ticket` |
 | `Answerer` + `Critic` | Reflexion 循环（生成 → 评分 → 改进） | ❌ | ❌ | ❌ | `/chat/reflexive`, `/chat/reflexive/stream` |
-| `Planner` + `Worker` + `Synthesizer` | Multi-Agent DAG | ❌ | ❌ | ❌ | `/chat/multi-agent`, `/chat/multi-agent/stream` |
+| `Planner` + `Worker` + `Synthesizer` (+ `Replanner`) | Multi-Agent DAG（可选 replan） | ❌ | ❌ | ❌ | `/chat/multi-agent`, `/chat/multi-agent/stream` |
+| `AgentBrain` | 深度 Agent 单步 ReAct 决策（动作经 `AgentAction` 走循环，非原生 tool） | ❌ | 经 `rag_search` 动作 | 经 `AgentAction` | `/agent/run`, `/agent/run/async` |
+| `SqlAssistant` | NL2SQL：调 `run_sql` 工具查只读库再解读（6 层护栏在 `NlToSqlService`） | ❌ | ❌ | `run_sql` | `/chat/sql` |
 | `McpAssistant` | 工具来自外部 MCP server | ❌ | ❌ | MCP | `/chat/mcp` |
 | `QueryClassifier` + `Judge` | LLM-as-router / LLM-as-judge | ❌ | ❌ | ❌ | `/chat/auto`, `/eval/run` 内部 |
 | `GroundednessChecker` | RAG faithfulness 校验（temp=0，事后判答案是否被 source 支撑） | ❌ | ❌ | ❌ | `/chat` + `/chat/category` 内部（`app.rag.grounding.enabled=true`） |
+| `ProfileExtractor` | 长期记忆：temp=0 从对话抽 durable 用户事实（偏好/属性/诉求） | ❌ | ❌ | ❌ | `/chat/memory` 后异步 observe |
+| `GraphExtractor` + `LlmEntityLinker` | GraphRAG：temp=0 抽实体-关系三元组 / query 实体锚定 | ❌ | ❌ | ❌ | 入库建图 + `graph` 路检索内部 |
+
+> 视觉理解走 `VisionModel`（`ai/vision`，自定义接口包装非 Bean 的 vision `ChatModel`，**不是 `@AiService`**，避开「多 ChatModel Bean」冲突）；意图分类 `FeishuIntent` / 客服大脑 `CustomerServiceBrain` 复用 `Assistant`。详见各模块 doc。
 
 ---
 
@@ -191,7 +197,25 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 ---
 
-## 12. Reflexion（自反思）
+## 12. 深度 Agent（开放式 plan→act→observe 循环）
+
+- 区别于 Multi-Agent 的**固定 DAG**：模型每步自己决定下一步、用工具、观察、再决策，直到 `finish` 或预算耗尽——填「长程、轨迹由模型自定」的空白
+- **显式 ReAct 循环**（结构化 `AgentDecision` 决策，**非**原生 function-calling）：为对每步完全控制 + 跨 provider 确定性可单测
+- **循环控制**（核心价值）：硬预算 `max-steps` / 循环检测 `max-repeats`（连续重复同一动作）/ scratchpad 跨步工作记忆（`note` 沉淀 + 截断）/ 深度受限 `delegate` 子 Agent / 逐步 trace
+- `stopReason` ∈ `DONE` / `MAX_STEPS` / `LOOP` / `ERROR`（brain 异常不崩 run）/ `CANCELLED`（异步 `Future.cancel(true)` interrupt → 每步开头侦测中断标志提前退出，顶层 finally 清标志防污染线程池）
+- `AgentBrain` 程序化 `AiServices.builder` 构建、无 ChatMemory、走主 `ChatModel`——已挂 metrics + per-tenant token 预算 listener，**token 自动纳入配额**；不注册成 Bean（同 `Judge` 套路）
+- **加动作 = 实现 `AgentAction` + `@Component`**（自动发现，无需改循环）。已接入真实能力动作：
+  - `rag_search`：复用主 RAG 链 `vectorRetriever`（带租户 + category 过滤），返回带 `[doc=ID]` 引用的片段
+  - `nl2sql_query`：deep-agent + nl2sql 双开时装配，透传 `NlToSqlService`（6 层 SQL 护栏 + 只读 + 租户谓词）
+  - `mcp_call`：deep-agent + mcp 双开时装配，分派 `McpClient` 动态发现的整个工具集（目录进描述）
+- **Browser-use**（`app.deep-agent.browser.enabled`，默认关）：Playwright 无头 Chromium 做成 6 个动作插进循环——`browser_open`（执行 JS 后读渲染文本/链接）/ `browser_click`（文本点击）/ `browser_click_xy`（坐标点击）/ `browser_type`（表单输入）/ `browser_screenshot`（整页截图存文件）/ `browser_see`（截图→`ai/vision` 视觉理解，browser + vision 双开时装配）；按线程懒加载、`AgentRunListener.onRunEnd` 关页面、Chromium 仅开启时下载
+- `POST /agent/run`（同步）+ `/agent/run/async`（异步，复用 `async` 引擎投后台、轮询/SSE/webhook 取回）；**eval `type:"agent"`** 黄金集校验 stopReason/步数/答案
+- 默认关（`app.deep-agent.*`），零新依赖（Playwright 仅 browser 开启时下载二进制）
+- 38 个确定性单测（循环 11 + browser 11 + rag/nl2sql/mcp 动作 16），全用桩，不连模型/浏览器/DB/MCP
+
+---
+
+## 13. Reflexion（自反思）
 
 - `Critic` 输出 **3 维评分**：`correctness` / `completeness` / `clarity`，每维 0.0–1.0 + 一句 `mainIssue`
 - **加权聚合分** `Σ(weight_i × score_i) / Σ(weight_i)` 低于 `app.reflexion.threshold` 触发改进
@@ -202,7 +226,26 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 ---
 
-## 13. 安全 / Guardrails
+## 14. 业务落地与扩展模块（默认关，各有专属 doc）
+
+> 这些是在框架能力之上落地的业务/生产化场景，**全部 `@ConditionalOnProperty` 默认关、零回归**，深度细节见各自 `docs/*.md`。
+
+| 模块 | 一句话能力 | 开关 | 端点 | doc |
+| --- | --- | --- | --- | --- |
+| **NL2SQL / ChatBI** | 自然语言 → 只读 SELECT → 执行 → 解读；**6 层 SQL 护栏**（只读账号/语句白名单/表白名单/强制 LIMIT/超时/租户谓词）+ schema 注入 + 数字 grounding | `app.nl2sql.enabled` | `/chat/sql` | `nl2sql.md` |
+| **企业知识库问答** | Milvus 持久化 + Apache Tika 解析 PDF/Office 上传 + `kb` profile，多租户隔离 + 重启持久化 + 版本覆盖 | `kb` profile | `/rag/documents` | `knowledge-base.md` |
+| **工作流编排（Flowable）** | 退款审批 BPMN + 人工审批 + MySQL 持久化；生产硬化 #1–#10（超时驳回/幂等/补偿/历史清理/outbox+DLQ/claim 并发 409/PII purge…） | `app.workflow.enabled` | `/workflow/*` | `workflow-integration.md` |
+| **渠道接入（飞书）** | 回调 + AES 解密验签 + 意图路由（退款→工作流/其余→对话）+ 审批卡片回推，5s ack + 异步回推 | `app.channel.feishu.enabled` | `/channel/feishu/event` | `workflow-integration.md` |
+| **语音客服 Agent** | 音频 → ASR → 客服大脑（意图路由）→ TTS；JDK HttpClient 调 OpenAI 兼容 ASR/TTS，含 SSE 半流式分句 | `app.voice.enabled` | `/voice/chat`, `/voice/chat/stream`, `/voice/transcribe` | `voice-agent.md` |
+| **多模态文档理解** | 图像入库增强 RAG + 视觉对话 + 扫描件 OCR；vision provider 与 chat/embedding 三向解耦，caption LRU 缓存 + 入库安全闸 | `app.vision.enabled` | `/chat/vision`, `/rag/documents`（图片） | `multimodal.md` |
+| **GraphRAG（图谱增强）** | 入库抽三元组建图 + 检索 N 跳遍历作**第三路 retriever**（vector/keyword/graph）经 RRF 融合；JDBC 持久化 + LLM 实体链接 | `app.rag.graph.enabled` | 内部第三路召回 | `graphrag.md` |
+| **长期记忆 / 用户画像** | 跨会话记住用户 durable 事实，chat 前召回注入、chat 后异步抽取更新；正交于会话内滑窗记忆 | `app.memory.profile.enabled` | `/chat/memory`, `/memory/profile` | `long-term-memory.md` |
+| **A2A（Agent2Agent）Server** | JSON-RPC 单端点 + Agent Card 发现 + 三种调用（message/send 同步·message/stream SSE·pushNotificationConfig webhook 异步） | `app.a2a.enabled` | `/a2a`, `/.well-known/agent-card.json` | `a2a.md` |
+| **生产化基线 #1–#8** | 多租户隔离 / 限流 / per-tenant token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送 | 多个 flag | `/tasks/*`（异步） | `production-hardening.md` |
+
+---
+
+## 15. 安全 / Guardrails
 
 - `PiiGuardrail` (`OutputGuardrail`)：检测邮箱、中国手机号、18 位身份证号；命中即 `reprompt` 让模型重写为 `[REDACTED]`，`maxRetries=2`
 - `PromptInjectionGuardrail` (`InputGuardrail`)：12 条 bilingual 规则 + 可选 LLM 分类器；BLOCK/SANITIZE/AUDIT 三档
@@ -211,7 +254,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 ---
 
-## 14. 可观测性
+## 16. 可观测性
 
 | 能力 | 实现 | 暴露 |
 | --- | --- | --- |
@@ -232,7 +275,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 ---
 
-## 15. 评测 Harness（生产级）
+## 17. 评测 Harness（生产级）
 
 ### 黄金集
 `src/main/resources/eval/eval-cases.json`，每条：`{id, question, type?, mustInclude[], mustNotInclude[], judgeHint?}`
@@ -252,7 +295,9 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 返回 `Summary{totalCases, runsPerCase, totalRuns, passedRuns, overallPassRate, averageScore, totalDurationMs, cases:[{caseId, runs, passedCount, passRate, avgScore, scoreStdev, attempts[]}]}`
 
-### Type Dispatch（跨 5 个 endpoint 统一评测）
+### Type Dispatch（9 种 type 跨多 endpoint 统一评测）
+
+> `set` 选黄金集：`default` / `sql` / `a2a` / `workflow` / `graph` / `agent`（各有独立 `eval-cases-<set>.json`，后五个需先开对应 profile）。
 
 | `type` | 内部调用 | 喂给 Judge 的 answer 形式 |
 | --- | --- | --- |
@@ -261,6 +306,11 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 | `extract` | `Extractor.extractTicket(question)` | Ticket POJO 序列化的 JSON |
 | `multi-agent` | `MultiAgentService.run(question)` | `tasks: N\n<子任务>\n---\n<finalAnswer>` |
 | `reflexive` | `ReflexiveService.chatReflexive(question)` | `attempts: N, accepted: true\n---\n<finalAnswer>` |
+| `agent` | `DeepAgentService.run(question)` | `stopReason: X\nsteps: N\n---\n<finalAnswer>`（需 `app.deep-agent.enabled`） |
+| `sql` | `NlToSqlService.ask(question)` | `guardBlocked: B\nsql: ...\nrowCount: N\n---\n<解读>`（需 `app.nl2sql.enabled`） |
+| `graph` | `Assistant.chat(...)`（同 chat dispatch） | 模型回复原文（mustInclude 查桥接实体，校验多跳）；需 `app.rag.graph.enabled` |
+| `workflow` | `WorkflowService.start(...)` | `status: ...\npriority: ...\n---\n<reply>`（需 `app.workflow.enabled`） |
+| `a2a` | `A2aService.dispatch("message/send", ...)` | 序列化的 JSON-RPC response（需 `app.a2a.enabled`） |
 
 ### Judge 噪声控制
 1. **客观字段走规则匹配**：`coversAllRequiredFacts` / `violatesForbidden` 在 `EvaluationRunner` 里用 `answer.contains(...)` 算，**不让 Judge LLM 判**。Judge 只负责 `score` + `reasoning`
@@ -288,7 +338,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 ---
 
-## 16. REST API 总览
+## 18. REST API 总览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -301,10 +351,24 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 | POST | `/chat/multi-agent` | Multi-Agent DAG |
 | POST | `/chat/multi-agent/stream` | 流式 Multi-Agent |
 | POST | `/chat/mcp` | MCP 工具驱动对话 |
+| POST | `/agent/run` | 深度 Agent 开放式循环（需 `app.deep-agent.enabled`） |
+| POST | `/agent/run/async` | 深度 Agent 异步版（投后台 + 轮询/SSE/webhook 取回） |
+| POST | `/chat/memory` | 记忆增强对话（跨会话画像，需 `app.memory.profile.enabled`） |
+| GET/DELETE | `/memory/profile` | 查看 / 清空当前用户长期记忆 |
+| POST | `/chat/vision` | 视觉对话（multipart `image`，需 `app.vision.enabled`） |
+| POST | `/chat/sql` | NL2SQL / ChatBI（需 `app.nl2sql.enabled`） |
 | POST | `/extract/ticket` | 结构化输出（Ticket POJO） |
 | POST | `/rag/ingest?category=` | 文档入库（可选分类标签） |
-| POST | `/eval/run?runs=N` | 跑黄金集 |
+| POST/DELETE | `/rag/documents` | 文档生命周期：上传（Tika/图片视觉）+ 版本/删除（`kb` profile） |
+| POST | `/voice/chat`, `/voice/chat/stream`, `/voice/transcribe` | 语音客服（需 `app.voice.enabled`） |
+| POST/GET | `/workflow/*` | 退款审批工作流：start / tasks / claim / complete / instances / data（需 `app.workflow.enabled`） |
+| POST | `/channel/feishu/event` | 飞书事件订阅 / 卡片回调（需 `app.channel.feishu.enabled`） |
+| POST | `/a2a` | A2A JSON-RPC 单端点（需 `app.a2a.enabled`） |
+| GET | `/.well-known/agent-card.json` | A2A 服务发现（免鉴权） |
+| GET | `/tasks/{id}`, `/tasks/{id}/stream` | 异步任务轮询 / SSE（multi-agent / deep-agent async 取结果） |
+| POST | `/eval/run?runs=N&set=` | 跑黄金集（`set` 选集） |
 | POST | `/eval/run-cases?runs=N` | 跑临时集 |
+| POST | `/eval/gate?set=`, `/eval/baseline?set=` | CI 门禁（回归返 422）/ 生成基线 |
 | GET | `/health` | 简易健康 |
 | GET | `/actuator/health` | Actuator（含 llm / embedding sub-indicator） |
 | GET | `/actuator/health/readiness` | K8s readinessProbe 用 |
@@ -313,7 +377,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 
 ---
 
-## 17. 关键配置开关
+## 19. 关键配置开关
 
 ```yaml
 # LLM
@@ -360,6 +424,26 @@ app.query-router.enabled:       false
 app.mcp.enabled:                false
 app.mcp.transport:              stdio | http
 
+# RAG 进阶
+app.rag.grounding.enabled:      false   # 事实幻觉事后校验（warn 模式）
+app.rag.graph.enabled:          false   # GraphRAG 第三路召回
+
+# 深度 Agent
+app.deep-agent.enabled:         false
+app.deep-agent.browser.enabled: false   # Browser-use（Playwright）
+
+# 业务落地模块（默认全关，详见各 doc）
+app.nl2sql.enabled:             false
+app.workflow.enabled:           false
+app.channel.feishu.enabled:     false
+app.voice.enabled:              false
+app.vision.enabled:             false
+app.memory.profile.enabled:     false
+app.a2a.enabled:                false
+
+# 生产化基线（多租户 / 限流 / token 配额 / 审计 / 异步）
+app.security.*  /  app.audit.*  /  app.async.*    # 见 docs/production-hardening.md
+
 # 评测
 app.eval.auto-ingest:           false
 app.eval.concurrency:           4
@@ -367,68 +451,66 @@ app.eval.concurrency:           4
 
 ---
 
-## 18. 配套文档
+## 20. 配套文档
 
 | 文档 | 内容 |
 | --- | --- |
-| `CLAUDE.md` | 本仓库给 AI 协作者用的总览（含技术栈/扩展点/注意事项） |
-| `PROMPT_JOURNEY.md` | Prompt 工程 + eval harness + 生产化的完整演化日志 |
-| `docs/roadmap.md` | 待完善项 / ROI 分档 / 决策表 |
-| `docs/observability.md` | Prometheus / Grafana / Health Check 接入 |
-| `docs/qa.md` | 概念性问答记录（路由 / 决策权 / 设计取舍） |
-| `docs/grafana-dashboard.json` | 现成 7-panel dashboard |
+| `CLAUDE.md` | 给 AI 协作者用的总览（技术栈 / 扩展点 / 注意事项 / 完整 doc 索引） |
 | `CAPABILITIES.md` | 本文档：能力清单（参考/checklist） |
+| `PROMPT_JOURNEY.md` | Prompt 工程 + eval harness + 生产化的完整演化日志 |
+| **业务场景** | |
+| `docs/scenarios.md` | 业务场景落地总览（知识库问答 / 智能客服：NL2SQL·工作流·渠道） |
+| `docs/knowledge-base.md` | 企业知识库问答（Milvus + Tika + `kb` profile） |
+| `docs/nl2sql.md` | NL2SQL / ChatBI（6 层 SQL 护栏 + schema 注入 + 数字 grounding） |
+| `docs/workflow-integration.md` | 工作流编排（Flowable）+ 渠道接入（飞书）+ SSO |
+| `docs/voice-agent.md` | 语音客服 Agent（ASR → 客服大脑 → TTS） |
+| `docs/multimodal.md` | 多模态文档理解（图像入库 / 视觉对话 / 扫描件 OCR） |
+| `docs/deep-agent.md` | 深度 Agent（开放式循环 + 真实能力动作 + Browser-use） |
+| `docs/graphrag.md` | GraphRAG（三元组建图 + N 跳遍历第三路召回） |
+| `docs/long-term-memory.md` | 长期记忆 / 用户画像（跨会话） |
+| `docs/a2a.md` | A2A（Agent2Agent）Server 落地 |
+| `docs/production-hardening.md` | 生产化基线 #1–#8（多租户 / 限流 / 配额 / 审计 / 异步 / 推送） |
+| **运维 / 评估** | |
+| `docs/observability.md` | Prometheus / Grafana / Health Check 接入 |
+| `docs/grafana-dashboard.json` | 现成 7-panel dashboard |
+| `docs/roadmap.md` | 待完善项 / ROI 分档 / 决策表 |
+| `docs/recall-verification.md` | 召回验证与召回率计算 |
+| `docs/qa.md` | 概念性问答记录（路由 / 决策权 / 设计取舍） |
+| **面试速答稿** | |
+| `docs/rag-interview-notes.md` / `token-control-interview.md` / `a2a-interview.md` | RAG / Token 控制 / A2A 速答稿 |
 
 ---
 
-## 19. 项目结构
+## 21. 项目结构
+
+> 包级骨干视图（237 源文件不逐一展开；完整文件级拆解见各模块 `docs/*.md` 与 CLAUDE.md）。
 
 ```text
 src/main/java/com/lrj/langchain4j/
 ├── LangChain4jApplication.java
 ├── ai/
-│   ├── Assistant.java                          @AiService 主对话（含 @OutputGuardrails）
-│   ├── CategoryChatService.java                动态 filter 包装
-│   ├── extract/{Extractor,Ticket}.java         结构化抽取
-│   ├── guardrail/PiiGuardrail.java             PII 输出守卫
-│   ├── mcp/McpAssistant.java                   MCP 工具桥接
-│   ├── multiagent/{Plan,SubTask,Planner,Worker,Synthesizer,MultiAgentService}.java
-│   ├── reflexion/{Answerer,Critic,Critique,ReflexiveService}.java
-│   ├── routing/{BareAssistant,QueryClassifier,QueryRouterService,RouteDecision,RouteKind}.java
-│   └── tools/DateTimeTool.java
-├── config/
-│   ├── LlmConfig.java                          6-provider chat/streaming 统一装配
-│   ├── EmbeddingModelConfig.java               2-provider embedding 装配
-│   ├── AssistantProperties / AssistantStyleConfig / ResolvedAssistantStyle.java
-│   ├── LangChain4jConfig.java                  Retriever + Reranker + QueryTransformer + Augmentor
-│   ├── ChatMemoryConfig.java
-│   ├── EmbeddingStoreConfig.java               6 种 store 切换
-│   ├── ExtractorConfig / ReflexionConfig / MultiAgentConfig / QueryRoutingConfig.java
-│   ├── EvalConfig.java                         Judge ChatModel + evalExecutor
-│   ├── McpConfig.java
-│   └── ObservabilityConfig.java
-├── controller/{ChatController,EvalController}.java
-├── eval/{EvalCase,EvalResult,EvaluationRunner,Judge,Judgment}.java
-├── memory/SummarizingChatMemory.java
-├── observability/
-│   ├── LoggingChatModelListener / MetricsChatModelListener.java
-│   ├── LlmHealthIndicator / EmbeddingHealthIndicator.java
-│   └── TraceIdFilter.java
-├── rag/
-│   ├── RagIngestionService.java
-│   ├── CategoryContext.java
-│   ├── MarkdownHeaderSplitter.java
-│   ├── ChainedQueryTransformer.java
-│   ├── TaggedSourceContentInjector.java
-│   ├── hybrid/{DocumentMirror,KeywordContentRetriever,KeywordTokenizer,SimpleKeywordTokenizer,HanLpKeywordTokenizer}.java
-│   └── scoring/OllamaLlmScoringModel.java
-└── store/
-    ├── doris/{DorisEmbeddingStore,DorisFilterTranslator}.java
-    └── redis/RedisChatMemoryStore.java
+│   ├── Assistant.java / CategoryChatService.java   主对话（@AiService + @Output/InputGuardrails）+ 动态 filter
+│   ├── extract/  reflexion/  multiagent/  routing/ 结构化抽取 / 自反思 / Multi-Agent DAG(+replan) / LLM-as-router
+│   ├── mcp/  grounding/  guardrail/  tools/         MCP 桥接 / 事实幻觉校验 / PII·注入守卫 / @Tool
+│   ├── agent/                                       深度 Agent：循环 + AgentAction(actions/) + browser/(Browser-use)
+│   └── vision/                                      多模态：VisionModel + VisionConfig + VisionContentGuard
+├── config/                                          LlmConfig / EmbeddingModelConfig / EmbeddingStoreConfig / 各模块 @Config
+├── controller/                                      Chat / Eval / Agent / Vision / Voice / Nl2Sql / Workflow / Memory / Document / Task / A2a / channel
+├── rag/                                             检索增强 + hybrid/ graph/(GraphRAG) lifecycle/(文档生命周期) scoring/
+├── memory/                                          SummarizingChatMemory + profile/(长期记忆/用户画像)
+├── nl2sql/                                          NL2SQL：SqlAssistant + 6 层 SqlGuard + SchemaProvider + NumberGrounding
+├── workflow/                                        Flowable BPMN：退款审批 + 人工审批 + outbox/DLQ + 硬化 #1–#10
+├── channel/                                         CustomerServiceBrain + feishu/（渠道接入）
+├── voice/                                           SpeechService + VoiceConversationService（ASR→脑→TTS）
+├── a2a/                                             A2A Server：JSON-RPC + Agent Card + protocol/ 协议类型
+├── security/  audit/  async/                        多租户/限流/token 配额 · 审计日志 · 长任务异步(sse/ webhook/)
+├── eval/                                            评测 harness：EvaluationRunner + Judge + baseline gate
+├── observability/                                   listener(logging/metrics) + health indicator + TraceIdFilter
+└── store/                                           doris/（自实现 ANN）+ redis/（ChatMemoryStore）
 ```
 
 ---
 
-## 20. 一句话定位
+## 22. 一句话定位
 
-**一个从 demo 到生产可用的 LangChain4j 参考实现**：6 个 LLM provider 热切换、6 种向量库、3 种滑窗记忆、Hybrid + Rerank + Query Expansion + History-aware 检索全套、Reflexion + Multi-Agent DAG + LLM-as-router 三种 agent 形态、PII Guardrail、Prometheus + Grafana + Health Check、外置 prompt + 多 provider override、生产级评测 harness（type dispatch + multi-run + parallel + temp=0 Judge）。**零配置就是 Ollama + InMemory 的最小可跑形态**，要哪些上哪些。
+**一个从 demo 到生产可用的 LangChain4j 参考实现**：6 个 LLM provider 热切换、6 种向量库、3 种滑窗记忆、Hybrid + Rerank + Query Expansion + History-aware + GraphRAG 检索全套、Reflexion + Multi-Agent DAG + 深度 Agent（开放式循环 + Browser-use）+ LLM-as-router 多种 agent 形态、PII/注入 Guardrail + 事实幻觉校验、Prometheus + Grafana + Health Check、外置 prompt + 多 provider override、生产级评测 harness（9 种 type dispatch + multi-run + parallel + temp=0 Judge + baseline 门禁）。**业务落地层**再叠 NL2SQL/ChatBI、企业知识库、Flowable 工作流、飞书渠道、语音客服、多模态理解、长期记忆、A2A Server，以及多租户/限流/配额/审计/异步的生产化基线——**全部 `@ConditionalOnProperty` 默认关、零回归**。**零配置就是 Ollama + InMemory 的最小可跑形态**，要哪些上哪些。

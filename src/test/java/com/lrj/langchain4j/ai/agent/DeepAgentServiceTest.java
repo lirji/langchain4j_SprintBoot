@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -163,6 +164,24 @@ class DeepAgentServiceTest {
         var run = svc.run("goal");
         assertEquals("ERROR", run.stopReason());
         assertEquals(1, action.closed, "cleanup must run even if the brain blows up");
+    }
+
+    @Test
+    void interruptedThread_stopsWithCancelled() {
+        EchoAction echo = new EchoAction();
+        // brain 第一步返回动作并把当前线程标记为 interrupted（模拟异步 Future.cancel(true)）；
+        // 第二步开头侦测到中断 → CANCELLED。第一步照常跑完（无法中止已在进行的步骤）。
+        AgentBrain interrupting = new ScriptedBrain(act("echo", "x", null), act("echo", "y", null)) {
+            @Override public AgentDecision decide(String g, String a, String s, String h) {
+                AgentDecision d = super.decide(g, a, s, h);
+                Thread.currentThread().interrupt();
+                return d;
+            }
+        };
+        var run = new DeepAgentService(interrupting, List.of(echo), props()).run("goal");
+        assertEquals("CANCELLED", run.stopReason());
+        assertEquals(1, echo.calls.get(), "进行中的那一步跑完，下一步前才停");
+        assertFalse(Thread.currentThread().isInterrupted(), "顶层 run 收尾应清掉中断标志，避免污染线程池");
     }
 
     @Test
