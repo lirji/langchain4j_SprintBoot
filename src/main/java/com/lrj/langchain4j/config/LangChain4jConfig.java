@@ -47,6 +47,7 @@ public class LangChain4jConfig {
      * Retriever used when reranking is disabled — returns final top-k directly.
      */
     @Bean
+    @org.springframework.beans.factory.annotation.Qualifier("vectorRetriever")
     @ConditionalOnProperty(name = "app.rag.rerank.enabled", havingValue = "false", matchIfMissing = true)
     public ContentRetriever directContentRetriever(EmbeddingStore<TextSegment> embeddingStore,
                                                    EmbeddingModel embeddingModel,
@@ -66,15 +67,17 @@ public class LangChain4jConfig {
      * for the scoring model to re-rank down to top-k.
      */
     @Bean
+    @org.springframework.beans.factory.annotation.Qualifier("vectorRetriever")
     @ConditionalOnProperty(name = "app.rag.rerank.enabled", havingValue = "true")
     public ContentRetriever candidateContentRetriever(EmbeddingStore<TextSegment> embeddingStore,
                                                       EmbeddingModel embeddingModel,
-                                                      @Value("${app.rag.rerank.candidate-size:20}") int candidateSize) {
+                                                      @Value("${app.rag.rerank.candidate-size:20}") int candidateSize,
+                                                      @Value("${app.rag.min-score:0.3}") double minScore) {
         return EmbeddingStoreContentRetriever.builder()
                 .embeddingStore(embeddingStore)
                 .embeddingModel(embeddingModel)
                 .maxResults(candidateSize)
-                .minScore(0.3)
+                .minScore(minScore)
                 .dynamicFilter(query -> tenantScopedFilter(CategoryContext.get()))
                 .build();
     }
@@ -179,9 +182,12 @@ public class LangChain4jConfig {
     }
 
     @Bean
-    public RetrievalAugmentor retrievalAugmentor(ContentRetriever vectorRetriever,
+    public RetrievalAugmentor retrievalAugmentor(@org.springframework.beans.factory.annotation.Qualifier("vectorRetriever")
+                                                 ContentRetriever vectorRetriever,
                                                  @org.springframework.beans.factory.annotation.Autowired(required = false)
                                                  KeywordContentRetriever keywordRetriever,
+                                                 @org.springframework.beans.factory.annotation.Autowired(required = false)
+                                                 com.lrj.langchain4j.rag.graph.GraphRetrieverHolder graphHolder,
                                                  @org.springframework.beans.factory.annotation.Autowired(required = false)
                                                  ScoringModel scoringModel,
                                                  @org.springframework.beans.factory.annotation.Autowired(required = false)
@@ -190,16 +196,25 @@ public class LangChain4jConfig {
                                                  @org.springframework.beans.factory.annotation.Autowired(required = false)
                                                  @org.springframework.beans.factory.annotation.Qualifier("expandingQueryTransformer")
                                                  QueryTransformer expanding,
-                                                 @Value("${app.rag.top-k:5}") int topK) {
-        QueryRouter router = (keywordRetriever != null)
-                ? new DefaultQueryRouter(vectorRetriever, keywordRetriever)
-                : new DefaultQueryRouter(vectorRetriever);
+                                                 @Value("${app.rag.top-k:5}") int topK,
+                                                 @Value("${app.rag.rerank.min-score:0.0}") double rerankMinScore) {
+        // 多路并联：vector 恒在 + keyword（hybrid 开时）+ graph（GraphRAG 开时）。
+        // 三路召回都扇出，由下面的 aggregator 用 RRF 融合。graph 路在 app.rag.graph.enabled=false
+        // 时 Bean 不存在 → 此处 null → 不进 router，检索链与历史完全一致。
+        List<ContentRetriever> retrievers = new ArrayList<>();
+        retrievers.add(vectorRetriever);
+        if (keywordRetriever != null) retrievers.add(keywordRetriever);
+        if (graphHolder != null) retrievers.add(graphHolder.retriever());
+        QueryRouter router = new DefaultQueryRouter(retrievers);
 
+        // rerank 后再卡一道分数门槛：0.0（默认）= 不丢，保留 reranker 排序后的全部 top-k；
+        // 调高（如 0.5）= 重排打分低于阈值的候选直接剔除，避免无关 chunk 占满 top-k。
+        // 跟召回侧 app.rag.min-score 正交：那个治"召回什么"，这个治"重排后留什么"。
         ContentAggregator aggregator = (scoringModel != null)
                 ? ReRankingContentAggregator.builder()
                         .scoringModel(scoringModel)
                         .maxResults(topK)
-                        .minScore(0.0)
+                        .minScore(rerankMinScore)
                         .build()
                 : new DefaultContentAggregator();
 

@@ -3,8 +3,11 @@ package com.lrj.langchain4j.rag.lifecycle;
 import com.lrj.langchain4j.audit.AuditEventType;
 import com.lrj.langchain4j.audit.AuditLogger;
 import com.lrj.langchain4j.rag.DocumentSplitterFactory;
+import com.lrj.langchain4j.rag.graph.GraphIngestor;
+import com.lrj.langchain4j.rag.graph.GraphStore;
 import com.lrj.langchain4j.rag.hybrid.DocumentMirror;
 import com.lrj.langchain4j.security.TenantContext;
+import org.springframework.beans.factory.ObjectProvider;
 import dev.langchain4j.data.document.Document;
 import dev.langchain4j.data.document.DocumentSplitter;
 import dev.langchain4j.data.embedding.Embedding;
@@ -53,19 +56,26 @@ public class DocumentService {
     private final DocumentSplitterFactory splitterFactory;
     private final DocumentRegistry registry;
     private final AuditLogger audit;
+    // GraphRAG 软依赖（app.rag.graph.enabled 时才有 Bean）：upload 建图、delete 同步删边
+    private final ObjectProvider<GraphIngestor> graphIngestorProvider;
+    private final ObjectProvider<GraphStore> graphStoreProvider;
 
     public DocumentService(EmbeddingStore<TextSegment> embeddingStore,
                            EmbeddingModel embeddingModel,
                            DocumentMirror documentMirror,
                            DocumentSplitterFactory splitterFactory,
                            DocumentRegistry registry,
-                           AuditLogger audit) {
+                           AuditLogger audit,
+                           ObjectProvider<GraphIngestor> graphIngestorProvider,
+                           ObjectProvider<GraphStore> graphStoreProvider) {
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
         this.documentMirror = documentMirror;
         this.splitterFactory = splitterFactory;
         this.registry = registry;
         this.audit = audit;
+        this.graphIngestorProvider = graphIngestorProvider;
+        this.graphStoreProvider = graphStoreProvider;
     }
 
     /**
@@ -99,6 +109,10 @@ public class DocumentService {
                 .put("tenantId", tenantId)
                 .put("docId", docId)
                 .put("displayName", displayName)
+                // file_name 是 TaggedSourceContentInjector.inferId 优先读的 key（跟
+                // FileSystemDocumentLoader 的默认 key 对齐）—— 不写它，上传文档的引用会退化成
+                // 通用 [doc=doc#N]，而不是 [doc=<文件名>#N]。splitter 会把 doc metadata 复制进每个 segment。
+                .put("file_name", displayName)
                 .put("version", String.valueOf(nextVersion));
         if (category != null && !category.isBlank()) {
             doc.metadata().put("category", category);
@@ -111,6 +125,11 @@ public class DocumentService {
         List<Embedding> embeddings = embeddingModel.embedAll(segments).content();
         embeddingStore.addAll(embeddings, segments);
         documentMirror.add(segments);
+        // GraphRAG：开启时建图。旧版本的边已在上面 deleteInternal 里按 displayName 前缀清掉，再入新版 → re-upload 不重复
+        GraphIngestor graphIngestor = graphIngestorProvider.getIfAvailable();
+        if (graphIngestor != null) {
+            graphIngestor.ingest(segments);
+        }
 
         DocumentInfo info = new DocumentInfo(
                 docId, tenantId, displayName,
@@ -175,6 +194,14 @@ public class DocumentService {
                         && Objects.equals(info.tenantId(), seg.metadata().getString("tenantId"))
                         && Objects.equals(info.docId(), seg.metadata().getString("docId")));
         log.debug("removed {} mirror segments for docId={}", removed, info.docId());
+
+        // GraphRAG：同步删该文档的边。三元组 sourceId = "<displayName>#<idx>"（inferId 口径），
+        // 按租户 + displayName 前缀匹配。不同步会让 graph 路召回到已删文档的关系。
+        GraphStore graphStore = graphStoreProvider.getIfAvailable();
+        if (graphStore != null) {
+            int removedTriples = graphStore.removeBySourcePrefix(info.tenantId(), info.displayName() + "#");
+            log.debug("removed {} graph triples for doc '{}'", removedTriples, info.displayName());
+        }
     }
 
     /** SHA-256(tenant + ":" + name) → 前 16 hex；URL-safe 且对 displayName 中的特殊字符鲁棒。 */

@@ -6,6 +6,7 @@ import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.content.injector.ContentInjector;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -31,13 +32,17 @@ public class TaggedSourceContentInjector implements ContentInjector {
         StringBuilder sb = new StringBuilder();
         sb.append(userMessage.singleText());
         sb.append("\n\n[Retrieved sources — cite the ones you actually use as `[doc=ID]`]:\n");
+        List<RetrievedSourcesContext.Source> collected = new ArrayList<>(contents.size());
         for (int i = 0; i < contents.size(); i++) {
             TextSegment seg = contents.get(i).textSegment();
             String id = inferId(seg, i);
+            collected.add(new RetrievedSourcesContext.Source(id, seg.text()));
             sb.append("<source id=\"").append(id).append("\">\n");
             sb.append(seg.text()).append("\n");
             sb.append("</source>\n");
         }
+        // 暴露给 grounding 后校验（Layer 0 引用核对 + Layer 1 faithfulness）。调用方负责 clear。
+        RetrievedSourcesContext.set(collected);
         return UserMessage.from(sb.toString());
     }
 
@@ -46,7 +51,7 @@ public class TaggedSourceContentInjector implements ContentInjector {
      * 退到 {@code source} / {@code absolute_directory_path} 文件名，再退到 "doc"。
      * chunk 标号优先用 metadata 的 {@code index}（部分 splitter 会放），退到列表顺序号。
      */
-    private String inferId(TextSegment seg, int fallbackIndex) {
+    public static String inferId(TextSegment seg, int fallbackIndex) {
         var meta = seg.metadata();
         String name = firstNonBlank(
                 meta.getString("file_name"),

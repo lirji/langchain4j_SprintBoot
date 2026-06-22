@@ -25,6 +25,19 @@
 
     <dependencyManagement>
         <dependencies>
+            <!-- 统一 io.grpc 版本到 Milvus SDK（io.milvus:milvus-sdk-java:2.5.9）所基于的 1.59.1。
+                 否则 langchain4j-qdrant 会把 grpc-api 拉到 1.77.0，而 1.77 删掉了 Milvus 仍调用的
+                 io.grpc.InternalGlobalInterceptors → 启动 milvusEmbeddingStore 时
+                 NoClassDefFoundError。放在 langchain4j-bom 之前，确保 grpc 版本以此为准。
+                 注：这把 qdrant 的 grpc 也降到 1.59.1；qdrant store 未在常用 profile 启用，
+                 若要用 qdrant 需另行验证其与 grpc 1.59 的兼容性。 -->
+            <dependency>
+                <groupId>io.grpc</groupId>
+                <artifactId>grpc-bom</artifactId>
+                <version>1.59.1</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <dependency>
                 <groupId>dev.langchain4j</groupId>
                 <artifactId>langchain4j-bom</artifactId>
@@ -128,6 +141,15 @@
             <artifactId>langchain4j-easy-rag</artifactId>
         </dependency>
 
+        <!-- Apache Tika 文档解析（PDF / Word / Excel / PPT / HTML 等）。
+             虽然 easy-rag 已传递引入，但 per-tenant 上传路径（DocumentTextExtractor）
+             直接 import ApacheTikaDocumentParser，显式声明避免将来 easy-rag 改依赖时静默断裂。
+             version 由 langchain4j-bom 管理（当前 1.13.1-beta23）。 -->
+        <dependency>
+            <groupId>dev.langchain4j</groupId>
+            <artifactId>langchain4j-document-parser-apache-tika</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-pgvector</artifactId>
@@ -153,6 +175,40 @@
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
             <version>8.4.0</version>
+        </dependency>
+
+        <!-- NL2SQL（app.nl2sql.*，默认关）：JdbcTemplate 执行只读查询。
+             DataSource 由 Nl2SqlConfig 手动构建（@ConditionalOnProperty），
+             DataSourceAutoConfiguration 已在主 App 排除，保持默认启动无 datasource。
+             demo 库走 MySQL（驱动复用上面的 mysql-connector-j）。 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+
+        <!-- 工作流编排（app.workflow.*，默认关）：Flowable BPMN 引擎。
+             刻意用 flowable-spring（core + Spring 集成）而非 flowable-spring-boot-starter-process：
+             starter 的自动装配只要在 classpath 就会触发、强依赖一个自动装配的主 DataSource，而本项目
+             DataSourceAutoConfiguration 已在主 App 排除（默认无主 SQL 源）→ starter 会让默认启动报错。
+             flowable-spring 无 spring-boot autoconfig，引擎由 WorkflowConfig 在 @ConditionalOnProperty
+             下手动 buildProcessEngine()，关闭时零开销 —— 跟 LlmConfig 绕开 ollama starter、
+             Nl2SqlConfig 手动建 DataSource 同一套路。版本钉 7.1.0（SB 3.3.5 / Spring 6 / Java 21 稳妥）。
+             引擎数据源走 MySQL（驱动复用下面已声明的 mysql-connector-j），建 ~25 张 ACT_* 表。 -->
+        <dependency>
+            <groupId>org.flowable</groupId>
+            <artifactId>flowable-spring</artifactId>
+            <version>7.1.0</version>
+        </dependency>
+
+        <!-- Browser-use（深度 Agent 的 AgentAction，app.deep-agent.browser.enabled，默认关）：
+             Playwright 驱动无头 Chromium 做网页导航/读取。jar 只是客户端，浏览器二进制需首次
+             用 `mvn exec:java -e -D exec.mainClass=com.microsoft.playwright.CLI -D exec.args="install chromium"`
+             或代码 launch() 时自动下载。会话由 PlaywrightBrowserSession 在开关开启时按线程懒加载，
+             关闭时整条 browser 链不装配、Playwright 不被触碰，零开销/零浏览器下载。 -->
+        <dependency>
+            <groupId>com.microsoft.playwright</groupId>
+            <artifactId>playwright</artifactId>
+            <version>1.47.0</version>
         </dependency>
 
         <dependency>

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "workflow-refund-needs-approval",
+    "type": "workflow",
+    "question": "我要申请退款 9999 元，订单号 ORD-2026-001，商品质量问题。",
+    "mustInclude": ["status: WAITING_APPROVAL"],
+    "mustNotInclude": ["status: COMPLETED"],
+    "judgeHint": "本 case 走 /workflow/refund/start（type:workflow）。answer 含 status / priority / reply。大额退款应抽工单 → 高优先级人工审批，状态停在 WAITING_APPROVAL（reply 此时为空，等审批）。考点：流程进入审批挂起而非自动放款。需 app.workflow.enabled=true + MySQL。"
+  },
+  {
+    "id": "workflow-refund-high-priority",
+    "type": "workflow",
+    "question": "紧急！双倍扣款了，请立刻退款 5000 元，订单 ORD-2026-777。",
+    "mustInclude": ["priority: HIGH"],
+    "mustNotInclude": [],
+    "judgeHint": "退款工单优先级应判为 HIGH（金额大 + 紧急）。考点：工单抽取的 priority 字段。answer 里 priority 行应为 HIGH。"
+  },
+  {
+    "id": "workflow-refund-extracts-ticket",
+    "type": "workflow",
+    "question": "订单 ORD-2026-333 想退款，金额 3200，收到的商品和描述不符。",
+    "mustInclude": ["status: WAITING_APPROVAL"],
+    "mustNotInclude": ["[error:"],
+    "judgeHint": "正常退款申请应成功启动流程并进入审批（WAITING_APPROVAL），不报错。考点：工单抽取 + 流程启动 + 状态持久化链路通畅。"
+  }
+]

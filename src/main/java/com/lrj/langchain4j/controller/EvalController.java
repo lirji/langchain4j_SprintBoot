@@ -1,8 +1,11 @@
 package com.lrj.langchain4j.controller;
 
+import com.lrj.langchain4j.eval.Baseline;
+import com.lrj.langchain4j.eval.BaselineGate;
 import com.lrj.langchain4j.eval.EvalCase;
 import com.lrj.langchain4j.eval.EvalResult;
 import com.lrj.langchain4j.eval.EvaluationRunner;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -27,11 +30,15 @@ public class EvalController {
      * 跑黄金集。{@code runs=N}（默认 1）让每个 case 跑 N 次，结果会聚合成
      * per-case {@code avg/σ/passRate}—— 用来过滤 Assistant 侧 temp=0.7 的随机性。
      * 真要做 prompt A/B 一般取 runs=3~5。
+     *
+     * <p>{@code set} 选黄金集：{@code default}（chat 主集，无需额外 profile）/ {@code sql} / {@code a2a} /
+     * {@code workflow}（<strong>需先开对应 profile</strong>：app.nl2sql/a2a/workflow.enabled）。
      */
     @PostMapping("/run")
     @PreAuthorize("hasAuthority('SCOPE_eval')")
-    public EvalResult.Summary run(@RequestParam(defaultValue = "1") int runs) throws IOException {
-        return runner.runDefault(runs);
+    public EvalResult.Summary run(@RequestParam(defaultValue = "1") int runs,
+                                  @RequestParam(defaultValue = "default") String set) throws IOException {
+        return runner.runSet(set, runs);
     }
 
     /** 同 {@link #run}，case 集从 body 来；脚本里搞临时回归用。 */
@@ -40,5 +47,34 @@ public class EvalController {
     public EvalResult.Summary runCases(@RequestParam(defaultValue = "1") int runs,
                                        @RequestBody List<EvalCase> cases) {
         return runner.run(cases, runs);
+    }
+
+    /**
+     * CI 门禁：跑指定集 → 对照提交的基线（{@code resources/eval/baseline[-set].json}）。
+     * <strong>有回归时返回 HTTP 422</strong>，CI 脚本据此 fail；body 是 {@link BaselineGate.GateResult}
+     * （含 regressions 明细 + 完整 summary）。无回归返回 200。
+     */
+    @PostMapping("/gate")
+    @PreAuthorize("hasAuthority('SCOPE_eval')")
+    public ResponseEntity<BaselineGate.GateResult> gate(@RequestParam(defaultValue = "1") int runs,
+                                                        @RequestParam(defaultValue = "default") String set)
+            throws IOException {
+        BaselineGate.GateResult result = runner.gate(set, runs);
+        return result.passed()
+                ? ResponseEntity.ok(result)
+                : ResponseEntity.unprocessableEntity().body(result);
+    }
+
+    /**
+     * 生成基线：跑指定集 N 次，每个门槛取观测值 − {@code slack}（默认 0.1）。把返回的 JSON 存成
+     * {@code resources/eval/baseline[-set].json} 提交即可。首次建基线 / 有意抬高合格线后重置时用。
+     * 推荐 {@code runs>=3} 让观测稳。
+     */
+    @PostMapping("/baseline")
+    @PreAuthorize("hasAuthority('SCOPE_eval')")
+    public Baseline baseline(@RequestParam(defaultValue = "3") int runs,
+                             @RequestParam(defaultValue = "default") String set,
+                             @RequestParam(defaultValue = "0.1") double slack) throws IOException {
+        return runner.deriveBaseline(set, runs, slack);
     }
 }

@@ -19,6 +19,8 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.core.StringRedisTemplate;
 
 import java.time.Duration;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 
 /**
  * 问答记忆系统配置
@@ -44,7 +46,8 @@ public class ChatMemoryConfig {
     }
 
     @Bean
-    public ChatMemoryProvider chatMemoryProvider(ChatMemoryStore store, MemoryProperties props, ChatModel chatModel) {
+    public ChatMemoryProvider chatMemoryProvider(ChatMemoryStore store, MemoryProperties props,
+                                                 LlmConfig llmConfig, LlmConfig.LlmProperties llmProperties) {
         String mode = props.getWindowMode();
         if ("tokens".equalsIgnoreCase(mode)) {
             TokenCountEstimator estimator = new OpenAiTokenCountEstimator(props.getTokenizerModel());
@@ -59,8 +62,23 @@ public class ChatMemoryConfig {
         if ("summary".equalsIgnoreCase(mode)) {
             int threshold = props.getMaxMessages();
             int keepRecent = props.getSummary().getKeepRecent();
-            log.info("ChatMemory window: summary (threshold={}, keepRecent={})", threshold, keepRecent);
-            return memoryId -> new SummarizingChatMemory(memoryId, store, chatModel, threshold, keepRecent);
+            // 摘要走 temp=0 的专用模型（跟 Judge/Critic 同思路）：压缩是确定性任务，
+            // 用主模型默认 temp=0.7 会让同一段历史每次压出不同摘要，记忆漂移。
+            // 仅 summary 模式才构建，不注册成 Bean（避免多 ChatModel Bean 冲突）。
+            ChatModel summarizer = llmConfig.buildJudgeChatModel(llmProperties);
+            // 异步压缩（默认）：摘要 LLM 调用不在请求路径上跑，投到后台 daemon 线程池。
+            // async=false 退回同步（在 add 内阻塞请求线程，用于调试/对照）。
+            boolean async = props.getSummary().isAsync();
+            Executor executor = async ? summaryCompactionExecutor() : null;
+            // token 计量触发（maxTokens>0 时启用）+ 摘要膨胀上限。token 估算复用同款 OpenAI tokenizer。
+            int maxTokens = props.getSummary().getMaxTokens();
+            int maxSummaryChars = props.getSummary().getMaxSummaryChars();
+            TokenCountEstimator estimator = maxTokens > 0
+                    ? new OpenAiTokenCountEstimator(props.getTokenizerModel()) : null;
+            log.info("ChatMemory window: summary (threshold={}, keepRecent={}, summarizer temp=0, async={}, maxTokens={}, maxSummaryChars={})",
+                    threshold, keepRecent, async, maxTokens, maxSummaryChars);
+            return memoryId -> new SummarizingChatMemory(memoryId, store, summarizer, threshold, keepRecent,
+                    executor, estimator, maxTokens, maxSummaryChars);
         }
         int max = props.getMaxMessages();
         log.info("ChatMemory window: messages (max={})", max);
@@ -69,6 +87,20 @@ public class ChatMemoryConfig {
                 .maxMessages(max)
                 .chatMemoryStore(store)
                 .build();
+    }
+
+    /** 后台压缩线程池：daemon 小池（2 线程），不阻塞应用 shutdown。摘要是低频后台操作，2 线程足够。 */
+    private volatile Executor summaryExecutor;
+
+    private synchronized Executor summaryCompactionExecutor() {
+        if (summaryExecutor == null) {
+            summaryExecutor = Executors.newFixedThreadPool(2, r -> {
+                Thread t = new Thread(r, "mem-summarizer");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        return summaryExecutor;
     }
 
     @Bean
@@ -103,9 +135,21 @@ public class ChatMemoryConfig {
 
         public static class Summary {
             private int keepRecent = 6;
+            /** 压缩是否异步（后台线程池跑摘要 LLM，不阻塞请求）。false = 同步（请求路径上压缩）。 */
+            private boolean async = true;
+            /** token 触发预算：>0 时除条数阈值外，token 数超此值也触发压缩（治少量超大消息）。0 = 关。 */
+            private int maxTokens = 0;
+            /** 摘要膨胀上限（字符）：压出的摘要超此长度截断兜底，防多轮累积越滚越大。0 = 不限。 */
+            private int maxSummaryChars = 2000;
 
             public int getKeepRecent() { return keepRecent; }
             public void setKeepRecent(int keepRecent) { this.keepRecent = keepRecent; }
+            public boolean isAsync() { return async; }
+            public void setAsync(boolean async) { this.async = async; }
+            public int getMaxTokens() { return maxTokens; }
+            public void setMaxTokens(int maxTokens) { this.maxTokens = maxTokens; }
+            public int getMaxSummaryChars() { return maxSummaryChars; }
+            public void setMaxSummaryChars(int maxSummaryChars) { this.maxSummaryChars = maxSummaryChars; }
         }
 
         public static class Redis {

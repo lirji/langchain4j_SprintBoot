@@ -87,6 +87,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
         if (path.endsWith("/stream")) return "stream";              // /chat/stream, /chat/reflexive/stream, /chat/multi-agent/stream
         if (path.startsWith("/rag/ingest")) return "ingest";
         if (path.startsWith("/eval/")) return "eval";
+        if (path.startsWith("/a2a")) return "a2a";                  // A2A JSON-RPC（message/send 同步、tasks/* 管理）
         if (path.startsWith("/chat") || path.startsWith("/extract")) return "chat";
         return "default";
     }

@@ -59,7 +59,11 @@ public class SecurityConfig {
                                 "/actuator/info",
                                 "/actuator/prometheus",
                                 "/actuator/tokenbudget",
-                                "/health"
+                                "/health",
+                                // 飞书事件订阅 / 卡片回调：不带 X-Api-Key，用飞书自带验签解密（FeishuController）
+                                "/channel/feishu/**",
+                                // A2A 服务发现：Agent Card 公开可读，免鉴权（POST /a2a 仍需 X-Api-Key）
+                                "/.well-known/agent-card.json"
                         ).permitAll()
                         .anyRequest().authenticated())
                 .addFilterBefore(apiKeyAuthFilter, UsernamePasswordAuthenticationFilter.class)

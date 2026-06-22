@@ -1,0 +1,8 @@
+{
+  "minOverallPassRate": 0.80,
+  "minAverageScore": 0.65,
+  "cases": {
+    "tool-current-time": { "minPassRate": 0.66, "minAvgScore": 0.60 },
+    "extract-critical": { "minPassRate": 0.66, "minAvgScore": 0.60 }
+  }
+}

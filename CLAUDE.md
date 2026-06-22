@@ -5,9 +5,24 @@
 ## 配套文档
 
 - `PROMPT_JOURNEY.md`（项目根目录）— prompt 工程 + eval harness + 生产化的完整演化日志，从 demo 到生产可用
+- `CAPABILITIES.md`（项目根目录）— 项目能力清单：工程基线 + 已落地能力一览，面向"这个仓库能做什么"的速览（设计取舍/演化看 `CLAUDE.md` / `PROMPT_JOURNEY.md` / `docs/`）
+- `docs/scenarios.md` — **业务场景落地总览**：把已落地/规划中的业务场景汇总在一处（① 企业知识库问答 ✅ / ② 智能客服：NL2SQL ✅、工作流编排 🚧、渠道 🚧），含各场景状态、核心端点、关键文件、怎么跑，是场景层的导航入口
 - `docs/roadmap.md` — 待完善项 / 按 ROI 分档 / "触发信号 → 该做什么"决策表
 - `docs/production-hardening.md` — **业务化基线 #1–#8 完整落地记录**：多租户隔离 / 限流 / token 配额 / 文档生命周期 / prompt injection / 审计日志 / 长任务异步化 / Webhook + SSE 推送。包含设计要点、关键文件、yml 配置、验证脚本、关键设计决定
+- `docs/workflow-integration.md` — **业务落地接入设计（规划/实施中）**：客服场景的工作流编排（Flowable BPMN 7.1.0 + 人工审批 + 状态持久化）/ SSO·OAuth（暂缓）/ 渠道接入（飞书样板）。含阶段决策、Flowable 三个坑、退款审批样板流程、待确认 TODO
+- `docs/nl2sql.md` — **NL2SQL / ChatBI（Milestone 2.A + 2.B 已落地并验证）**：自然语言→SQL→只读执行→解读的受控链路。核心是 6 层 SQL 安全护栏（L1 只读账号 / L2 语句白名单 / L3 表白名单 / L4 强制 LIMIT / L5 超时 / L6 租户谓词）+ Schema 注入（含中文枚举 distinct 值）+ few-shot。`POST /chat/sql`，MySQL demo 库，`app.nl2sql.*` 默认关，需 tool-calling 模型。2.B 已补：**数字 grounding**（`NumberGrounding` 确定性核对答案数字 ∈ rows，warn 模式）+ **自修环轮数上限**（`max-tool-calls`）+ **eval `type:"sql"`** 黄金集
+- `docs/knowledge-base.md` — **企业知识库问答系统落地**：Milvus 持久化 + Apache Tika 解析 PDF/Office 上传 + `kb` profile（`application-kb.yml`）+ 端到端验证（多租户隔离 / 重启持久化 / 版本覆盖）
 - `docs/observability.md` — Prometheus / Grafana / Health Check 接入说明
+- `docs/recall-verification.md` — **召回验证与召回率计算**：`rag-recall-all-providers` 强召回 case（靶点「5 provider 列在同一 section」，回归 chunking 切分后召回完整性，含 token 模式跑法）+ 厘清本项目 `passRate`（规则匹配 + Judge）vs 经典 `Recall@k`（需标注黄金集）的区别与各自算法
+- `docs/rag-interview-notes.md` — **RAG 面试速答稿**：Chunking 选型决策表（含 chars/tokens 计量单位）/ 多路·混合召回 / RRF / 召回评估，按「怎么做 + 为什么 + 踩坑」组织
+- `docs/graphrag.md` — **GraphRAG（图谱增强检索）落地（G1–G4 全落地）**：`rag/graph` 包，`app.rag.graph.enabled`（默认关），零新依赖。补向量召回的「多跳关系 / 实体聚合」盲区——入库时 `GraphExtractor`（temp=0）抽实体-关系三元组建图，检索时 `GraphContentRetriever` 从 query 命中实体做 N 跳遍历，作为**第三路 retriever** 并联进 router（vector/keyword/graph）由 RRF 融合。每条三元组带 `sourceId`（`file#chunk`）→ `[doc=ID]` 引用 + grounding Layer 0 白嫖。**G3**：`JdbcGraphStore`（`store=jdbc` MySQL 边表持久化，代 Neo4j）+ `async` 后台建图 + 接 `kb` profile + `removeBySourcePrefix` 生命周期同步。**G4**：`entity-linking=llm`（`LlmEntityLinker` 抽 query 实体再锚定）+ 受限 schema（`extract.relation-types` 白名单）+ 轻量实体消歧（`aliases` 别名表）。23 个确定性单测 + `eval-cases-graph.json`（3 条）+ `baseline-graph.json` 种子（起模型后 `/eval/baseline?set=graph` 重生成）
+- `docs/token-control-interview.md` — **Token 控制面试速答稿**：8 题按 AI Agent 岗提问方式组织（ChatMemory 三种滑窗 / tokenizer 估算偏差 / per-tenant 日 token 预算三组件闭环 / 多副本 Redis 演进 / multi-agent fan-out 成本 + 租户归属 / 输出侧短板 / token 指标 / 降本 roadmap），每题含代码锚点
+- `docs/a2a-interview.md` — **A2A 协议面试速答稿**：三种调用方式（message/send 同步 · message/stream SSE 流式 · pushNotificationConfig Webhook 异步推）/ 三种传输 binding（JSON-RPC/gRPC/REST）/ Agent Card 发现 / Task 状态机（含 input-required）/ A2A vs MCP 对比 / 本项目落地答法
+- `docs/long-term-memory.md` — **长期记忆 / 用户画像落地（v1）**：`memory/profile` 包，`app.memory.profile.enabled`（默认关），零新依赖。补「跨会话记住用户」能力，正交于会话内滑窗记忆（ChatMemory）。chat 前 `recall` 该用户 durable 事实（偏好/属性/反复诉求）注入上下文，chat 后 `observe` 异步用 `ProfileExtractor`（temp=0）抽取更新。`UserProfileStore` 按 `(tenant,user)` 隔离 + 去重 + 容量淘汰；`UserProfileChatService` 包装 `Assistant.chat`（同 `CategoryChatService` 范式）。端点 `POST /chat/memory`、`GET/DELETE /memory/profile`。10 个确定性单测。Redis 持久化 / embedding 消歧 / update-forget 按信号补
+- `docs/voice-agent.md` — **语音客服 Agent 落地（v1 turn-based）**：`voice` 包 + 共享 `channel/CustomerServiceBrain`，`app.voice.enabled`（默认关），零新依赖（JDK `HttpClient`）。把「智能客服」从飞书文本延伸到语音——音频 → ASR → 客服大脑（意图路由：退款/投诉→工作流，其余→RAG 对话）→ TTS → 音频。`SpeechService` 抽象 + `OpenAiSpeechService`（OpenAI 兼容：`/audio/transcriptions` multipart + `/audio/speech`，base-url 可指云 OpenAI/Azure/本地 whisper+tts）。`POST /voice/chat`（multipart 音频）。TTS 前剥 `[doc=]` 引用标记 + 空转写兜底。复用多租户/配额/审计/工作流全链；7 个确定性单测。实时全双工/电话 IVR = 未来项
+- `docs/multimodal.md` — **多模态文档理解落地（分三段）**：`ai/vision` 包 + `app.vision.*`（默认关），零新依赖。把「文档理解」从纯文本延伸到图像——① **图像入库增强 RAG**：`POST /rag/documents` 上传图片 → 视觉模型「描述 + OCR 转写」→ 文本 → 走现有 chunk/embed/检索/引用全链；② **视觉对话** `POST /chat/vision`（multipart `image`+`message`）看图直接作答、单轮不入库；③ **扫描件 OCR**（图片格式，caption 指令内含逐字转写，与描述同一次调用）。`app.vision.provider` 与 chat/embedding **三向解耦**（openai-compat: gpt-4o/qwen2.5-vl；ollama: llava/qwen2.5-vl/llama3.2-vision）。关键设计：视觉 `ChatModel` 由 `VisionConfig` 直接构造、**不注册成 Bean**（避开 `@AiService` 只能有一个 ChatModel 的约束，同 `buildJudgeChatModel` 套路），对外只暴露 `VisionModel` 接口；`MultimodalDocumentExtractor` 软依赖 vision（关闭时上传文本零回归、上传图片清晰 400）。**生产硬化 A/B/C**：A 视觉 `ChatModel` 灌入 `ChatModelListener`（纳入 Prometheus 指标 + per-tenant token 预算，堵绕过配额的口子）；B `DefaultVisionModel` 按图 SHA-256 去重的有界 LRU caption 缓存（`app.vision.caption-cache-size`）；C `VisionContentGuard` 入库前安全闸——注入指令阻断（复用 `PromptInjectionDetector`）+ PII 脱敏（`PiiDetector.redact`）+ 审计，补「图像 caption 绕过 `@AiService` guardrail」缺口。13 个确定性单测。PDF 扫描件逐页渲染 = 未来项
+- `docs/deep-agent.md` — **深度 Agent（开放式 plan→act→observe 循环）落地**：`ai/agent` 包 + `app.deep-agent.*`（默认关），零新依赖。区别于 `multiagent` 的固定 DAG——模型自己决定下一步、用工具、观察、再决策，直到 `finish` 或预算耗尽。显式 ReAct 循环（结构化 `AgentDecision` 决策 + 可插拔 `AgentAction`，**非**原生 function-calling，为的是对每步完全控制 + 跨 provider 确定性可测）：硬预算 `max-steps` / 循环检测 `max-repeats` / scratchpad 跨步工作记忆（`note` 沉淀、截断）/ 深度受限的 `delegate` 子 Agent 派生 / 逐步 trace；`stopReason` ∈ DONE/MAX_STEPS/LOOP/ERROR/CANCELLED（异步 `Future.cancel(true)` interrupt → 每步开头侦测中断标志提前退出，顶层 finally 清标志防污染线程池）。`AgentBrain` 程序化 `AiServices.builder` 构建、无 ChatMemory、走主 `ChatModel`（token 自动纳入配额）。加动作 = 实现 `AgentAction` + `@Component`（自动发现，无需改循环），是 Browser-use/Computer-use 的地基。`POST /agent/run`（同步）+ `/agent/run/async`（**异步**，复用 `async` 引擎投后台、轮询/SSE/webhook 取回）。**eval `type:"agent"`** 黄金集（`set=agent`，校验 stopReason/步数/答案）已接。**真实能力动作**已接入（验证「动作只是往循环里插的工具」）：`rag_search`（复用主 RAG 链 `vectorRetriever`、带 `[doc=ID]` 引用、租户隔离）/ `nl2sql_query`（deep-agent+nl2sql 双开时装配、透传 `NlToSqlService` 全护栏）/ `mcp_call`（deep-agent+mcp 双开、分派 `McpClient` 动态工具集、目录进描述）。**Browser-use** 已落地（`app.deep-agent.browser.enabled`，默认关）：Playwright 无头 Chromium 做成 `browser_open`/`browser_click`（文本点击）/`browser_click_xy`（坐标点击）/`browser_type`（表单输入）/`browser_screenshot`（整页截图存文件）/`browser_see`（截图→`ai/vision` 视觉理解，browser+vision 双开时装配）插进循环，按线程懒加载、`AgentRunListener.onRunEnd` 关页面、Chromium 仅开启时下载。38 个确定性单测（循环 11 + browser 11 + rag/nl2sql/mcp 动作 16）。**Computer-use 桌面沙箱（方向 C：Docker 桌面 + 系统级截图/点击）= 唯一剩余未来项**
+- `docs/a2a.md` — **A2A（Agent2Agent）Server 落地**：`a2a` 包，`app.a2a.enabled`（默认关），零新依赖。三种调用方式（`message/send` chat 同步 / `message/stream` chat SSE 流式 / multi-agent 异步 Task + `pushNotificationConfig` webhook 回推）+ `tasks/get|cancel`。复用 `async` Task 引擎 + 安全/多租户/配额链；A2A push 与现有 `WebhookDispatcher` 双通道隔离。含协议↔内部模型映射、关键文件、怎么跑
 - `docs/qa.md` — 概念性问答记录（路由 / 决策权 / 设计取舍等），按时间倒序
 - `docs/grafana-dashboard.json` — 现成的 7 panel dashboard JSON
 
@@ -87,6 +102,65 @@ src/main/
 documents/                                 RAG 文档目录（.txt/.md/.pdf 等）
 ```
 
+> 上面的树是骨干视图。仓库已扩出若干新包，未逐一展开：`ai/routing`（LLM-as-router classifier）、`ai/mcp`（MCP 桥接 AiService）、`ai/grounding`（事实幻觉事后校验）、`memory`（SummarizingChatMemory 等滑窗实现）、`memory/profile`（长期记忆/用户画像 v1：`ProfileExtractor` temp=0 抽 durable 事实 + `InMemoryUserProfileStore` 按 (tenant,user) 隔离/去重/容量淘汰 + `UserProfileService` recall/异步 observe + `UserProfileChatService` 召回注入包装 + `MemoryController` `/chat/memory`·`/memory/profile`，默认关，详见 `docs/long-term-memory.md`）、`rag/hybrid`（KeywordContentRetriever + DocumentMirror）、`rag/graph`（GraphRAG G1–G4：`GraphExtractor` 三元组抽取 + `InMemoryGraphStore`/`JdbcGraphStore`（MySQL 持久化）邻接图 + `TokenEntityLinker`/`LlmEntityLinker` 实体链接 + `GraphContentRetriever` N 跳遍历第三路召回 + `GraphIngestor` async 建图/别名消歧/受限 schema，默认关，详见 `docs/graphrag.md`）、`rag/lifecycle`（文档生命周期）、`security`（多租户 / prompt injection / 限流 / token 配额）、`audit`（审计日志）、`async`（长任务异步化 + `async/sse` + `async/webhook` 推送）、`eval`（评测 harness）、`observability`（listener / TraceIdFilter）、`nl2sql`（NL2SQL/ChatBI：6 层 SQL 安全护栏 + 只读执行，默认关）、`workflow`（Flowable BPMN 工作流编排：退款审批样板 + 人工审批 + MySQL 持久化。上生产硬化 #1–#10 全落地：`ApprovalTimeoutSweeper` 超时自动驳回（#1）+ `dedupeId`/businessKey 幂等（#2）+ `ServiceTaskDelegates.withRetry` LLM 失败降级补偿/事务边界（#3）+ `WorkflowHistoryCleaner` 历史表按保留期清理/history=audit（#4）+ `WorkflowReplyStore` reply 出流程变量落 `WF_REPLY` 业务表（#5）+ 版本分布日志（#6）+ claim/unclaim + 并发审批 409（#7）+ `WorkflowOutbox`/`WorkflowOutboxDispatcher` 终态回推持久 outbox + DLQ（#8）+ `WorkflowMetrics` 接 Micrometer（#9）+ `purge` PII 合规删除（#10），默认关）、`channel/feishu`（飞书渠道 Milestone 1.B：`FeishuController` 回调 + `FeishuCrypto` AES 解密/验签 + `FeishuIntent` 意图分类 + `FeishuClient` 出站/token 缓存 + `FeishuChannelService` 意图路由[退款→工作流/其余→对话] + `FeishuReplyListener` 监听 `WorkflowTerminalEvent` 回推，5s ack + 异步回推 + 审批卡片闭环，默认关）、`voice`（语音客服 Agent v1：`SpeechService` 抽象 + `OpenAiSpeechService`（ASR `/audio/transcriptions` + TTS `/audio/speech`，JDK HttpClient）+ `VoiceConversationService` 编排 ASR→脑→TTS + `controller/VoiceController` `/voice/chat`，复用 `channel/CustomerServiceBrain`（渠道无关客服大脑：意图分类→工作流/对话），默认关，详见 `docs/voice-agent.md`）、`ai/vision`（多模态文档理解：`VisionModel` 抽象 + `DefaultVisionModel`（base64 + `UserMessage.from(ImageContent,TextContent)` → `chat()`）+ `VisionConfig`（`app.vision.enabled` 条件化，按 provider 建视觉 `ChatModel` 但**不注册成 Bean**，灌入 `ChatModelListener` 接指标/配额）+ `VisionProperties` + `VisionContentGuard`（入库前注入阻断 + PII 脱敏）+ caption SHA-256 LRU 缓存，配 `rag/lifecycle/MultimodalDocumentExtractor`（图片→视觉描述/OCR→安全闸、其余→Tika）+ `controller/VisionController`（`/chat/vision`），与 chat/embedding 三向解耦，默认关，详见 `docs/multimodal.md`）、`ai/agent`（深度 Agent：开放式 plan→act→observe 循环。`AgentBrain`（结构化 `AgentDecision` 单步决策 AiService，无记忆，程序化构建走主 `ChatModel`）+ `DeepAgentService`（循环本体：`max-steps` 硬预算 / `max-repeats` 循环检测 / scratchpad 跨步记忆 / 深度受限 `delegate` 子 Agent / 逐步 trace / stopReason）+ `AgentAction` 可插拔动作接口（`@Component` 自动发现，`actions/CurrentTimeAction` 示例 + `actions/RagSearchAction`（`rag_search` 复用 `vectorRetriever`、带 `[doc=ID]` 引用、租户隔离）+ `actions/Nl2SqlAction`（`nl2sql_query` 仅 deep-agent+nl2sql 双开时装配、透传受控 `NlToSqlService` 全护栏）+ `actions/McpToolAction`（`mcp_call` 仅 deep-agent+mcp 双开时装配、分派 `McpClient` 动态工具集、目录进描述））+ `config/DeepAgentConfig`（`app.deep-agent.enabled` 条件化）+ `controller/AgentController`（`/agent/run` 同步 + `/agent/run/async` 投 `async` 引擎，`Future.cancel(true)` 触发循环 `CANCELLED` 取消感知）+ `AgentRunListener`（顶层 run 收尾钩子）+ `ai/agent/browser`（Browser-use：`BrowserSession` 接口 + `PlaywrightBrowserSession` 按线程懒加载无头 Chromium + `browser_open`/`browser_click`/`browser_click_xy`（坐标点击）/`browser_type`（表单输入）/`browser_screenshot`（整页截图存文件、不回传 base64）/`browser_see`（截图→`ai/vision` 视觉理解，双开 browser+vision 时装配）动作，`app.deep-agent.browser.enabled` 默认关）+ eval `type:"agent"`，默认关，详见 `docs/deep-agent.md`）、`a2a`（A2A Server Milestone：`A2aController` JSON-RPC 单端点 `/a2a` + `/.well-known/agent-card.json` 发现 + `A2aService` 分派[chat 同步/multi-agent 异步] + `A2aStreamService` SSE 流式 + `A2aMapper` 状态翻译 + `A2aPushNotifier`/`A2aPushNotificationStore` webhook 回推 + `a2a/protocol/*` 手写 record 协议类型，复用 `async`/安全/配额，零新依赖，默认关）。详见对应 `docs/*.md`。
+
+## 构建 / 测试 / 打包
+
+```bash
+# 编译
+mvn compile
+
+# 跑全部单测（src/test/java，纯 JVM，不需要起 Ollama）
+mvn test
+
+# 跑单个测试类
+mvn test -Dtest=MarkdownHeaderSplitterTest
+
+# 跑单个测试方法
+mvn test -Dtest=MarkdownHeaderSplitterTest#simpleMarkdown_oneSegmentPerSection
+
+# 打可执行 jar（target/*.jar，含 spring-boot repackage）
+mvn package
+
+# 跳过测试打包
+mvn package -DskipTests
+```
+
+现有单测（JUnit 5，spring-boot-starter-test，**全是纯逻辑单测、不拉起 Spring context、不连模型**）：
+
+- `config/AssistantPropertiesTest` — provider override 解析成 `ResolvedAssistantStyle` 的 fallback 逻辑
+- `rag/MarkdownHeaderSplitterTest` — markdown-header chunking 切分行为（含 `#`-only 自适应 / breadcrumb / 极小 section 合并）
+- `eval/CaseAggregateTest` — multi-run 聚合（passRate / avgScore / σ）算法
+- `eval/BaselineGateTest` — baseline CI 门禁纯逻辑（全局/per-case 门槛 / 缺席 case / 容差 / 基线生成）
+- `eval/GoldenSetsTest` — 黄金集 JSON 结构合法性（4 个集 + baseline 解析，挡 JSON 笔误）
+- `ai/multiagent/MultiAgentServiceTest` — DAG 拓扑排序 / 环检测降级
+- `ai/grounding/GroundingServiceTest` — Layer 0 编造引用检测 / 弃答跳过
+- `ai/guardrail/StreamGuardTest` — 流式后处理：PII 命中 + 澄清式提问识别（input-required）
+- `ai/tools/DateTimeToolTest` — 工具坏入参返回可纠错文本而非抛异常
+- `memory/SummarizingChatMemoryTest` — 摘要记忆：同步/异步压缩 / 失败不丢消息 / clear
+- `nl2sql/SqlGuardTest` — NL2SQL 安全护栏（18 case）：注入拦截 / 只读 / 表白名单 / 强制 LIMIT / 租户谓词
+- `nl2sql/NumberGroundingTest` — NL2SQL 数字 grounding：受支撑来源 / 序数·年份豁免 / 千分位归一
+- `rag/graph/GraphRagTest` — GraphRAG（14 case）：图遍历（1 跳/2 跳/客体侧/桥接）/ 租户·类别隔离 / token 实体链接 / 检索 provenance（sourceId 重建）+ 分组 + maxTriples 截断 + `removeBySourcePrefix`
+- `rag/graph/GraphIngestorTest` — 建图钩子（5 case）：别名规范化 / 受限 schema 过滤 / async 投后台 / 空三元组跳过
+- `rag/graph/LlmEntityLinkerTest` — LLM 实体链接（4 case）：提及锚定真实实体 / 幻觉提及不当种子 / 抽取失败降级
+- `channel/CustomerServiceBrainTest` — 客服大脑（5 case）：CHAT 路由 / 工作流关闭降级对话 / 工作流播报文案（挂起转人工 / 自动受理 reply）
+- `voice/VoiceConversationServiceTest` — 语音编排（3 case）：ASR→脑→TTS 全链 / 空转写跳过大脑兜底 / TTS 前剥引用标记 + base64
+- `voice/SentenceChunkerTest` — SSE 半流式分句器（5 case）：句末标点切句 / min-chars 阈值不切过短句 / flush 残余 / 引用标记不误切 / 单 token 多句
+- `memory/profile/InMemoryUserProfileStoreTest` — 长期记忆存储（5 case）：去重 / 容量淘汰 / 租户·用户隔离 / 空文本跳过 / 清空
+- `memory/profile/UserProfileServiceTest` — 画像服务（5 case）：召回格式 + recall-limit 截最近 / 观察抽取入库 / 空抽取 no-op / 抽取异常被吞
+- `ai/agent/DeepAgentServiceTest` — 深度 Agent 循环：max-steps 硬预算 / max-repeats 循环检测 / scratchpad / stopReason 判定
+- `ai/agent/browser/BrowserActionsTest` — Browser-use 动作（`browser_open`/`browser_click`）插入循环的行为
+- `ai/agent/actions/RagSearchActionTest` / `Nl2SqlActionTest` / `McpToolActionTest` — 深度 Agent 真实能力动作：`rag_search` 引用格式·截断·空命中·异常降级 / `nl2sql_query` 结果格式·护栏拦截·异常降级 / `mcp_call` 目录进描述·JSON 分派·缺字段·坏 JSON·工具错误·异常降级（桩 retriever / 桩 SqlAssistant 写 `SqlExecutionContext` / 桩 `McpClient`，不连模型/DB/MCP server）
+- `ai/vision/DefaultVisionModelTest` — 视觉模型：base64 编码 + caption SHA-256 LRU 缓存命中
+- `a2a/A2aMapperTest` / `a2a/A2aDispatchTest` — A2A 协议↔内部模型映射 / dispatch + skill 路由
+- `workflow/WorkflowServiceTest` / `WorkflowOutboxTest` / `ServiceTaskDelegatesTest` / `ApprovalTimeoutSweeperTest` / `WorkflowHistoryCleanerTest` — 工作流：抽单·优先级 / outbox+DLQ / withRetry 降级补偿 / 超时驳回 / 历史清理（纯逻辑，不连 Flowable 引擎）
+- `rag/lifecycle/DocumentTextExtractorTest` / `InMemoryDocumentRegistryTest` / `MultimodalDocumentExtractorTest` — 文档生命周期：Tika 文本抽取 / 注册表去重·版本 / 多模态分流（图片→视觉、其余→Tika）
+- `channel/feishu/FeishuCryptoTest` / `FeishuIntentTest` — 飞书 AES 解密·验签 / 意图分类
+
+> 这份清单是骨干视图；`find src/test -name "*Test.java"` 取当前全集（约 35 个）。新增功能模块通常会带确定性单测，列表可能滞后于实际。
+
+没有 lint / formatter / 覆盖率插件配置（pom 里只有 `spring-boot-maven-plugin`）。**LLM 行为回归靠 eval harness（见末尾「评测 Harness」节），不是 JUnit** —— JUnit 只覆盖确定性的纯逻辑，凡是要连模型的断言都走 `/eval/run`。
+
 ## 运行
 
 前置条件：
@@ -117,7 +191,7 @@ mvn spring-boot:run
 | --- | --- | --- | --- |
 | `ollama`（默认） | 无 | `llama3.1` | 本地，零成本；需先 `ollama pull <model>` |
 | `openai` | `OPENAI_API_KEY` | `gpt-4o-mini` | 走官方端点；如需代理填 `app.llm.openai.base-url` |
-| `anthropic` | `ANTHROPIC_API_KEY` | `claude-haiku-4-5` | 可改 `claude-sonnet-4-6` / `claude-opus-4-7` |
+| `anthropic` | `ANTHROPIC_API_KEY` | `claude-haiku-4-5` | 可改 `claude-sonnet-4-6` / `claude-opus-4-7`；prompt caching 默认开（`app.llm.anthropic.cache-system-messages` / `cache-tools`）—— 长 system prompt + 工具 schema 命中缓存后输入 token 按 cache-read 计费（约 1 折），`MetricsChatModelListener` 打 `cache_read`/`cache_write` tag 量化命中率 |
 | `gemini` | `GOOGLE_AI_GEMINI_API_KEY` | `gemini-2.0-flash` | Google AI Studio key |
 | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat` | OpenAI 兼容协议，已预设 `base-url=https://api.deepseek.com/v1`；可换 `deepseek-reasoner`(R1) |
 | `vllm` | `VLLM_MODEL`（必填）/ `VLLM_API_KEY`（vLLM 默认不校验，默 `EMPTY`） | 留空，必须显式设 | **生产推荐**。OpenAI 兼容协议，默认 K8s service DNS（`http://vllm-chat.default.svc.cluster.local:8000/v1`）。复用 `OpenAiChatModel`，零新依赖 |
@@ -138,6 +212,7 @@ DEEPSEEK_API_KEY=sk-... mvn spring-boot:run -Dspring-boot.run.arguments=--app.ll
 
 注意：
 
+- **多参数覆盖优先用环境变量，别堆逗号**：`-Dspring-boot.run.arguments=--a=x,--b=y` 实测有过"只有第一个参数生效、第二个被静默丢弃"的情况（NL2SQL 落地时 `--app.nl2sql.enabled=true,--app.llm.ollama.model-name=qwen3:14b` 第二个没生效，排查良久）。要同时覆盖多个 key 时改用 env var（relaxed binding 稳）：`APP_NL2SQL_ENABLED=true APP_LLM_OLLAMA_MODEL_NAME=qwen3:14b mvn spring-boot:run`。单参数用 `-Dspring-boot.run.arguments` 没问题。
 - **EmbeddingModel 由独立开关装配**（`app.embedding.provider`），跟 chat provider 完全解耦 —— 见下面 "切换 Embedding Provider" 节。切换 chat 不影响 RAG 已入库的向量。
 - `application.yml` 里**不要**再添加 `langchain4j.ollama.chat-model` / `langchain4j.<provider>.chat-model` 块，否则 LangChain4j starter 会和 `LlmConfig` 各创建一个 `ChatModel` Bean → 启动冲突。所有 chat/streaming 配置都走 `app.llm.<provider>.*`。
 - Tool calling 在 Gemini / DeepSeek-V3 上行为略有差异；`@AiService` 接口代码无需改。
@@ -215,8 +290,28 @@ mvn spring-boot:run -Dspring-boot.run.arguments=--app.rag.store=doris
 | POST | `/chat/multi-agent/stream` | SSE 流式 multi-agent：按阶段 emit `plan` / `worker-result` / `synthesis-token` / `done`。**Synthesizer 那 10-20s 一次性等变成 token-by-token 立刻看** |
 | POST | `/chat/mcp` | 由 MCP server 的工具驱动的对话（需 `app.mcp.enabled=true`） |
 | POST | `/chat/auto` | LLM-as-router：classifier 分类成 RAG/TOOL/CHAT 分别走 Assistant 或 BareAssistant（需 `app.query-router.enabled=true`）；返回 `{decision, reply, classifyMs, answerMs}` |
-| POST | `/eval/run?runs=N` | 跑 `resources/eval/eval-cases.json` 黄金集，每 case 跑 N 次（默认 1）；返回 per-case avg/σ/passRate + 整体 |
+| POST | `/chat/sql` | NL2SQL / ChatBI：自然语言 → 只读 SELECT → 执行 → 解读（需 `app.nl2sql.enabled=true`）；返回 `{question, sql, rowCount, rows, answer, guardBlocked}`。需 tool-calling 模型。见 `docs/nl2sql.md` |
+| POST | `/workflow/refund/start` | 退款审批工作流：抽工单 → 高优先级人工审批 → 通过/驳回 → 答复（需 `app.workflow.enabled=true` + MySQL）；body 可选 `dedupeId`（按 `tenant:chatId:dedupeId` 幂等去重）/ `webhookUrl`（终态经 outbox 可靠回推）；返回 `{instanceId, status, reply, taskId, priority, deduplicated}`。见 `docs/workflow-integration.md` |
+| GET  | `/workflow/tasks` | 本租户待审任务列表（需 `SCOPE_approve`），含 `assignee` |
+| POST | `/workflow/tasks/{taskId}/claim` `/unclaim` | 认领 / 取消认领任务（需 `SCOPE_approve`）；已被他人领 → 409 |
+| POST | `/workflow/tasks/{taskId}/complete` | 完成审批 body `{approved, comment}`（需 `SCOPE_approve`）→ 同步跑 resolve/reject → 返回 `{reply}`；并发双重审批 → 409 |
+| GET  | `/workflow/instances/{instanceId}` | 工作流实例状态 + reply |
+| DELETE | `/workflow/data?chatId=` | PII 合规删除：清本租户该 chatId 的运行/历史实例 + reply + outbox（需 `SCOPE_approve`） |
+| POST | `/channel/feishu/event` | 飞书事件订阅 / 卡片回调入口（需 `app.channel.feishu.enabled=true`）：URL 握手回 challenge + 消息事件（意图路由：退款/投诉→工作流，其余→对话）+ 审批卡片回调。安全链放行（飞书自带验签，不带 X-Api-Key）。见 `docs/workflow-integration.md`「渠道（飞书）」 |
+| POST | `/voice/chat` | 语音客服（需 `app.voice.enabled=true`）：multipart `audio` + 可选 `chatId` → 音频经 ASR → 客服大脑（退款/投诉→工作流，其余→对话）→ TTS。返回 `{transcript, reply, route, audioContentType, audioBase64}`。走 `/chat` 同款鉴权链。见 `docs/voice-agent.md` |
+| POST | `/voice/chat/stream` | 语音 SSE 半流式（需 `app.voice.enabled=true`）：multipart `audio` → 整段 ASR → 流式生成 → 分句 TTS。SSE 先 `transcript` 事件，再逐句 `audio-chunk`（`{text,audioContentType,audioBase64}`），末 `done`。边生成边播；只走对话。见 `docs/voice-agent.md` |
+| POST | `/voice/transcribe` | 仅 ASR（调试）：multipart `audio` → `{transcript}`（需 `app.voice.enabled=true`） |
+| POST | `/chat/vision` | 视觉对话（需 `app.vision.enabled=true`）：multipart `image` + 可选 `message` → 看图直接作答、单轮不入库。返回 `{reply}`。走 `/chat` 同款鉴权链。见 `docs/multimodal.md` |
+| POST | `/agent/run` | 深度 Agent（需 `app.deep-agent.enabled=true`）：body `{"goal":"..."}` → 开放式 plan→act→observe 循环，返回 `{goal, steps[], finalAnswer, stopReason, depth}`。走 `/chat` 同款鉴权链。见 `docs/deep-agent.md` |
+| POST | `/agent/run/async` | 深度 Agent 异步版（需 `app.deep-agent.enabled=true`）：body `{"goal":"...","webhookUrl"?}` → 立即返回 `AsyncTask`，循环投后台。结果走 `GET /tasks/{id}` 轮询 / `/tasks/{id}/stream` SSE / webhook 回推（复用 `async` 引擎）。长目标用 |
+| POST | `/chat/memory` | 记忆增强对话（需 `app.memory.profile.enabled=true`）：chat 前召回该用户跨会话长期记忆注入、chat 后异步更新画像。query `chatId` + body `{message}` → `{reply}`。见 `docs/long-term-memory.md` |
+| GET/DELETE | `/memory/profile` | 查看 / 清空（PII 合规）当前用户的长期记忆（需 `app.memory.profile.enabled=true`） |
+| POST | `/a2a` | A2A（Agent2Agent）JSON-RPC 2.0 单端点（需 `app.a2a.enabled=true`）：`message/send`（chat 同步 / multi-agent 异步建 Task）、`message/stream`（chat SSE 流式）、`tasks/get`·`tasks/cancel`、`tasks/pushNotificationConfig/set`·`/get`。需 `X-Api-Key`。见 `docs/a2a.md` |
+| GET  | `/.well-known/agent-card.json` | A2A 服务发现：Agent Card（skills / endpoint / capabilities / securitySchemes）。安全链放行，免鉴权 |
+| POST | `/eval/run?runs=N&set=default` | 跑黄金集，每 case 跑 N 次（默认 1）；`set` 选集：`default`(`eval-cases.json`) / `sql` / `a2a` / `workflow` / `graph` / `agent`（`sql`/`a2a`/`workflow`/`agent` 需先开对应 profile，`graph` 需 `app.rag.graph.enabled`+`auto-ingest`）；返回 per-case avg/σ/passRate + 整体 |
 | POST | `/eval/run-cases?runs=N` | body 传 `EvalCase[]` 跑临时集（N 同上） |
+| POST | `/eval/gate?runs=N&set=default` | CI 门禁：跑指定集 → 对照 `resources/eval/baseline[-set].json`；有回归返 **HTTP 422** + regressions 明细，无回归 200。配 `scripts/eval-gate.sh` |
+| POST | `/eval/baseline?runs=N&set=default&slack=0.1` | 从一次实测 run 生成基线（观测值−slack），返回 `Baseline` JSON 供落盘提交（首次建基线 / 重置合格线用，建议 runs≥3） |
 | GET  | `/actuator/health` | Spring Boot Actuator |
 | GET  | `/actuator/metrics/gen_ai.client.token.usage` | LLM token 用量（Micrometer） |
 | GET  | `/actuator/prometheus` | Prometheus scrape 端点 |
@@ -261,9 +356,10 @@ curl -X POST 'localhost:8080/chat/category?chatId=u1&category=manual' \
 - `InMemoryEmbeddingStore` 重启即丢，仅适合本地开发。
 - `ChatMemoryProvider` 当前是进程内存，多实例部署需要换成持久化实现（如基于 Redis 的 `ChatMemoryStore`）。
 - 默认 `MessageWindowChatMemory.withMaxMessages(20)`，长会话需考虑 token 预算或换成 `TokenWindowChatMemory`。
-- `DorisEmbeddingStore` 是社区/自实现版本，已支持 add / search / remove **和 metadata filter**（`DorisFilterTranslator` 把 `IsEqualTo` / `IsIn` / `And` / `Or` / `Not` 等翻译成 `get_json_string(metadata,'$.key') = ?` 形式的 SQL；JSON key 用 `[A-Za-z0-9_.-]+` 白名单校验防注入）。生产用法仍建议补：批量 Stream Load、连接池。
+- `DorisEmbeddingStore` 是社区/自实现版本，已支持 add / search / remove **和 metadata filter**（`DorisFilterTranslator` 把 `IsEqualTo` / `IsIn` / `And` / `Or` / `Not` 等翻译成 `get_json_string(metadata,'$.key') = ?` 形式的 SQL；JSON key 用 `[A-Za-z0-9_.-]+` 白名单校验防注入）。`addAll` 已改为**单连接 + 单条多行 INSERT**批量入库（不再每行一条 INSERT/一个新连接）。生产更大规模仍可上 Stream Load + 连接池。
 - **HTTP client 冲突**：classpath 里同时有 `langchain4j-http-client-spring-restclient` 和 `langchain4j-http-client-jdk` 两个 SPI 实现，LangChain4j 会抛 `Conflict: multiple HTTP clients found`。`LangChain4jApplication.main()` 里用 `System.setProperty("langchain4j.http.clientBuilderFactory", "dev.langchain4j.http.client.jdk.JdkHttpClientBuilderFactory")` 显式锁定 JDK 实现。要换回 Spring RestClient 改这一行即可，不要删。
 - **Ollama starter 与 Spring Boot 3.3.5 不兼容**：`langchain4j-ollama-spring-boot-starter` 1.13.x 的 `OllamaEmbeddingModel` 自动装配引用了 Spring Boot 3.4+ 才有的 `org.springframework.boot.http.client.ClientHttpRequestFactorySettings`，3.3.5 下会 `NoClassDefFoundError`。因此 yml 里**不要**配 `langchain4j.ollama.embedding-model.*`（也不要配 `chat-model` / `streaming-chat-model`），所有 Ollama Bean 都在 `LlmConfig` 里手动 `OllamaChatModel.builder()` / `OllamaEmbeddingModel.builder()` 构建。升级 Spring Boot 到 3.4+ 后可以考虑回到 starter 自动装配，但目前自管比较省事。
+- **Guardrail 必须靠自定义 SPI 才能注入依赖**（**别删 `SpringClassInstanceFactory`**）：LangChain4j（1.13.x）实例化 `@InputGuardrails(X.class)` / `@OutputGuardrails(Y.class)` 引用的类时，走 `ClassInstanceLoader` → 默认**反射调无参构造**，spring-boot-starter **并不会** `getBean()`。本项目的 guardrail（`PromptInjectionGuardrail` 需 `PromptInjectionDetector`、`PiiGuardrail` 需 `AuditLogger`）只有带参构造，默认路径会抛 `NoSuchMethodException` 把整条 `Assistant.chat` 打挂（连带 `/chat`、`/chat/category` 和 eval 全废）。解法：`config/SpringClassInstanceFactory` 实现 `dev.langchain4j.spi.classloading.ClassInstanceFactory` SPI，注册在 `resources/META-INF/services/dev.langchain4j.spi.classloading.ClassInstanceFactory`，优先从 Spring 容器取 bean、取不到再回退反射；context 通过 `SpringContextHolder`（`ApplicationContextAware` 静态持有）拿。这一层对所有 LC4j class 实例化生效，对非 bean 类无回归。
 
 ## Prompt 工程
 
@@ -319,7 +415,7 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 - `messages`（默认）— `MessageWindowChatMemory`，保留最近 `max-messages` 条
 - `tokens` — `TokenWindowChatMemory`，保留最近 `max-tokens` 个 token；用 `OpenAiTokenCountEstimator(tokenizer-model)` 近似计数（Ollama 没自带 tokenizer，OpenAI 估算偏差通常 10–15%）
-- `summary` — 自定义 `SummarizingChatMemory`：超过 `max-messages` 时，把旧消息（保留最近 `summary.keep-recent` 条之外的）用 LLM 压缩成单条 `SystemMessage`；每次压缩一次额外 LLM 调用
+- `summary` — 自定义 `SummarizingChatMemory`：超过 `max-messages` 时，把旧消息（保留最近 `summary.keep-recent` 条之外的）用 LLM 压缩成单条 `SystemMessage`；每次压缩一次额外 LLM 调用。摘要器走 **temp=0 专用模型**（`buildJudgeChatModel`，压缩是确定性任务，避免每次压出不同摘要导致记忆漂移）。压缩**默认异步**（`app.memory.summary.async`，默 true）：`add()` 只追加立即返回、压缩投后台 daemon 线程池，不阻塞请求；快照锁内取、LLM 调用锁外、合并回锁内，期间新 add 的尾部消息保留，单飞防堆叠，失败不丢消息。`add()` 用 per-id 锁串行化 RMW 防并发丢更新（限单 JVM，多副本 + Redis 需 Redis 层锁）。触发除消息条数外还支持 **token 预算**（`app.memory.summary.max-tokens`>0 时估算 token 超阈也压，治少量超大消息）；摘要有**膨胀上限** `app.memory.summary.max-summary-chars`（默 2000，截断兜底防多轮累积越滚越大）
 
 **Reranking** `app.rag.rerank.enabled` + `type`:
 
@@ -359,11 +455,14 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 **Chunking 策略** `app.rag.chunking.*`:
 
-- `strategy=recursive`（默认）— `DocumentSplitters.recursive(max-chars, overlap)`，按字符数硬切 + overlap，简单粗暴适合任何文档
-- `strategy=markdown-header` — `MarkdownHeaderSplitter` 自实现：按 `(?m)(?=^##+ )` 切 section，每个 chunk 是完整主题；超长 section fallback 到 recursive
-- `max-chars: 300` — recursive 模式的 chunk 大小目标；markdown-header 模式的 section 长度阈值
+- `strategy=recursive`（默认）— `DocumentSplitters.recursive(max-size, overlap)`，按 unit 硬切 + overlap，简单粗暴适合任何文档
+- `strategy=markdown-header` — `MarkdownHeaderSplitter` 自实现，每个 chunk 是完整主题；超长 section fallback 到 recursive。三处增强（2026-06-17）：① **自适应标题层级** —— 有 `##+` 按它切（历史行为），否则退到 `#`（纯 H1 文档不再一刀不切成巨块），都没有才整篇 1 段；② **极小 section 合并** `app.rag.chunking.min-section-size`（yml 默认 120 / 代码默认 0=关）—— 连续不足阈值的碎块向后并块，大 section 各自独立；③ **breadcrumb metadata** —— `###` chunk 带上父级路径（`Top > Sub > SubSub`，仅深度>1 注入），`section` 叶子标题不变
+- `unit=chars`（默认）| `tokens` — **计量单位开关**（`DocumentSplitterFactory`）。`chars` 按字符数，零依赖；`tokens` 给 splitter 挂 `OpenAiTokenCountEstimator`（tiktoken），用 `DocumentSplitters.recursive(size, overlap, estimator)` 三参重载，`max-size`/`overlap` 单位变 token，`MarkdownHeaderSplitter` 的 section 阈值也透传同一 estimator（按 token 计量，不再 char/token 混用）。本地模型（Ollama/bge-m3）不暴露 tokenizer，用 OpenAI 估算（偏差 ~10-15%，chunk 软目标可接受）。**token 模式必须保证 `max-size + overlap ≤ embedding 模型 max input`，否则尾部静默截断**。复用了 `ChatMemoryConfig` 里 `TokenWindowChatMemory` 同款 estimator 思路
+- `max-size: 300`（兼容旧 key `max-chars`，`max-size` 优先、缺省回退 `max-chars`）— recursive 模式 chunk 大小目标 / markdown-header section 阈值；单位由 `unit` 决定
 - `overlap: 50` — recursive 模式 chunk 重叠（markdown-header 只在 fallback 时用到）
-- markdown-header 给 segment 加 metadata：`section` 标题 + `index` 顺序号，引用 `[doc=file.md#3]` 对应"第 3 个 section"而不是"第 3 个 300-char 块"
+- `min-section-size: 120`（yml 默认 / 代码默认 0=关）— markdown-header 极小 section 合并阈值，单位随 `unit`（tokens 模式建议调小到 ~30）；仅对 markdown-header 生效
+- `tokenizer-model: gpt-4o-mini` — `tokens` 模式计数用的 tokenizer；`chars` 模式忽略
+- markdown-header 给 segment 加 metadata：`section` 标题 + `index` 顺序号，引用 `[doc=file.md#3]` 对应"第 3 个 section"而不是"第 3 个块"
 - 实测对本项目（5 个 chat provider 列在 1 个 `## Section` 里）的可见提升：recursive(300) 召回不全只列 2 个 provider，markdown-header(600) 召回完整 5 个
 
 **History-aware retrieval** `app.rag.history-aware.*`:
@@ -390,6 +489,18 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 - `LangChain4jConfig.retrievalAugmentor` 是**始终构造**的（不再 conditional on rerank/hybrid），目的就是无条件挂这个 injector —— 不然没启 rerank 的默认路径就走 `DefaultContentInjector`，引用格式契约失效。
 - 与 `app.assistant.citation-policy` 形成闭环：injector 给模型可引的 id，policy 告诉模型按 `[doc=ID]` 引用。任一缺失模型都不会输出格式化引用。
 - `app.rag.min-score`（默认 0.3）控制 cosine 相似度阈值。0.6 之类的高阈值在中文 query 用 `nomic-embed-text` 时召回很低，eval 把这个钉出来过。
+
+**RAG 事实幻觉事后校验（grounding）** `app.rag.grounding.*`:
+
+- 解决的是**事实幻觉**（答案结构完美但内容不被检索资料支撑），跟 Schema（治结构幻觉）、状态机（治动作幻觉）正交。`enabled=false`（默认）时行为与历史完全一致。
+- **仅作用于触发了检索的回答**（本轮没召回到 source 直接跳过，不烧 token）。两层叠加：
+  - **Layer 0（零 LLM，确定性）** `GroundingService.fabricatedCitations`：答案里 `[doc=ID]` 引用的 id 必须在本轮检索集合里，否则判"编造引用"。靠 `RetrievedSourcesContext`（ThreadLocal，由 `TaggedSourceContentInjector` 注入时写入，仿 `CategoryContext` 套路）拿到检索到的 id。
+  - **Layer 1（faithfulness）** `GroundednessChecker`：RAGAS 风格，把答案拆成原子断言逐条对照 `<source>` 判是否被支撑，`groundedScore = 被支撑数 / 总数`；诚实弃答/闲聊无事实断言记 1.0。走独立 temp=0 ChatModel（`LlmConfig.buildJudgeChatModel`，**不注册 ChatModel Bean**，跟 `Critic`/`Judge` 同思路），且 `@ConditionalOnProperty` 只在开启时才构造（关闭零开销）。
+- **v1 只实现 warn 模式**：命中任一层就在答案末尾追加 `⚠️ 可信度提示：…。请以原始资料为准。` + 打 WARN 日志，**不改写、不拒答**。`refuse`/`regenerate` 暂未做（避免半成品开关，故 yml 里没有 `on-fail`）。
+- `threshold`（默认 0.7）— Layer 1 聚合分低于此值才 warn。
+- 接线点：`ChatController./chat` 与 `CategoryChatService`（`/chat/category`）都包了一层 `GroundingService.applyToFreshAnswer(...)`。**`/chat/stream` 流式路径的 grounding 仍未挂**（受 `RetrievedSourcesContext` ThreadLocal 跨流式回调线程边界限制）；但流式 PII 后处理已补 —— 见下「流式后处理」。
+- **诚实弃答跳过校验**：答案命中 `ABSTENTION_MARKERS`（"未在文档中找到"等，跟 `citationPolicy` 契约闭环）时直接放行——弃答无事实断言、无可幻觉。eval 的 `grounding-abstain-quiet` 钉出过这个：弱模型（qwen3:8b）的 Layer 1 checker 会把弃答误判成 `groundedScore=0.0` 触发假告警，故用确定性话术识别兜底，不依赖 checker 在弃答上稳定判 1.0。
+- Layer 1 校验器异常被吞（降级跳过 Layer 1，不影响答案返回）。
 
 ## 多 Agent 协作 / Guardrails / 可观测性
 
@@ -426,14 +537,21 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 **Output Guardrails** `@OutputGuardrails(PiiGuardrail.class, maxRetries=2)`：
 
-- 已挂在 `Assistant.chat()`。检测 email / 中国手机号 / 身份证号；命中就 `reprompt` 让模型重写为 `[REDACTED]`
-- 流式 `chatStream` 暂未挂 guardrail（流式 guardrail 会缓冲整段，按需要再加）
+- 已挂在 `Assistant.chat()`。检测 email / 中国手机号 / 身份证号；命中就 `reprompt` 让模型重写为 `[REDACTED]`。PII 规则抽成共享 `ai/guardrail/PiiDetector`（非流式 guardrail + 流式后处理复用同一套）
 - 输入侧用 `@InputGuardrails(SomeInputGuardrail.class)` 同理
+
+**流式后处理（Stream post-processing）** `ai/guardrail/StreamGuard`：
+
+- 流式路径（`/chat/stream` + A2A `message/stream`）的 token 逐个发出，**无法像非流式 guardrail 那样重写**——已发的收不回。故只做 **append-only 告警**：缓冲完整答案 → `StreamGuard.piiWarningOrNull` 命中 PII 则追加 warning 事件（`/chat/stream` 是 `event: warning`；A2A 是告警 artifact）
+- **A2A input-required**：`StreamGuard.looksLikeClarifyingQuestion`（保守启发式：明确澄清话术 + 问号结尾 + 较短）判回复是澄清式提问时，A2A 流终态置 `INPUT_REQUIRED`（`app.a2a.detect-input-required`，默开）
+- **断连取消**：两条 stream 路径注册 `emitter.onCompletion/onTimeout/onError` → `cancelled` 标记，客户端断开后停止转发 + 跳过后处理。**限制**：`TokenStream.start()` 返 void、无取消句柄，无法中止上游 LLM 生成（仍跑完），只省转发/后处理
+- grounding 流式后校验已补：用 `TokenStream.onRetrieved` 捕获检索片段（绕开 `RetrievedSourcesContext` ThreadLocal 跨线程问题），收口时 `GroundingService.streamWarningOrNull`（Layer 0 引用核对 + Layer 1 faithfulness）命中追加 `grounding-warning` 事件/artifact。Layer 1 开启时收口多一次 temp=0 LLM 调用（延迟尾增）
+- 单测 `StreamGuardTest`（PII 命中 + 澄清式提问识别）
 
 **Observability**（详见 `docs/observability.md`）：
 
 - `LoggingChatModelListener` — 每次 LLM 调用打一行 `model / duration_ms / tokens_in/out/total`
-- `MetricsChatModelListener` — 自己写的最小实现（`langchain4j-micrometer` 还未发到 Maven Central），用 `MeterRegistry` 直接打点：`gen_ai.client.requests`（counter）、`gen_ai.client.operation.duration`（timer）、`gen_ai.client.token.usage`（counter，按 input/output 拆 tag）、`gen_ai.client.errors`
+- `MetricsChatModelListener` — 自己写的最小实现（`langchain4j-micrometer` 还未发到 Maven Central），用 `MeterRegistry` 直接打点：`gen_ai.client.requests`（counter）、`gen_ai.client.operation.duration`（timer）、`gen_ai.client.token.usage`（counter，按 input/output 拆 tag；Anthropic 额外打 `cache_read`/`cache_write` —— 见下 prompt caching）、`gen_ai.client.errors`
 - **listener 通过 `LlmConfig` 构造器注入 `List<ChatModelListener>` 灌到每个 chat builder**。之前注释说 "starter 自动 wire"，但项目改成手动建 ChatModel 后绕开了 starter，metrics 其实没记录 —— 这是 hardening 时修的 silent bug
 - `TraceIdFilter` — 每个 HTTP 请求生成 8 位 `traceId` 进 MDC、回写 `X-Trace-Id` 响应头；日志 pattern 已带 `[%X{traceId:-}]`
 - Prometheus 抓取：`/actuator/prometheus`
@@ -520,16 +638,33 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 ### 跨 endpoint：type dispatch
 
-`EvalCase` 有可选 `type` 字段（默认 `"chat"`），让同一套 harness 覆盖 4 个 endpoint：
+`EvalCase` 有可选 `type` 字段（默认 `"chat"`），让同一套 harness 覆盖多个 endpoint：
 
 | type | 调用 | "answer" 喂给 Judge 的形式 | 用途 |
 | --- | --- | --- | --- |
 | `chat`（默认） | `Assistant.chat(...)` | 模型回复原文 | 主对话 |
+| `graph` | `Assistant.chat(...)`（同 chat dispatch） | 模型回复原文 | GraphRAG：校验多跳关系（mustInclude 查桥接实体）/ 实体聚合 / 不编造关系。独立集只为隔离前置（建图 + 多跳 case）。需 `app.rag.graph.enabled` + `app.eval.auto-ingest` |
+| `grounded` | `GroundingService.applyToFreshAnswer(() -> Assistant.chat(...))` | 模型回复原文（命中闸门时末尾带 `⚠️ 可信度提示`） | 测 RAG 事实幻觉的事后校验闸门 |
 | `extract` | `Extractor.extractTicket(question)` | Ticket POJO 序列化的 JSON | 结构化抽取（mustInclude 可查 `"priority":"CRITICAL"` 等字面） |
 | `multi-agent` | `MultiAgentService.run(question)` | `tasks: N\n<子任务列表>\n---\n<finalAnswer>` | 同时校验拆分粒度（mustInclude 查 `tasks: 3`）和最终答案 |
 | `reflexive` | `ReflexiveService.chatReflexive(question)` | `attempts: N, accepted: true\n---\n<finalAnswer>` | 同时校验反思迭代行为（attempts/accepted）和最终答案 |
+| `sql` | `NlToSqlService.ask(question)` | `guardBlocked: B\nsql: ...\nrowCount: N\n---\n<解读>` | NL2SQL：校验护栏拦截（mustInclude 查 `guardBlocked: true`）/ 中文枚举 / 租户隔离 / 解读数字。需 `app.nl2sql.enabled` + MySQL demo 库 + tool-calling 模型 |
+| `a2a` | `A2aService.dispatch("message/send", ...)`（chat skill 同步） | 序列化的 JSON-RPC response | A2A：校验 dispatch + skill 路由 + 协议映射（mustInclude 查 `"role":"agent"` / `"error"`）。需 `app.a2a.enabled` |
+| `workflow` | `WorkflowService.start(chatId, question, ...)` | `status: ...\npriority: ...\n---\n<reply>` | 退款工作流：校验进审批（mustInclude 查 `status: WAITING_APPROVAL`）/ 优先级 / 工单抽取。需 `app.workflow.enabled` + MySQL |
+| `agent` | `DeepAgentService.run(question)` | `stopReason: ...\nsteps: N\n---\n<finalAnswer>` | 深度 Agent：校验开放式循环正常完成（mustInclude 查 `stopReason: DONE`，挡 LOOP/MAX_STEPS）/ 步数 / 最终答案。需 `app.deep-agent.enabled` + tool-calling 模型 |
 
-dispatch 在 `EvaluationRunner.invokeByType()`，加新 type 在 switch 加一支 + 在 EvalCase 文档里登记即可。
+dispatch 在 `EvaluationRunner.invokeByType()`，加新 type 在 switch 加一支 + 在 EvalCase 文档里登记即可。`sql`/`a2a`/`workflow`/`agent` 的服务经 `ObjectProvider` 软依赖注入：没开对应 profile 时为 null，跑到该 type 的 case 才报清晰错误（不影响 default 集）。各有独立黄金集文件 `eval-cases-{sql,a2a,workflow,graph,agent}.json`，`/eval/run?set=` 选（`graph` 服务无软依赖，只需开 `app.rag.graph.enabled`+`auto-ingest`；`agent` 需 `app.deep-agent.enabled`）。
+
+**baseline CI 门禁**：`Baseline`（全局 + per-case 合格线）+ `BaselineGate`（纯函数对照，带浮点容差，基线里有但本次缺席的 case 也判回归，防"偷偷删 case 让门禁变绿"）。`POST /eval/gate?set=&runs=` 有回归返 HTTP 422（CI fail），`POST /eval/baseline` 从实测 run 减 slack 生成基线落盘。`scripts/eval-gate.sh` 封装 curl + 退出码。基线生成/对照逻辑被 `BaselineGateTest` 确定性覆盖，黄金集 JSON 结构被 `GoldenSetsTest` 校验（CI 挡 JSON 笔误）。
+
+**grounded 类型的两条 case 有前置**（`grounding-supported-quiet` / `grounding-abstain-quiet`）：
+
+- 它跟 `chat` 的唯一区别是包了一层 `GroundingService` —— 闸门只在 `app.rag.grounding.enabled=true` 时运行，否则等价于 `chat`（直通）。
+- 两条都依赖检索召回，需 `app.eval.auto-ingest=true`（或先手动 `/rag/ingest`）才有 source 可校验。
+- 都测的是"闸门**不该响**的场景"（充分支撑的答案 / 诚实弃答），用 `mustNotInclude: ["可信度提示"]` 守住 warn 模式最怕的**误报**。`grounding-supported-quiet` 若偶发响了，多半是 Layer 0 引用 id 对不上或 Layer 1 偏严——这是关于闸门松紧的信号，不是测试 bug。
+- 跑法：`mvn spring-boot:run -Dspring-boot.run.arguments="--app.rag.grounding.enabled=true,--app.eval.auto-ingest=true"` 后 `POST /eval/run?runs=3`。
+
+> 注：当前默认黄金集还含 `rag-citation-*` / `rag-no-match` 等依赖 ingest 的 RAG case，所以"开 auto-ingest 跑"本就是 RAG 相关 case 的标准前置。
 
 结构化输出之所以序列化成 string 喂 Judge：
 

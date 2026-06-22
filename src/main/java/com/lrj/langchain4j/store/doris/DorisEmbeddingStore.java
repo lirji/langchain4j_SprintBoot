@@ -108,21 +108,47 @@ public class DorisEmbeddingStore implements EmbeddingStore<TextSegment> {
 
     @Override
     public List<String> addAll(List<Embedding> embeddings) {
-        List<String> ids = new ArrayList<>(embeddings.size());
-        for (Embedding e : embeddings) {
-            ids.add(add(e));
-        }
-        return ids;
+        return insertBatch(embeddings, null);
     }
 
     @Override
     public List<String> addAll(List<Embedding> embeddings, List<TextSegment> embedded) {
-        if (embeddings.size() != embedded.size()) {
+        if (embedded != null && embeddings.size() != embedded.size()) {
             throw new IllegalArgumentException("embeddings/embedded size mismatch");
         }
-        List<String> ids = new ArrayList<>(embeddings.size());
-        for (int i = 0; i < embeddings.size(); i++) {
-            ids.add(add(embeddings.get(i), embedded.get(i)));
+        return insertBatch(embeddings, embedded);
+    }
+
+    /**
+     * 批量入库：<strong>单连接 + 单条多行 INSERT</strong>（{@code VALUES (...),(...),...}），
+     * 取代原来「每个 chunk 一条 INSERT + 一个新 Connection」（N 个 chunk = N 次建连 + N 次往返）。
+     * 向量是 {@code ARRAY<FLOAT>} 字面量不能参数化，按数值内联（{@link #toArrayLiteral} 已 sanitize）；
+     * id/text/metadata 仍走 PreparedStatement 占位防注入。
+     */
+    private List<String> insertBatch(List<Embedding> embeddings, List<TextSegment> embedded) {
+        if (embeddings == null || embeddings.isEmpty()) {
+            return List.of();
+        }
+        int n = embeddings.size();
+        List<String> ids = new ArrayList<>(n);
+        StringBuilder sql = new StringBuilder("INSERT INTO ").append(table)
+                .append(" (id, text, metadata, embedding) VALUES ");
+        for (int i = 0; i < n; i++) {
+            ids.add(UUID.randomUUID().toString());
+            if (i > 0) sql.append(',');
+            sql.append("(?, ?, ?, ").append(toArrayLiteral(embeddings.get(i).vector())).append(')');
+        }
+        try (Connection c = conn(); PreparedStatement ps = c.prepareStatement(sql.toString())) {
+            int p = 1;
+            for (int i = 0; i < n; i++) {
+                TextSegment seg = embedded == null ? null : embedded.get(i);
+                ps.setString(p++, ids.get(i));
+                ps.setString(p++, seg == null ? null : seg.text());
+                ps.setString(p++, (seg == null || seg.metadata() == null) ? "{}" : writeJson(seg.metadata().toMap()));
+            }
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("Doris batch insert (" + n + " rows) failed", e);
         }
         return ids;
     }

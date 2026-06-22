@@ -174,6 +174,10 @@ public class LlmConfig {
                 .temperature(tempOverride != null ? tempOverride : p.getTemperature())
                 .timeout(p.getTimeout())
                 .maxRetries(p.getMaxRetries())
+                // prompt caching：长 system prompt（5 段 SYSTEM_PROMPT）+ 工具定义命中缓存后，
+                // 后续同 prefix 请求的输入 token 计费按 cache-read（约 1 折）。见 docs。
+                .cacheSystemMessages(p.isCacheSystemMessages())
+                .cacheTools(p.isCacheTools())
                 .listeners(listeners)
                 .logRequests(p.isLogRequests())
                 .logResponses(p.isLogResponses())
@@ -193,6 +197,8 @@ public class LlmConfig {
                 .modelName(p.getModelName())
                 .temperature(p.getTemperature())
                 .timeout(p.getTimeout())
+                .cacheSystemMessages(p.isCacheSystemMessages())
+                .cacheTools(p.isCacheTools())
                 .build();
     }
 
@@ -402,6 +408,10 @@ public class LlmConfig {
         private int maxRetries = 3;
         private boolean logRequests = false;
         private boolean logResponses = false;
+        /** Anthropic prompt caching：缓存长 system prompt 前缀，降后续请求输入 token 成本。默认开。 */
+        private boolean cacheSystemMessages = true;
+        /** Anthropic prompt caching：缓存工具定义（@Tool schema），多工具场景省 token。默认开。 */
+        private boolean cacheTools = true;
 
         public String getApiKey() { return apiKey; }
         public void setApiKey(String apiKey) { this.apiKey = apiKey; }
@@ -417,6 +427,10 @@ public class LlmConfig {
         public void setLogRequests(boolean logRequests) { this.logRequests = logRequests; }
         public boolean isLogResponses() { return logResponses; }
         public void setLogResponses(boolean logResponses) { this.logResponses = logResponses; }
+        public boolean isCacheSystemMessages() { return cacheSystemMessages; }
+        public void setCacheSystemMessages(boolean cacheSystemMessages) { this.cacheSystemMessages = cacheSystemMessages; }
+        public boolean isCacheTools() { return cacheTools; }
+        public void setCacheTools(boolean cacheTools) { this.cacheTools = cacheTools; }
     }
 
     public static class GeminiProps {

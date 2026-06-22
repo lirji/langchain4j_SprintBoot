@@ -1,0 +1,26 @@
+[
+  {
+    "id": "a2a-chat-sync",
+    "type": "a2a",
+    "question": "用三句话介绍 LangChain4j",
+    "mustInclude": ["\"role\":\"agent\"", "LangChain4j"],
+    "mustNotInclude": ["\"error\""],
+    "judgeHint": "本 case 走 A2A message/send 的 chat skill 同步路径。answer 是序列化的 JSON-RPC response：成功时含 result.role=agent + reply 文本。考点：A2A dispatch + skill 路由 + 协议映射正常，回答确实介绍了 LangChain4j。需 app.a2a.enabled=true。"
+  },
+  {
+    "id": "a2a-chat-factual",
+    "type": "a2a",
+    "question": "什么是向量数据库？一句话。",
+    "mustInclude": ["\"role\":\"agent\""],
+    "mustNotInclude": ["\"error\""],
+    "judgeHint": "同 a2a chat 同步路径。考点：response 结构正确（agent message）且回答切题（向量数据库的简洁定义）。不要因为是 JSON 包裹就扣分。"
+  },
+  {
+    "id": "a2a-empty-rejected",
+    "type": "a2a",
+    "question": "   ",
+    "mustInclude": ["\"error\""],
+    "mustNotInclude": [],
+    "judgeHint": "空白消息应被 A2A 参数校验拒绝（invalidParams），response 含 error 而非 result。考点：协议层对非法入参的处理。"
+  }
+]
