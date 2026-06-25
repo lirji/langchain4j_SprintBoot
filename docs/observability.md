@@ -13,6 +13,37 @@ LangChain4j 的每次 LLM 调用经过 `MetricsChatModelListener`（自实现，
 
 监听器在 `LlmConfig` 启动时通过 `List<ChatModelListener>` 自动灌入每个 `ChatModel` builder。
 
+### 切分质量指标（`ChunkMetrics`）
+
+LLM 指标之外，每次 RAG 入库（`RagIngestionService` 批量 / `DocumentService` 单上传）切分完成后由 `ChunkMetrics` 打点，让「换 chunking 策略 / 调 `max-size` 后切分形态怎么变」可观测，而不是靠人肉看召回 case。所有指标带 `strategy` tag（`recursive` / `markdown-header` / `parent-child` / `semantic`），尺寸统一按**字符数**：
+
+| 指标 | 类型 | tags | 含义 |
+| --- | --- | --- | --- |
+| `rag_chunk_size` | DistributionSummary | `strategy` | 每个 chunk 的字符长度 → 自动给出 `_count` / `_sum` / `_max`，均值 = sum/count |
+| `rag_chunk_total` | counter | `strategy` | 入库 chunk 总数 |
+| `rag_chunk_tiny` | counter | `strategy` | 小于 `app.rag.metrics.tiny-chars`（默 50）的碎块/孤儿块数 |
+| `rag_chunk_oversize` | counter | `strategy` | 大于 `app.rag.metrics.oversize-chars`（默 2000）的超大块数 |
+| `rag_ingest_documents` | counter | `strategy` | 入库文档数 |
+
+`ChunkMetrics` 始终在线（同 `MetricsChatModelListener`，观测能力不藏在开关后），打点成本可忽略；某次入库零 chunk 时只记 `rag_ingest_documents`，碎块/超大块为 0 时不创建对应 counter（保持指标干净）。
+
+样例 PromQL：
+
+```promql
+# chunk 平均长度（按策略）
+rate(rag_chunk_size_sum[1h]) / rate(rag_chunk_size_count[1h])
+
+# 碎块比例 —— 偏高说明切太碎、单句成块污染检索
+sum(rate(rag_chunk_tiny_total[1h])) by (strategy)
+  / sum(rate(rag_chunk_total[1h])) by (strategy)
+
+# 超大块比例 —— 偏高说明一块塞多主题、稀释相似度
+sum(rate(rag_chunk_oversize_total[1h])) by (strategy)
+  / sum(rate(rag_chunk_total[1h])) by (strategy)
+```
+
+> 尺寸按字符计量（确定性、零 tokenizer 依赖；作分布监控足够），与 `app.rag.chunking.unit` 的 chars/tokens 解耦——指标只为横向比较切分形态。要 p50/p95 分位，给 `rag_chunk_size` 加 `publishPercentileHistogram` 即可（当前只出 count/sum/max）。
+
 ## Prometheus 抓取
 
 应用已暴露 `/actuator/prometheus`。最小 Prometheus 配置：

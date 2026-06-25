@@ -457,13 +457,27 @@ mvn spring-boot:run -Dspring-boot.run.arguments=\
 
 - `strategy=recursive`（默认）— `DocumentSplitters.recursive(max-size, overlap)`，按 unit 硬切 + overlap，简单粗暴适合任何文档
 - `strategy=markdown-header` — `MarkdownHeaderSplitter` 自实现，每个 chunk 是完整主题；超长 section fallback 到 recursive。三处增强（2026-06-17）：① **自适应标题层级** —— 有 `##+` 按它切（历史行为），否则退到 `#`（纯 H1 文档不再一刀不切成巨块），都没有才整篇 1 段；② **极小 section 合并** `app.rag.chunking.min-section-size`（yml 默认 120 / 代码默认 0=关）—— 连续不足阈值的碎块向后并块，大 section 各自独立；③ **breadcrumb metadata** —— `###` chunk 带上父级路径（`Top > Sub > SubSub`，仅深度>1 注入），`section` 叶子标题不变
+- `strategy=parent-child` — `ParentChildSplitter` 自实现，**small-to-big**：child 用 `max-size`/`overlap` 切小块去 embed（召回精准），parent 用 `app.rag.chunking.parent.{strategy,size,overlap}` 切大块（`strategy` 可选 recursive / markdown-header）。检索命中 child 后 `TaggedSourceContentInjector` 按 metadata 的 `parent_text` 换成所属 parent 全文喂模型（上下文完整），多个 child 命中同一 parent 按 `parent_id` 去重、共享 `[doc=file#parentId]` 引用（与 grounding/citation 闭环对齐）。parent 全文随 child 冗余存进 metadata（零新存储 / 重启安全 / 6 后端一致，代价 store 膨胀）。单测 `ParentChildSplitterTest` + `TaggedSourceContentInjectorTest`
+- `strategy=semantic` — `SemanticChunkingSplitter` 自实现，按**主题连续性**切：逐句 embed（每句拼前后各 `semantic.buffer-size` 句成窗口平滑噪声）→ 算相邻句 cosine 距离 → 距离超 `semantic.breakpoint-percentile`（默 95）分位的间隙处下刀 → 超 `semantic.max-size` 的语义块 fallback recursive、不足 `semantic.min-size` 的碎块并块。适合无标题结构的长文（纪要/访谈/论文正文）。**复用主 `EmbeddingModel`**（`DocumentSplitterFactory` 注入），代价是入库每句多一次 embed；embedding 后端故障自动降级 recursive（不让入库崩）。单测 `SemanticChunkingSplitterTest`（桩 embedding 令距离可预测）
 - `unit=chars`（默认）| `tokens` — **计量单位开关**（`DocumentSplitterFactory`）。`chars` 按字符数，零依赖；`tokens` 给 splitter 挂 `OpenAiTokenCountEstimator`（tiktoken），用 `DocumentSplitters.recursive(size, overlap, estimator)` 三参重载，`max-size`/`overlap` 单位变 token，`MarkdownHeaderSplitter` 的 section 阈值也透传同一 estimator（按 token 计量，不再 char/token 混用）。本地模型（Ollama/bge-m3）不暴露 tokenizer，用 OpenAI 估算（偏差 ~10-15%，chunk 软目标可接受）。**token 模式必须保证 `max-size + overlap ≤ embedding 模型 max input`，否则尾部静默截断**。复用了 `ChatMemoryConfig` 里 `TokenWindowChatMemory` 同款 estimator 思路
 - `max-size: 300`（兼容旧 key `max-chars`，`max-size` 优先、缺省回退 `max-chars`）— recursive 模式 chunk 大小目标 / markdown-header section 阈值；单位由 `unit` 决定
 - `overlap: 50` — recursive 模式 chunk 重叠（markdown-header 只在 fallback 时用到）
 - `min-section-size: 120`（yml 默认 / 代码默认 0=关）— markdown-header 极小 section 合并阈值，单位随 `unit`（tokens 模式建议调小到 ~30）；仅对 markdown-header 生效
 - `tokenizer-model: gpt-4o-mini` — `tokens` 模式计数用的 tokenizer；`chars` 模式忽略
+- `parent.{strategy,size,overlap}`（默 recursive/1200/0）— **parent-child 专用**：parent（喂上下文的大块）切法与窗口；仅 `strategy=parent-child` 生效
+- `semantic.{buffer-size,breakpoint-percentile,max-size,min-size}`（默 1/95/1000/0）— **semantic 专用**：句邻居缓冲 / 断点分位 / 块大小上下限；仅 `strategy=semantic` 生效
 - markdown-header 给 segment 加 metadata：`section` 标题 + `index` 顺序号，引用 `[doc=file.md#3]` 对应"第 3 个 section"而不是"第 3 个块"
 - 实测对本项目（5 个 chat provider 列在 1 个 `## Section` 里）的可见提升：recursive(300) 召回不全只列 2 个 provider，markdown-header(600) 召回完整 5 个
+
+**Contextual Retrieval（Anthropic）** `app.rag.contextual.*`（默认关，与 chunking 策略**正交**——任何 strategy 都可叠加）：
+
+- `enabled=true` 时入库链在「切分后、embed 前」插一道改写：`ChunkContextualizer`（temp=0 AiService，`buildJudgeChatModel`，**不注册 ChatModel Bean**）给每个 chunk 生成一句「安放回全文」的上下文（消解代词/缩写、点明位置），`ContextualEnricher` 拼到 chunk 前面再 embed → chunk 脱离全文后仍自洽、召回失败率显著降。跟 hybrid(BM25)/rerank 叠加效果更好（Anthropic 原文标配组合）
+- 经 `ObjectProvider` 软依赖接入 `RagIngestionService`（批量，per-document 改写）+ `DocumentService`（单上传）；关闭时 Bean 不存在、入库链零回归
+- `max-doc-chars: 8000`（喂上下文生成器的文档截断上限，控成本/上下文）/ `min-segments: 2`（单 chunk 文档跳过——整块即全文无歧义）。每 chunk 一次 LLM 调用（一次性入库成本，生产可叠 provider prompt caching 降本）；某块失败保留原文不前缀（不让入库崩）；**串行执行**保 `TenantContext`（token 正确计入租户配额，并行需 MDC 透传=未来项）。单测 `ContextualEnricherTest`
+
+**切分质量指标** `app.rag.metrics.*`（`ChunkMetrics`，始终在线）：每次入库切分完成后打 Micrometer 指标（按 `strategy` tag）：`rag.chunk.size`（尺寸分布 `_count/_sum/_max`）/ `rag.chunk.{total,tiny,oversize}`（碎块·超大块比例）/ `rag.ingest.documents`。换策略/调 max-size 后切分质量可观测，不必人肉看召回。阈值 `tiny-chars`（默 50）/ `oversize-chars`（默 2000），按字符计量（零 tokenizer 依赖）。样例 PromQL 见 `docs/observability.md`。单测 `ChunkMetricsTest`
+
+> 入库链顺带的一处修正：`RagIngestionService` 原本切一次喂 mirror、`EmbeddingStoreIngestor` 内部再切一次 —— 对纯文本切分无所谓，但 semantic 这种「切分阶段就要逐句 embed」的策略等于双倍 embedding 成本。已改成「切一次 → 直接 `embedAll`+`addAll`」，与 `DocumentService` 单上传路径口径一致。
 
 **History-aware retrieval** `app.rag.history-aware.*`:
 

@@ -7,7 +7,9 @@ import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.content.injector.ContentInjector;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 把检索到的 Content 用 {@code <source id="...">...</source>} 标签包起来再拼到用户消息后，
@@ -33,12 +35,20 @@ public class TaggedSourceContentInjector implements ContentInjector {
         sb.append(userMessage.singleText());
         sb.append("\n\n[Retrieved sources — cite the ones you actually use as `[doc=ID]`]:\n");
         List<RetrievedSourcesContext.Source> collected = new ArrayList<>(contents.size());
+        // parent-child：多个 child 命中同一 parent → 按 id 去重，parent 文本只注入一次。
+        // 非 parent-child 场景 id 天然各异（file#index），去重不会误合并不同 chunk。
+        Set<String> seenIds = new HashSet<>(contents.size());
         for (int i = 0; i < contents.size(); i++) {
             TextSegment seg = contents.get(i).textSegment();
             String id = inferId(seg, i);
-            collected.add(new RetrievedSourcesContext.Source(id, seg.text()));
+            if (!seenIds.add(id)) {
+                continue;
+            }
+            // parent-child：命中的是小 child，但喂给模型的是它所属的 parent 全文（上下文完整）
+            String body = sourceBody(seg);
+            collected.add(new RetrievedSourcesContext.Source(id, body));
             sb.append("<source id=\"").append(id).append("\">\n");
-            sb.append(seg.text()).append("\n");
+            sb.append(body).append("\n");
             sb.append("</source>\n");
         }
         // 暴露给 grounding 后校验（Layer 0 引用核对 + Layer 1 faithfulness）。调用方负责 clear。
@@ -49,7 +59,8 @@ public class TaggedSourceContentInjector implements ContentInjector {
     /**
      * 生成稳定 id。优先用 metadata 里的 {@code file_name}（FileSystemDocumentLoader 默认放这个 key），
      * 退到 {@code source} / {@code absolute_directory_path} 文件名，再退到 "doc"。
-     * chunk 标号优先用 metadata 的 {@code index}（部分 splitter 会放），退到列表顺序号。
+     * chunk 标号：parent-child 模式优先用 {@code parent_id}（让同一 parent 的多个 child 共享同一引用 id、
+     * 与注入的 parent 文本对齐），否则用 {@code index}（部分 splitter 会放），再退到列表顺序号。
      */
     public static String inferId(TextSegment seg, int fallbackIndex) {
         var meta = seg.metadata();
@@ -58,11 +69,22 @@ public class TaggedSourceContentInjector implements ContentInjector {
                 meta.getString("source"),
                 lastPathSegment(meta.getString("absolute_directory_path")),
                 "doc");
-        String idx = meta.getString("index");
-        if (idx == null || idx.isBlank()) {
+        String idx = firstNonBlank(
+                meta.getString(ParentChildSplitter.PARENT_ID),
+                meta.getString("index"));
+        if (idx == null || idx.isBlank() || "doc".equals(idx)) {
             idx = String.valueOf(fallbackIndex);
         }
         return name + "#" + idx;
+    }
+
+    /**
+     * 注入给模型的 source 正文：parent-child 模式下返回所属 parent 全文（{@link ParentChildSplitter#PARENT_TEXT}），
+     * 否则返回 segment 自身文本。这样召回精度由小 child 决定、喂给 LLM 的上下文由大 parent 决定。
+     */
+    private static String sourceBody(TextSegment seg) {
+        String parentText = seg.metadata().getString(ParentChildSplitter.PARENT_TEXT);
+        return (parentText != null && !parentText.isBlank()) ? parentText : seg.text();
     }
 
     private static String firstNonBlank(String... candidates) {
