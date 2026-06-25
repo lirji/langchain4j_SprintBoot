@@ -9,7 +9,7 @@
 
 - Java 21、Spring Boot 3.3.5、Maven（含 `./mvnw` wrapper，无需本机装 Maven）
 - LangChain4j 1.13.1（BOM 统一管理，部分子模块 pin 到 `1.13.1-beta23` / `1.13.1`）
-- 237 个 Java 源文件，`./mvnw compile` 通过；约 35 个确定性单测类（纯逻辑、不连模型）
+- 243 个 Java 源文件，`./mvnw compile` 通过；约 43 个确定性单测类（纯逻辑、不连模型）
 - HTTP client 显式锁定为 JDK 实现（`LangChain4jApplication.main()` 里设系统属性，避免与 Spring RestClient SPI 冲突）
 
 ---
@@ -117,8 +117,14 @@
 
 | 策略 | 实现 | 适用 |
 | --- | --- | --- |
-| `recursive`（默认） | `DocumentSplitters.recursive(max-chars, overlap)` | 通用，按字符切 |
-| `markdown-header` | 自实现 `MarkdownHeaderSplitter` | `## section` 切，每 chunk 是完整主题，给 segment 加 `section` + `index` metadata |
+| `recursive`（默认） | `DocumentSplitters.recursive(max-size, overlap)` | 通用，按 `unit`(chars/tokens) 硬切 + overlap |
+| `markdown-header` | 自实现 `MarkdownHeaderSplitter` | `## section` 切，每 chunk 是完整主题，给 segment 加 `section`/`index`/`breadcrumb` metadata + 极小 section 合并 |
+| `parent-child` | 自实现 `ParentChildSplitter` | **small-to-big**：child 用 `max-size`/`overlap` 切小块去 embed（召回精准），parent 用 `app.rag.chunking.parent.*` 切大块；检索命中 child 后 `TaggedSourceContentInjector` 自动换成所属 parent 全文喂模型（上下文完整，多 child 命中同一 parent 去重）。parent 全文随 child 冗余存进 metadata（零新存储/重启安全/6 后端一致，代价 store 膨胀） |
+| `semantic` | 自实现 `SemanticChunkingSplitter` | **按主题连续性切**：逐句 embed → 算相邻句 cosine 距离 → 距离超 `breakpoint-percentile` 分位的间隙处下刀（`app.rag.chunking.semantic.*`）。适合无标题结构的长文（纪要/访谈/论文正文），每块是语义自洽单元。代价：入库每句多一次 embed；embedding 故障自动降级 recursive |
+
+> parent-child 关键设计：child 决定**召回精度**、parent 决定**上下文完整度**，把"切小召得准"和"切大上下文够"的两难拆开。`parent_id` 让同一 parent 的多个 child 共享同一 `[doc=file#parentId]` 引用，与 grounding（Layer 0 引用核对）/ citation 闭环对齐。`parent.strategy=markdown-header` 时 section 直接作 parent。确定性单测：`ParentChildSplitterTest`（5）+ `TaggedSourceContentInjectorTest`（3）。
+>
+> semantic 关键设计：复用已有 `EmbeddingModel`（零新依赖），`buffer-size` 把每句与邻居拼窗口再 embed 平滑噪声、`breakpoint-percentile`（默 95）控切点稀疏度、超 `max-size` 的语义块 fallback recursive、不足 `min-size` 的碎块并块。`RagIngestionService` 顺手改成"切一次→直接 embed/add"（不再走 `EmbeddingStoreIngestor` 的内部二次 split），避免 semantic 双倍 embedding 成本、与单上传路径口径一致。确定性单测：`SemanticChunkingSplitterTest`（7，桩 `EmbeddingModel` 按关键词给固定向量令距离可预测）。
 
 ### 7.3 检索增强
 
@@ -127,6 +133,7 @@
 | 召回数 | `app.rag.top-k` (默认 5) | `EmbeddingStoreContentRetriever.maxResults` |
 | 相似度阈值 | `app.rag.min-score` (默认 0.3) | 同上 minScore |
 | **动态 metadata filter** | `CategoryContext` ThreadLocal + `dynamicFilter` | `/chat/category?category=xxx` |
+| **Contextual Retrieval** | `app.rag.contextual.enabled` (默认关) | Anthropic 那套：入库时 `ChunkContextualizer`（temp=0，不注册 Bean）给每个 chunk 生成一句「安放回全文」的上下文前缀（消解代词/缩写、点明位置），`ContextualEnricher` 拼到 chunk 前再 embed → chunk 自洽、召回失败率显著降。与 chunking 策略正交、跟 hybrid(BM25)/rerank 叠加。软依赖接入两条入库链，关闭零回归。代价每 chunk 一次 LLM 调用（失败保留原文不崩） |
 | **Query Expansion** | `app.rag.query-expansion.enabled` + `n` | `ExpandingQueryTransformer`（1 query → N 变体，多路召回 + RRF） |
 | **History-aware retrieval** | `app.rag.history-aware.enabled` | `CompressingQueryTransformer`（history → self-contained query） |
 | **Transformer Chain** | 自动 | `ChainedQueryTransformer`（compress → expand 串行；LC4j 1.13 的 Augmentor 只接单个 transformer） |
@@ -260,6 +267,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 | --- | --- | --- |
 | LLM 调用日志 | `LoggingChatModelListener` | 每次一行 `model / duration_ms / tokens_in/out/total` |
 | Micrometer 指标 | 自实现 `MetricsChatModelListener`（`langchain4j-micrometer` 还没发到 central） | `gen_ai.client.{requests,operation.duration,token.usage,errors}` |
+| **切分质量指标** | `ChunkMetrics`（始终在线，每次入库打点，按 `strategy` tag） | `rag.chunk.size`（尺寸分布 `_count/_sum/_max`）/ `rag.chunk.{total,tiny,oversize}`（碎块·超大块比例）/ `rag.ingest.documents`。换策略/调 max-size 后切分质量可观测，阈值 `app.rag.metrics.{tiny,oversize}-chars` |
 | Prometheus 抓取 | `micrometer-registry-prometheus` | `GET /actuator/prometheus` |
 | Grafana dashboard | `docs/grafana-dashboard.json` | 7 panel（req rate / latency p50p95p99 / token spend / error rate by type / etc），导入即用 |
 | 请求 TraceID | `TraceIdFilter` | MDC + `X-Trace-Id` 响应头，日志 pattern `[%X{traceId:-}]` |
@@ -400,7 +408,13 @@ app.memory.window-mode:         messages | tokens | summary
 app.rag.store:                  in-memory | pgvector | milvus | chroma | qdrant | doris
 app.rag.top-k:                  5
 app.rag.min-score:              0.3
-app.rag.chunking.strategy:      recursive | markdown-header
+app.rag.chunking.strategy:      recursive | markdown-header | parent-child | semantic
+app.rag.chunking.parent.strategy: recursive | markdown-header  # parent-child 专用
+app.rag.chunking.parent.size:   1200                          # parent 大块目标大小
+app.rag.chunking.semantic.breakpoint-percentile: 95           # semantic 专用：切点稀疏度（越高块越大）
+app.rag.chunking.semantic.buffer-size: 1                      # 每句拼前后 N 句再 embed，平滑边界判断
+app.rag.contextual.enabled:     false                        # Contextual Retrieval：每 chunk 加文档级上下文前缀再 embed
+app.rag.contextual.max-doc-chars: 8000                       # 喂上下文生成器的文档截断上限
 
 # RAG 检索增强
 app.rag.history-aware.enabled:  false

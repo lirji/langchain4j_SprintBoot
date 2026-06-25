@@ -13,6 +13,12 @@
 | --- | --- | --- |
 | `recursive`（默认） | `DocumentSplitters.recursive(max-size=300, overlap=50)`，按 unit 硬切 + overlap | 对任何文档可用、零假设；缺点是会切断完整语义单元 |
 | `markdown-header` | 自实现 `MarkdownHeaderSplitter`，按 `(?m)(?=^##+ )` 切 section，每块一个完整主题；超长 section fallback 到 recursive | 语义内聚；给 segment 打 metadata（`section` 标题 + `index` 顺序号），引用 `[doc=file.md#3]` 指第 3 个 section 而非第 3 个块 |
+| `parent-child` | 自实现 `ParentChildSplitter`，**small-to-big**：child 小块 embed（精准召回）、parent 大块喂 LLM（上下文完整）；命中 child 后 `TaggedSourceContentInjector` 按 metadata `parent_text` 换 parent 全文、多 child 命中同一 parent 按 `parent_id` 去重 | 解耦「检索粒度」与「喂 LLM 粒度」；parent 全文随 child 冗余存 metadata（零新存储/重启安全，代价 store 膨胀） |
+| `semantic` | 自实现 `SemanticChunkingSplitter`，逐句 embed（拼 `buffer-size` 邻居）→ 相邻 cosine 距离 → 超 `breakpoint-percentile` 分位处切；超长块 fallback recursive | 主题内聚最好；复用主 `EmbeddingModel`，代价入库每句多一次 embed；后端故障降级 recursive 不崩 |
+
+**正交叠加：Contextual Retrieval（`app.rag.contextual.enabled`，默认关）** —— 自实现 `ContextualEnricher` + `ChunkContextualizer`（temp=0），入库时给每个 chunk 加一句「安放回全文」的 LLM 上下文前缀再 embed，与上面任何 strategy 都能叠加，跟 hybrid(BM25)/rerank 组合是 Anthropic 原文标配。每块一次 LLM 调用、失败保留原文不崩、串行保 `TenantContext`。
+
+**切分可观测：`ChunkMetrics`（始终在线）** —— 每次入库打 Micrometer 指标 `rag.chunk.{size,total,tiny,oversize}` + `rag.ingest.documents`（按 `strategy` tag），换策略/调 max-size 后切分质量（碎块/超大块比例、尺寸分布）可量化对照，不靠人肉看召回。详见 `docs/observability.md`。
 
 **计量单位 `app.rag.chunking.unit`（chars | tokens）**：
 - `chars`（默认）—— 按字符数，零依赖、稳定可控

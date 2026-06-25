@@ -2,7 +2,9 @@ package com.lrj.langchain4j.rag.lifecycle;
 
 import com.lrj.langchain4j.audit.AuditEventType;
 import com.lrj.langchain4j.audit.AuditLogger;
+import com.lrj.langchain4j.observability.ChunkMetrics;
 import com.lrj.langchain4j.rag.DocumentSplitterFactory;
+import com.lrj.langchain4j.rag.contextual.ContextualEnricher;
 import com.lrj.langchain4j.rag.graph.GraphIngestor;
 import com.lrj.langchain4j.rag.graph.GraphStore;
 import com.lrj.langchain4j.rag.hybrid.DocumentMirror;
@@ -59,6 +61,9 @@ public class DocumentService {
     // GraphRAG 软依赖（app.rag.graph.enabled 时才有 Bean）：upload 建图、delete 同步删边
     private final ObjectProvider<GraphIngestor> graphIngestorProvider;
     private final ObjectProvider<GraphStore> graphStoreProvider;
+    // Contextual Retrieval 软依赖（app.rag.contextual.enabled 时才有 Bean）：每 chunk 加文档级上下文前缀
+    private final ObjectProvider<ContextualEnricher> contextualEnricherProvider;
+    private final ChunkMetrics chunkMetrics;
 
     public DocumentService(EmbeddingStore<TextSegment> embeddingStore,
                            EmbeddingModel embeddingModel,
@@ -67,7 +72,9 @@ public class DocumentService {
                            DocumentRegistry registry,
                            AuditLogger audit,
                            ObjectProvider<GraphIngestor> graphIngestorProvider,
-                           ObjectProvider<GraphStore> graphStoreProvider) {
+                           ObjectProvider<GraphStore> graphStoreProvider,
+                           ObjectProvider<ContextualEnricher> contextualEnricherProvider,
+                           ChunkMetrics chunkMetrics) {
         this.embeddingStore = embeddingStore;
         this.embeddingModel = embeddingModel;
         this.documentMirror = documentMirror;
@@ -76,6 +83,8 @@ public class DocumentService {
         this.audit = audit;
         this.graphIngestorProvider = graphIngestorProvider;
         this.graphStoreProvider = graphStoreProvider;
+        this.contextualEnricherProvider = contextualEnricherProvider;
+        this.chunkMetrics = chunkMetrics;
     }
 
     /**
@@ -120,6 +129,14 @@ public class DocumentService {
 
         DocumentSplitter splitter = splitterFactory.create();
         List<TextSegment> segments = splitter.split(doc);
+
+        // Contextual Retrieval：开启时给每个 chunk 加文档级上下文前缀（embed 前）。关闭时 enricher=null、零回归。
+        ContextualEnricher enricher = contextualEnricherProvider.getIfAvailable();
+        if (enricher != null) {
+            segments = enricher.enrich(text, segments);
+        }
+
+        chunkMetrics.record(splitterFactory.strategy(), 1, segments);
 
         // 自己 embed + add，不走 EmbeddingStoreIngestor —— 后者要传 Document 列表会重复 split
         List<Embedding> embeddings = embeddingModel.embedAll(segments).content();

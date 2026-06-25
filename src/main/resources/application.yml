@@ -336,6 +336,10 @@ app:
     chunking:
       # recursive（默认）— 按 unit 硬切 + overlap，简单粗暴，适合任何文档
       # markdown-header — 按 ## section 切，每个 chunk 是完整主题；超长 section fallback 到 recursive
+      # parent-child — small-to-big：child 用下面 max-size/overlap 切小块去 embed（召回精准），
+      #                parent 用 parent.* 切大块；检索命中 child 后自动换成所属 parent 文本喂模型（上下文完整）
+      # semantic — 按主题连续性切：逐句 embed，在相邻句 cosine 距离断崖处下刀（semantic.*）。适合无结构长文，
+      #            代价是入库每句多一次 embedding 调用
       strategy: recursive
       # 计量单位 chars（默认）| tokens
       #   chars  — max-size/overlap 按字符数，零依赖；但同样字符数下中英文真实 token 数差 2~3 倍
@@ -351,6 +355,39 @@ app:
       min-section-size: 120
       # tokens 模式下计数用的 tokenizer（OpenAiTokenCountEstimator）；chars 模式忽略
       tokenizer-model: gpt-4o-mini
+      # parent-child（small-to-big）专用：仅 strategy=parent-child 时生效。
+      #   child = 上面的 max-size/overlap 切的小块（进向量库、决定召回精度）
+      #   parent = 下面切的大块（命中 child 后由 TaggedSourceContentInjector 换进 prompt、决定上下文完整度，
+      #            多个 child 命中同一 parent 自动去重 → parent 只注入一次）
+      # 取舍：parent 全文随 child 冗余存进 metadata（store 体积膨胀），换零新存储 + 重启安全 + 6 种后端一致。
+      parent:
+        strategy: recursive    # parent 切法：recursive | markdown-header（section 作 parent）
+        size: 1200             # parent 目标大小（单位同上面的 unit）
+        overlap: 0             # parent 重叠（recursive parent 用；markdown-header 仅 fallback 用）
+      # semantic（语义切分）专用：仅 strategy=semantic 时生效。逐句 embed → 算相邻句 cosine 距离 →
+      # 距离超过 breakpoint-percentile 分位的间隙即「话题切换」处下刀。代价：入库时每句多一次 embed 调用。
+      # embedding 后端故障时自动降级 recursive（不让入库崩）。
+      semantic:
+        buffer-size: 1               # 每句与前后各 N 句拼成窗口再 embed，平滑单句噪声让边界更稳；0=只用本句
+        breakpoint-percentile: 95    # 断点阈值分位：95=约 5% 最大的间隙成为切点（越高切得越少、块越大）
+        max-size: 1000               # 语义块大小上限（单位同 unit）；超了用 recursive 再切
+        min-size: 0                  # 语义块大小下限（单位同 unit）；不足的碎块向前并块。0=关闭合并
+
+    metrics:
+      # 切分质量指标打点（Micrometer，始终在线）：每次入库记录 chunk 尺寸分布 + 碎块/超大块比例，
+      # 打到 Prometheus（rag.chunk.size / rag.chunk.total|tiny|oversize / rag.ingest.documents，带 strategy tag）。
+      # 换 chunking 策略 / 调 max-size 后切分质量怎么变可观测，不必人肉看召回。阈值按字符数。
+      tiny-chars: 50         # 小于此长度的 chunk 计入 rag.chunk.tiny（碎块/孤儿块）
+      oversize-chars: 2000   # 大于此长度的 chunk 计入 rag.chunk.oversize（一块塞多主题）
+
+    contextual:
+      # Contextual Retrieval（Anthropic）：入库时给每个 chunk 用 temp=0 LLM 生成一句「安放回全文」的
+      # 上下文（消解代词/缩写、点明位置），拼到 chunk 前面再 embed —— chunk 脱离全文后仍自洽，召回失败率
+      # 显著下降。与 chunking 策略正交（任何 strategy 都可叠加），跟 hybrid(BM25)/rerank 互补叠加效果更好。
+      # 代价：每个 chunk 一次 LLM 调用（一次性入库成本）；某 chunk 失败保留原文不前缀（不让入库崩）。
+      enabled: false
+      max-doc-chars: 8000   # 喂给上下文生成器的文档原文截断上限（控成本/上下文）；单位字符
+      min-segments: 2       # 文档切出的 chunk 数 < 该值时跳过（单 chunk 即全文、无指代歧义）
 
     grounding:
       # RAG 事实幻觉的事后校验（仅作用于触发了检索的回答）。两层叠加：
