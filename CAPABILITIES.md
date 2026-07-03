@@ -5,6 +5,29 @@
 
 ---
 
+## 0. 项目定位
+
+**一个带自主深度 Agent 能力的企业级 LLM 应用平台**——不是"一个 Agent"，而是"一个能装下并演示多种自主程度 Agent 的平台"。
+
+判断"是不是 Agent"看四点：**自主决定下一步 / 用工具 / 带反馈的循环 / 朝目标推进**。本项目在同一套工程基线（多 provider、多租户、配额、审计、可观测、eval）上，把从"非 Agent 可控管道"到"真正自主 Agent"的完整光谱都铺了出来：
+
+| 自主度 | 模块 | 是 Agent 吗 | 说明 |
+| --- | --- | --- | --- |
+| **可控管道** | `/chat`、RAG、`/extract`、`/chat/vision`、NL2SQL | ❌ 不是 | 单次 LLM 调用的确定性链路，不自主选动作。NL2SQL 有 6 层护栏，**刻意反 Agent** |
+| **确定性编排** | `workflow`（Flowable 退款审批） | ❌ 相反 | 写死的 BPMN 流程 + 人工审批，与 Agent 正相反 |
+| **工具自主** | `Assistant.chat` + `@Tool` | 🟡 半个 | 模型自主决定"要不要调工具"，走 LC4j 原生 function-calling 隐式循环 |
+| **自我精炼** | `reflexion`（generate→critique→improve） | 🟡 agentic-lite | 有反馈循环但结构固定、不选工具 |
+| **多 Agent 编排** | `multiagent`（Planner→Worker→Synthesizer + replan） | 🟡 编排 | 模型拆任务，但执行是**固定 DAG**，不中途动态选工具 |
+| **自主 Agent** | **`ai/agent`（`/agent/run`）** | ✅ **是** | 开放式 **plan→act→observe**：模型每步自己决定下一个动作、用工具、观察、再决策，直到 finish 或预算耗尽 |
+
+**哪块是真 Agent**：`ai/agent` 深度 Agent。它有 Agent 该有的一切——三维预算（步数/墙钟/token）、循环检测（含震荡）、scratchpad 跨步工作记忆（溢出可 LLM 摘要）、brain 单步重试、深度受限 delegate 子 Agent、逐步 trace、取消感知。这些正是 **Loop Engineering（循环工程）** 把 demo 级 `while(调模型)` 升级为生产级循环的核心，详见 `docs/deep-agent.md`。
+
+**为什么保留"不 Agent"的部分**：生产里很多场景要的就是**可控管道**而非自主 Agent（NL2SQL 要护栏、退款审批要合规流程 + 人工兜底）。两种范式并存、按场景选型，才是本项目面向落地的完整性所在。
+
+一句话定性：**「一个带自主深度 Agent 能力的企业级 LLM 应用平台」**，`deep-agent` 是其中那个真正自主的 Agent。
+
+---
+
 ## 1. 工程基线
 
 - Java 21、Spring Boot 3.3.5、Maven（含 `./mvnw` wrapper，无需本机装 Maven）
