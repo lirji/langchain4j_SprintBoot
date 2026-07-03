@@ -89,12 +89,14 @@ public class ChatController {
                                     @RequestBody Map<String, String> body) {
         String scoped = scopedChatId(chatId);
         String message = body.getOrDefault("message", "");
-        String reply = groundingService.applyToFreshAnswer(() -> assistant.chat(scoped,
+        // Function 重载：grounding REGENERATE 模式下 hint 携带纠正指令，拼进 message 触发真正的纠正重生成
+        // （WARN/REFUSE 模式 hint 恒为空串，等价于原来的单次调用）。
+        String reply = groundingService.applyToFreshAnswer(hint -> assistant.chat(scoped,
                 assistantProps.getLanguage(),
                 assistantProps.getTone(),
                 assistantProps.getCitationPolicy(),
                 assistantProps.getExtra(),
-                message));
+                message + hint));
         return Map.of("chatId", chatId, "reply", reply);
     }
 

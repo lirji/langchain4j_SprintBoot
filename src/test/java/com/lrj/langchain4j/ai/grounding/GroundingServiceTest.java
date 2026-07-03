@@ -10,6 +10,7 @@ import org.springframework.beans.factory.ObjectProvider;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -26,6 +27,14 @@ class GroundingServiceTest {
         GroundingProperties p = new GroundingProperties();
         p.setEnabled(enabled);
         p.setThreshold(threshold);
+        return p;
+    }
+
+    private GroundingProperties props(boolean enabled, double threshold,
+                                      GroundingProperties.OnFail onFail, int maxRegen) {
+        GroundingProperties p = props(enabled, threshold);
+        p.setOnFail(onFail);
+        p.setMaxRegenerations(maxRegen);
         return p;
     }
 
@@ -129,6 +138,52 @@ class GroundingServiceTest {
                         new RetrievedSourcesContext.Source("real.md#0", "真实内容")));
         // Layer 1 异常被吞，Layer 0 通过 → 原样返回
         assertThat(out).isEqualTo("答案见 [doc=real.md#0]");
+    }
+
+    @Test
+    void refuseMode_fabricatedCitation_replacesAnswerWithSafeMessage() {
+        var svc = new GroundingService(props(true, 0.7, GroundingProperties.OnFail.REFUSE, 1),
+                provide((s, a) -> new GroundednessReport(1.0, List.of())));
+        String out = svc.applyToFreshAnswer(() ->
+                answerWithSources("答案见 [doc=ghost.md#9]",
+                        new RetrievedSourcesContext.Source("real.md#0", "真实内容")));
+        assertThat(out).doesNotContain("ghost.md#9");   // 未被支撑的内容被整段替换
+        assertThat(out).doesNotContain(WARN_MARK);       // refuse 不是 warn
+        assertThat(out).contains("暂不作答");
+    }
+
+    @Test
+    void regenerateMode_secondAttemptGrounded_returnsCleanAnswer() {
+        AtomicInteger n = new AtomicInteger();
+        var svc = new GroundingService(props(true, 0.7, GroundingProperties.OnFail.REGENERATE, 1),
+                provide((s, a) -> new GroundednessReport(1.0, List.of())));
+        String out = svc.applyToFreshAnswer(hint -> {
+            if (n.getAndIncrement() == 0) {
+                return answerWithSources("答案见 [doc=ghost.md#9]",   // 首次编造引用
+                        new RetrievedSourcesContext.Source("real.md#0", "真实内容"));
+            }
+            assertThat(hint).isNotEmpty();                            // 重生成时带纠正指令
+            return answerWithSources("答案见 [doc=real.md#0]",         // 修正后引用正确
+                    new RetrievedSourcesContext.Source("real.md#0", "真实内容"));
+        });
+        assertThat(out).isEqualTo("答案见 [doc=real.md#0]");
+        assertThat(out).doesNotContain(WARN_MARK);
+        assertThat(n.get()).isEqualTo(2);
+    }
+
+    @Test
+    void regenerateMode_exhausted_degradesToWarn() {
+        AtomicInteger n = new AtomicInteger();
+        var svc = new GroundingService(props(true, 0.7, GroundingProperties.OnFail.REGENERATE, 1),
+                provide((s, a) -> new GroundednessReport(1.0, List.of())));
+        String out = svc.applyToFreshAnswer(hint -> {
+            n.incrementAndGet();
+            return answerWithSources("答案见 [doc=ghost.md#9]",       // 始终编造 → 重试也不过
+                    new RetrievedSourcesContext.Source("real.md#0", "真实内容"));
+        });
+        assertThat(out).contains(WARN_MARK);       // 耗尽后降级为 warn
+        assertThat(out).contains("ghost.md#9");     // 保留最佳尝试
+        assertThat(n.get()).isEqualTo(2);           // 1 初始 + 1 重生成
     }
 
     /** 用 file_name + index metadata 造 Content，inferId 会得到 "file#index" 形式的稳定 id。 */

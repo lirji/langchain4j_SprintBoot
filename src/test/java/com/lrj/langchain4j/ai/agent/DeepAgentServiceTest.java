@@ -265,6 +265,32 @@ class DeepAgentServiceTest {
     }
 
     @Test
+    void brainTransientFailure_retriedThenSucceeds() {
+        AtomicInteger calls = new AtomicInteger();
+        AgentBrain flaky = (g, a, s, h) -> {
+            if (calls.getAndIncrement() == 0) throw new RuntimeException("transient parse fail");
+            return new AgentDecision("t", "finish", "", "", "recovered");
+        };
+        AgentProperties p = props();
+        p.setBrainMaxRetries(1);
+        var run = new DeepAgentService(flaky, List.of(new EchoAction()), p).run("goal");
+        assertEquals("DONE", run.stopReason());
+        assertEquals("recovered", run.finalAnswer());
+        assertEquals(2, calls.get(), "第一次失败、重试第二次成功");
+    }
+
+    @Test
+    void brainRetriesExhausted_stopsWithError() {
+        AtomicInteger calls = new AtomicInteger();
+        AgentBrain boom = (g, a, s, h) -> { calls.incrementAndGet(); throw new RuntimeException("always"); };
+        AgentProperties p = props();
+        p.setBrainMaxRetries(2);
+        var run = new DeepAgentService(boom, List.of(new EchoAction()), p).run("goal");
+        assertEquals("ERROR", run.stopReason());
+        assertEquals(3, calls.get(), "1 次初始 + 2 次重试 = 3 次后放弃");
+    }
+
+    @Test
     void delegationDisabled_isRejected() {
         AgentProperties p = props();
         p.setAllowDelegation(false);

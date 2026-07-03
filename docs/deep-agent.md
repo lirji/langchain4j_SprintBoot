@@ -26,6 +26,7 @@
 - **循环检测** —— 滑窗（`loop-window`，实际取 `max(loop-window, max-repeats)`）内同一 (动作,入参) 出现达 `max-repeats` 判 `LOOP`；能抓 `A→B→A→B` 震荡（旧逻辑只抓「连续完全相同」）；
 - **工作记忆** scratchpad —— 模型用 `note` 沉淀结论，跨步重注入；溢出 `max-scratchpad-chars` 时**按 bullet 行压缩**（不再腰斩半行），`scratchpad-summary=true` 时把挤出的旧结论 LLM 摘成一条 bullet 保住信息、失败降级为丢弃最旧整条；
 - **子 Agent 派生** `delegate` —— 深度受 `max-depth` 限，挡无限自我派生；
+- **brain 重试** `brain-max-retries`（默 1）+ `brain-retry-backoff-ms` —— 单步决策失败（结构化输出解析异常 / provider 抖动）在步内重试，全失败才判 `ERROR`；补循环最脆一环，与 LC4j 客户端 HTTP 重试正交（还兜解析失败）；
 - **逐步 trace** —— 每步 thought/action/observation 全留痕。
 
 `stopReason` ∈ `DONE`（正常 finish）/ `MAX_STEPS` / `TIMEOUT`（超墙钟预算）/ `BUDGET`（超近似 token 预算）/ `LOOP`（卡死重复，含震荡）/ `ERROR`（brain 异常，不崩整 run）/ `CANCELLED`（被取消：worker 线程被 interrupt，见下「取消感知」）。
@@ -62,7 +63,7 @@
 - `controller/AgentController.java` — `POST /agent/run`（同步）+ `/agent/run/async`（异步，投 `async` 引擎）
 - `ai/agent/AgentRunListener.java` — 顶层 run 收尾钩子（Browser-use 关页面用）
 - `ai/agent/browser/` — Browser-use：`BrowserSession` 接口 + `PlaywrightBrowserSession`（按线程懒加载无头 Chromium）+ `BrowserOpenAction`/`BrowserClickAction`/`BrowserClickXyAction`（坐标点击）/`BrowserTypeAction`（表单输入）/`BrowserScreenshotAction`（整页截图存文件）/`BrowserSeeAction`（截图→视觉理解，双开 browser+vision 时装配）
-- `DeepAgentServiceTest`（16）+ `browser/BrowserActionsTest`（11）+ `actions/RagSearchActionTest`（5）+ `actions/Nl2SqlActionTest`（4）+ `actions/McpToolActionTest`（7）— 确定性单测（finish / 动作+观察 / 未知动作恢复 / 步数预算 / 墙钟预算 TIMEOUT / token 预算 BUDGET / 连续+震荡循环检测 / scratchpad line-aware 压缩 + 摘要器压缩 / 委派深度上限 / 委派关闭 / onRunEnd 清理[含 brain 异常] / 取消感知[中断标志侦测+清理] / browser 动作透传+关闭+表单输入分隔+截图 / rag_search 引用格式·截断·空命中·异常降级 / nl2sql_query 结果格式·护栏拦截·异常降级 / mcp_call 目录进描述·JSON 分派·缺字段·坏 JSON·工具错误·异常降级）
+- `DeepAgentServiceTest`（18）+ `browser/BrowserActionsTest`（11）+ `actions/RagSearchActionTest`（5）+ `actions/Nl2SqlActionTest`（4）+ `actions/McpToolActionTest`（7）— 确定性单测（finish / 动作+观察 / 未知动作恢复 / 步数预算 / 墙钟预算 TIMEOUT / token 预算 BUDGET / 连续+震荡循环检测 / scratchpad line-aware 压缩 + 摘要器压缩 / brain 重试成功 + 重试耗尽 ERROR / 委派深度上限 / 委派关闭 / onRunEnd 清理[含 brain 异常] / 取消感知[中断标志侦测+清理] / browser 动作透传+关闭+表单输入分隔+截图 / rag_search 引用格式·截断·空命中·异常降级 / nl2sql_query 结果格式·护栏拦截·异常降级 / mcp_call 目录进描述·JSON 分派·缺字段·坏 JSON·工具错误·异常降级）
 - `eval/eval-cases-agent.json` — eval `type:"agent"` 黄金集（3 条，校验 stopReason/步数/最终答案）
 
 ## 端点

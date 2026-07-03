@@ -130,13 +130,34 @@ public class DeepAgentService {
 
             String scratch = scratchpadOrNone(scratchpad);
             String history = renderHistory(steps);
-            AgentDecision d;
-            try {
-                d = brain.decide(goal, actionsDesc, scratch, history);
-            } catch (Exception e) {
-                // brain 调用/解析失败：不让整个 run 崩，记一步并终止
-                log.warn("agent brain failed at step {} (depth={}): {}", n, depth, e.toString());
-                steps.add(new Step(n, "", "", "", "(brain error: " + e.getMessage() + ")"));
+            // brain 单步决策带重试：结构化输出偶发解析失败 / provider 抖动不该直接终结整个 run。
+            AgentDecision d = null;
+            Exception lastError = null;
+            int attempts = 1 + Math.max(0, props.getBrainMaxRetries());
+            for (int attempt = 1; attempt <= attempts; attempt++) {
+                try {
+                    d = brain.decide(goal, actionsDesc, scratch, history);
+                    lastError = null;
+                    break;
+                } catch (Exception e) {
+                    lastError = e;
+                    log.warn("agent brain failed at step {} attempt {}/{} (depth={}): {}",
+                            n, attempt, attempts, depth, e.toString());
+                    if (attempt < attempts && props.getBrainRetryBackoffMs() > 0) {
+                        try {
+                            Thread.sleep(props.getBrainRetryBackoffMs());
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return new Run(goal, steps, bestEffort(scratchpad), "CANCELLED", depth);
+                        }
+                    }
+                }
+            }
+            if (d == null) {
+                // 重试耗尽仍失败：不让整个 run 崩，记一步并终止
+                steps.add(new Step(n, "", "", "",
+                        "(brain error after " + attempts + " attempt(s): "
+                                + (lastError == null ? "" : lastError.getMessage()) + ")"));
                 return new Run(goal, steps, bestEffort(scratchpad), "ERROR", depth);
             }
             tokensUsed += tokenEstimator.applyAsInt(goal) + tokenEstimator.applyAsInt(actionsDesc)

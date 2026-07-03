@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -29,14 +30,31 @@ import java.util.stream.Collectors;
  *       聚合分低于 {@code threshold} 视为可能含未被资料支撑的内容。</li>
  * </ul>
  *
- * <p>v1 只实现 <b>warn 模式</b>：命中任一层就在答案末尾追加一句可信度提示并打 WARN 日志，
- * 不改写、不拒答。refuse / regenerate 留待后续。
+ * <p>命中闸门后的处置由 {@code app.rag.grounding.on-fail} 决定（{@link GroundingProperties.OnFail}）：
+ * <ul>
+ *   <li>{@code WARN}（默认）— 末尾追加可信度提示，不改写不拒答（历史行为）；</li>
+ *   <li>{@code REFUSE} — 用安全弃答话术替换整个答案（宁可不答）；</li>
+ *   <li>{@code REGENERATE} — 带纠正指令重生成最多 {@code max-regenerations} 次，仍不过阈降级为 WARN。</li>
+ * </ul>
+ * REFUSE/REGENERATE 让「验证」真正接回「生成」形成闭环（Loop Engineering 视角）。REGENERATE 需调用方走
+ * {@link #applyToFreshAnswer(Function)} 重载（把纠正指令拼进 prompt）；{@link #applyToFreshAnswer(Supplier)}
+ * 老签名仍可用，其 REGENERATE 退化为「原样重跑」（无纠正信号）。流式路径无法重写/重生成，仅 WARN。
  */
 @Service
 public class GroundingService {
 
     private static final Logger log = LoggerFactory.getLogger(GroundingService.class);
     private static final Pattern CITATION = Pattern.compile("\\[doc=([^\\]]+)\\]");
+
+    /** REGENERATE 模式拼进 prompt 的纠正指令（作为 {@link #applyToFreshAnswer(Function)} 的入参传给调用方）。 */
+    private static final String REGEN_HINT =
+            "\n\n[系统提示] 你上一版回答可能包含未被检索资料充分支撑的内容。请**仅依据**提供的 <source> 资料重新作答；"
+            + "若资料不足以支撑，请明确说「未在文档中找到相关内容」，不要编造或外推。";
+
+    /** REFUSE 模式的替换话术。刻意避开 ABSTENTION_MARKERS 里的措辞以免与「诚实弃答」混淆统计。 */
+    private static final String REFUSAL =
+            "抱歉，我无法从检索到的资料中充分核实这个回答，为避免提供不准确的信息，这里暂不作答。"
+            + "建议您查阅原始资料，或换一种问法。";
 
     /**
      * 弃答话术标记。跟 {@code AssistantProperties.citationPolicy} 契约的"未在文档中找到相关内容"闭环，
@@ -62,21 +80,59 @@ public class GroundingService {
      * <p>关闭时是零开销直通；try/finally 清理 ThreadLocal 防线程复用串数据。
      */
     public String applyToFreshAnswer(Supplier<String> answerCall) {
-        if (!props.isEnabled()) {
-            return answerCall.get();
-        }
-        RetrievedSourcesContext.clear();
-        try {
-            String answer = answerCall.get();
-            return verifyAndWarn(answer);
-        } finally {
-            RetrievedSourcesContext.clear();
-        }
+        // 老签名桥接到 Function 形式：忽略纠正指令 → REGENERATE 退化为原样重跑（无纠正信号）。
+        return applyToFreshAnswer(hint -> answerCall.get());
     }
 
-    private String verifyAndWarn(String answer) {
-        String suffix = warningSuffixOrNull(answer, RetrievedSourcesContext.get());
-        return suffix == null ? answer : answer + suffix;
+    /**
+     * 可重生成的重载：{@code answerCall} 接收一个<strong>纠正指令</strong>（首次为空串，REGENERATE 重试时非空），
+     * 调用方应把它拼进用户 prompt 再调模型。据此实现「验证 → 生成」闭环。
+     *
+     * <p>关闭时零开销直通；每次尝试 try/finally 清 {@link RetrievedSourcesContext} 防线程复用串数据。
+     */
+    public String applyToFreshAnswer(Function<String, String> answerCall) {
+        if (!props.isEnabled()) {
+            return answerCall.apply("");
+        }
+        GroundingProperties.OnFail mode = props.getOnFail();
+        int maxRegen = mode == GroundingProperties.OnFail.REGENERATE
+                ? Math.max(0, props.getMaxRegenerations()) : 0;
+
+        String answer = "";
+        String suffix = null;
+        String hint = "";
+        for (int attempt = 0; attempt <= maxRegen; attempt++) {
+            RetrievedSourcesContext.clear();
+            try {
+                answer = answerCall.apply(hint);
+                suffix = warningSuffixOrNull(answer, RetrievedSourcesContext.get());
+            } finally {
+                RetrievedSourcesContext.clear();
+            }
+            if (suffix == null) {
+                return answer; // 已被支撑 / 无检索 / 诚实弃答 → 直接返回
+            }
+            if (attempt < maxRegen) {
+                log.info("grounding gate hit, regenerating (attempt {}/{})", attempt + 1, maxRegen);
+                hint = REGEN_HINT;
+            }
+        }
+        return onFailResult(mode, answer, suffix);
+    }
+
+    /** 命中闸门且（REGENERATE 时）重试耗尽后的最终处置。 */
+    private String onFailResult(GroundingProperties.OnFail mode, String answer, String suffix) {
+        switch (mode) {
+            case REFUSE:
+                log.warn("grounding gate → REFUSE：以安全话术替换未被充分支撑的答案");
+                return REFUSAL;
+            case REGENERATE:
+                log.warn("grounding gate → REGENERATE 重试耗尽，降级为 WARN（保留最佳尝试 + 提示）");
+                return answer + suffix;
+            case WARN:
+            default:
+                return answer + suffix;
+        }
     }
 
     /**

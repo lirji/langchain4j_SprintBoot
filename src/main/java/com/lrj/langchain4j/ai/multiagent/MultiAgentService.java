@@ -202,22 +202,41 @@ public class MultiAgentService {
     /**
      * SSE 流式版本：按阶段 emit 事件。事件 names：
      * <ul>
-     *   <li>{@code plan} — 全部子任务的 plan 一次性发出（含 dependsOn）</li>
+     *   <li>{@code plan} — 每个 attempt 的 plan 一次性发出（含 dependsOn）；replan 时会再发一次修订后的</li>
      *   <li>{@code worker-result} — 每个 worker 完成时立即 emit（不等同层其他 worker）</li>
      *   <li>{@code synthesis-token} — Synthesizer 流式 token，前端可立刻渲染</li>
-     *   <li>{@code done} — 全部完成，最终全文一并发一次（方便客户端收口）</li>
+     *   <li>{@code critique} — <b>replan 开启时</b>每个 attempt 合成完的评分（3 维 + 聚合分 + mainIssue）</li>
+     *   <li>{@code replan} — <b>replan 开启且分数不过阈时</b>发一次，宣告将用修订 plan 再跑一轮</li>
+     *   <li>{@code done} — 全部完成，最终 Run（含全部 attempts）一并发一次</li>
      *   <li>{@code error} — 任何阶段异常都 emit + completeWithError</li>
      * </ul>
      *
      * <p>Worker 仍非流式（多 worker 同时流 token 会混乱）—— 这里的核心收益是
      * Synthesizer 那 10-20s 一次性等变成 token-by-token 立刻看到。
+     *
+     * <p><b>replan 闭环已接</b>（与 {@link #run} 对齐）：replan 开启且某 attempt 聚合分 &lt; threshold 且未达
+     * {@code max-replans} 时，emit {@code critique}+{@code replan}，用 {@link Replanner} 修订 plan 后**流式**再跑
+     * 一轮（{@link #streamAttempt} 自递归）。replan 关闭时行为与旧版一致：单 attempt、不评分、不发 critique/replan。
      */
     public void runStream(String question, SseEmitter emitter) {
         try {
             Plan plan = planner.plan(question);
             log.info("planner produced {} sub-tasks (stream)", plan.tasks().size());
-            emitter.send(SseEmitter.event().name("plan").data(plan));
+            streamAttempt(question, plan, 1, new ArrayList<>(), emitter);
+        } catch (Exception e) {
+            log.error("runStream pre-synthesis error", e);
+            safeSend(emitter, "error", e.getMessage());
+            emitter.completeWithError(e);
+        }
+    }
 
+    /**
+     * 流式跑一个 attempt：emit plan → DAG 并行(每 worker 完成即 emit) → 流式合成；合成完在
+     * {@link #onAttemptSynthesized} 里决定收口还是 replan 递归。
+     */
+    private void streamAttempt(String question, Plan plan, int n, List<Attempt> attempts, SseEmitter emitter) {
+        try {
+            safeSend(emitter, "plan", plan);
             List<List<SubTask>> levels = topologicalLevels(plan.tasks());
             if (levels == null) {
                 log.warn("cycle detected (stream), falling back to flat fan-out");
@@ -247,28 +266,72 @@ public class MultiAgentService {
             tokens
                     .onPartialResponse(token -> safeSend(emitter, "synthesis-token", token))
                     .onCompleteResponse(resp -> {
-                        // 全文一并发一次，方便客户端做最终落盘 / metric 计算。
-                        // stream 暂不接 replan 闭环 —— 单 attempt + acceptedByThreshold=true，
-                        // 跟 replan 关闭时的 run() 语义一致。lambda 捕获用 final 别名是为了
-                        // 兼容 "effectively final" 在某些 javac 版本对集合方法调用的检查口径。
                         String text = resp.aiMessage() != null ? resp.aiMessage().text() : "";
-                        Attempt only = new Attempt(1, finalPlan, finalOrdered, text, null, Double.NaN);
-                        safeSend(emitter, "done", new Run(finalPlan, finalOrdered, text,
-                                List.of(only), true));
-                        emitter.complete();
+                        onAttemptSynthesized(question, finalPlan, finalOrdered, n, text, attempts, emitter);
                     })
                     .onError(err -> {
-                        log.error("synthesis stream error", err);
+                        log.error("synthesis stream error (attempt {})", n, err);
                         safeSend(emitter, "error", err.getMessage());
                         emitter.completeWithError(err);
                     })
                     .start();
         } catch (Exception e) {
-            log.error("runStream pre-synthesis error", e);
+            log.error("streamAttempt {} error", n, e);
             safeSend(emitter, "error", e.getMessage());
             emitter.completeWithError(e);
         }
     }
+
+    /**
+     * 一个 attempt 合成完成后的收口/续跑决策（在流式回调线程上执行）：
+     * replan 关 → 直接 done；replan 开 → 评分并 emit critique，分数不过阈且未达上限则 emit replan 并递归再跑，
+     * 否则 done。评分/修订异常时降级为直接 done（不让流挂死）。
+     *
+     * <p>注意：本方法运行在 Synthesizer 的流式回调线程上，{@code TenantContext} 未必透传到此线程——
+     * critique/replan 的 token 仍经 ChatModel listener 全局计量，但 per-tenant 归属在此边界是已知弱点
+     * （与其他流式回调路径同源，MDC/租户跨线程透传属未来项）。
+     */
+    private void onAttemptSynthesized(String question, Plan plan, List<WorkerResult> ordered,
+                                      int n, String text, List<Attempt> attempts, SseEmitter emitter) {
+        try {
+            if (!replanProps.isEnabled()) {
+                attempts.add(new Attempt(n, plan, ordered, text, null, Double.NaN));
+                safeSend(emitter, "done", finalize(attempts, true));
+                emitter.complete();
+                return;
+            }
+
+            Critique c = critic.critique(question, text);
+            double agg = aggregate(c);
+            Attempt attempt = new Attempt(n, plan, ordered, text, c, agg);
+            attempts.add(attempt);
+            log.info("attempt {} (stream) critique agg={} issue={}", n, agg, c.mainIssue());
+            safeSend(emitter, "critique", new StreamCritique(n, agg, c));
+
+            boolean canReplan = agg < replanProps.getThreshold() && n - 1 < replanProps.getMaxReplans();
+            if (canReplan) {
+                safeSend(emitter, "replan", new ReplanNotice(n, replanProps.getThreshold(), c.mainIssue()));
+                Plan revised = revisePlan(question, attempt);
+                streamAttempt(question, revised, n + 1, attempts, emitter);
+            } else {
+                safeSend(emitter, "done", finalize(attempts, agg >= replanProps.getThreshold()));
+                emitter.complete();
+            }
+        } catch (Exception e) {
+            // 评分/修订失败：不让流挂死，用当前 attempt 收口。若当前 attempt 尚未入列则补一个未评分的。
+            log.warn("attempt {} scoring/replan failed, finalizing with current answer: {}", n, e.toString());
+            if (attempts.isEmpty() || attempts.get(attempts.size() - 1).n() != n) {
+                attempts.add(new Attempt(n, plan, ordered, text, null, Double.NaN));
+            }
+            safeSend(emitter, "done", finalize(attempts, true));
+            emitter.complete();
+        }
+    }
+
+    /** 流式 {@code critique} 事件载荷。 */
+    public record StreamCritique(int attempt, double aggregate, Critique critique) {}
+    /** 流式 {@code replan} 事件载荷。 */
+    public record ReplanNotice(int fromAttempt, double threshold, String issue) {}
 
     private static void safeSend(SseEmitter emitter, String event, Object data) {
         try {

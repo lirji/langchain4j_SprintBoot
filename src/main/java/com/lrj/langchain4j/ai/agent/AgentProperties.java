@@ -26,6 +26,15 @@ public class AgentProperties {
      * 非精确计费，只为挡「上下文越滚越大烧到全局配额上限才停」。
      */
     private int maxTokens = 0;
+    /**
+     * brain 单步决策失败（LLM 调用/结构化输出解析异常）时的<strong>额外</strong>重试次数。
+     * >0 时同一步内重试（可带退避），全失败才判 {@code ERROR}。补循环最脆一环的短板：
+     * 结构化输出偶发解析失败、provider 抖动不该直接终结整个 run。默认 1（失败再试一次）。
+     * 注意与 LangChain4j 客户端内部 HTTP 重试（429/5xx）正交——这层还兜解析失败。
+     */
+    private int brainMaxRetries = 1;
+    /** brain 重试前的退避（毫秒）。0（默认）= 不退避立即重试；退避期间响应线程中断（取消）会提前退出。 */
+    private long brainRetryBackoffMs = 0;
     /** 连续重复同一 (动作,入参) 达到此次数 → 判定卡死循环，提前终止。 */
     private int maxRepeats = 3;
     /**
@@ -57,6 +66,10 @@ public class AgentProperties {
     public void setMaxWallClockMs(long maxWallClockMs) { this.maxWallClockMs = maxWallClockMs; }
     public int getMaxTokens() { return maxTokens; }
     public void setMaxTokens(int maxTokens) { this.maxTokens = maxTokens; }
+    public int getBrainMaxRetries() { return brainMaxRetries; }
+    public void setBrainMaxRetries(int brainMaxRetries) { this.brainMaxRetries = brainMaxRetries; }
+    public long getBrainRetryBackoffMs() { return brainRetryBackoffMs; }
+    public void setBrainRetryBackoffMs(long brainRetryBackoffMs) { this.brainRetryBackoffMs = brainRetryBackoffMs; }
     public int getMaxRepeats() { return maxRepeats; }
     public void setMaxRepeats(int maxRepeats) { this.maxRepeats = maxRepeats; }
     public int getLoopWindow() { return loopWindow; }

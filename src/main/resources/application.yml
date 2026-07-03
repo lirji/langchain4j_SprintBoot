@@ -393,10 +393,11 @@ app:
       # RAG 事实幻觉的事后校验（仅作用于触发了检索的回答）。两层叠加：
       #   Layer 0（零 LLM）— 答案里 [doc=ID] 引用的 id 必须在检索集合里，否则判编造引用
       #   Layer 1（faithfulness）— source + 答案喂 temp=0 GroundednessChecker，聚合分 < threshold 视为可能未被支撑
-      # 命中任一层就在答案末尾追加"⚠️ 可信度提示"（warn 模式，不改写不拒答）。
-      # 代价：开启后每条走 RAG 的回答多 1 次 temp=0 LLM 调用。
+      # 命中后按 on-fail 处置。代价：开启后每条走 RAG 的回答多 1 次 temp=0 LLM 调用。
       enabled: false
       threshold: 0.7
+      on-fail: warn                # warn(默认,末尾追加⚠️提示不改写) | refuse(安全话术替换整段) | regenerate(带纠正指令重生成)
+      max-regenerations: 1         # regenerate 模式最大重生成次数(首次不计)；仍不过阈降级为 warn。/chat 走真正的纠正重生成
 
     history-aware:
       # 多轮对话场景：CompressingQueryTransformer 把"它跟 X 啥区别"+ history → "Y 跟 X 啥区别"
@@ -653,6 +654,8 @@ app:
     max-steps: 8                 # 单次 run 步数预算，跑满判 MAX_STEPS 终止，挡 runaway
     max-wall-clock-ms: 0         # 单次 run 墙钟预算(ms)，>0 时超时判 TIMEOUT。0=关。补步数预算：单步偶发慢挡不住耗时跑飞
     max-tokens: 0                # 单次 run 近似 token 预算(字符/4 估算)，>0 时超阈判 BUDGET。0=关。循环内安全上限，正交于全局日配额
+    brain-max-retries: 1         # brain 单步决策失败(LLM/解析异常)的额外重试次数，全失败才判 ERROR。补循环最脆一环
+    brain-retry-backoff-ms: 0    # 重试前退避(ms)。0=立即重试；退避期间响应线程被取消(interrupt)会提前退出
     max-repeats: 3               # 滑窗内同一(动作,入参)出现达此次数 → 判 LOOP 卡死，提前终止
     loop-window: 6               # 循环检测滑窗步数（能抓 A→B→A→B 震荡；实际窗口取 max(loop-window, max-repeats)）
     max-scratchpad-chars: 4000   # 跨步工作记忆字符上限，超出压缩（按 bullet 行保留最新），防 prompt 膨胀
