@@ -646,6 +646,28 @@ app:
     # 留空走 VisionProperties 内置中文默认；要改语气/语言在这里覆盖即可。
 #    caption-prompt: ""
 
+  chaining:
+    # Prompt Chaining（Anthropic workflow 模式）：把任务拆成固定顺序的若干步，每步一次 LLM 调用只处理
+    # 上一步输出，步间插确定性 gate（不达标短路终止）。预定义代码路径，非模型自主决定流程。默认关。
+    # POST /chat/chain body {"input":"..."} → 跑下面 steps 定义的默认链，返回逐步 trace。详见 docs/workflow-patterns.md。
+    enabled: false
+    steps:                         # 默认链：提纲 → 成文（成文步带 min-length gate 挡空洞输出）
+      - name: outline
+        instruction: "为下面的主题写一个 3-5 点的中文提纲，每点一行，只输出提纲。"
+      - name: draft
+        instruction: "严格按这份提纲写一段连贯的中文短文，覆盖每一点。"
+        gate-min-length: 80        # 成文过短(<80字)说明没展开 → 短路
+#       gate-must-contain: ""      # 可选：输出必须包含的子串
+#       gate-must-match: ""        # 可选：输出必须命中的正则(find 语义)
+
+  voting:
+    # Voting（Anthropic Parallelization/Voting 模式）：同一问题并行跑 N 次取共识，降低单次随机性、提升可信度
+    # （内容审核多重判定 / 分类多数表决）。默认关。POST /chat/vote body {"question":"...","n":5}。详见 docs/workflow-patterns.md。
+    enabled: false
+    n: 3                           # 并行投票次数
+    strategy: majority             # majority(确定性多数表决,离散/分类题) | synthesis(聚合器LLM收口,自由文本题)
+    min-agreement: 0.5             # majority 置信阈值：胜出票占比 ≥ 此值才 confident
+
   deep-agent:
     # 深度 Agent：开放式 plan→act→observe 循环（区别于 multiagent 的固定 DAG）。
     # 默认关 → DeepAgentService / AgentBrain / 示例动作全不装配。详见 docs/deep-agent.md。
