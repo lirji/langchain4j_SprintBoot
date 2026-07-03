@@ -7,6 +7,8 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.LongSupplier;
+import java.util.function.ToIntFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -182,6 +184,84 @@ class DeepAgentServiceTest {
         assertEquals("CANCELLED", run.stopReason());
         assertEquals(1, echo.calls.get(), "进行中的那一步跑完，下一步前才停");
         assertFalse(Thread.currentThread().isInterrupted(), "顶层 run 收尾应清掉中断标志，避免污染线程池");
+    }
+
+    @Test
+    void wallClockBudget_exceeded_stopsWithTimeout() {
+        EchoAction echo = new EchoAction();
+        AgentProperties p = props();
+        p.setMaxWallClockMs(100);
+        // clock 调用序: #1 算 deadline(0+100), #2 step1 检查(0<100 放行), #3 step2 检查(200>=100 → TIMEOUT)
+        long[] times = {0L, 0L, 200L};
+        AtomicInteger idx = new AtomicInteger();
+        LongSupplier clock = () -> times[Math.min(idx.getAndIncrement(), times.length - 1)];
+        var svc = new DeepAgentService(
+                new ScriptedBrain(act("echo", "a", null), act("echo", "b", null)),
+                List.of(echo), p, null, clock, s -> 0);
+        var run = svc.run("goal");
+        assertEquals("TIMEOUT", run.stopReason());
+        assertEquals(1, echo.calls.get(), "超时前跑完的那一步保留，下一步前才停");
+    }
+
+    @Test
+    void tokenBudget_exceeded_stopsWithBudget() {
+        EchoAction echo = new EchoAction();
+        AgentProperties p = props();
+        p.setMaxTokens(6);   // 估算器每次记 1；每步消耗 5(输入+决策) + 1(观察) = 6 → step2 开头即超
+        var svc = new DeepAgentService(
+                new ScriptedBrain(act("echo", "a", null), act("echo", "b", null), act("echo", "c", null)),
+                List.of(echo), p, null, () -> 0L, s -> 1);
+        var run = svc.run("goal");
+        assertEquals("BUDGET", run.stopReason());
+        assertEquals(1, echo.calls.get(), "预算耗尽前跑完 step1，step2 开头判 BUDGET");
+    }
+
+    @Test
+    void oscillatingActions_detectedAsLoop() {
+        // A→B→A→B→A：从无 3 次「连续」相同，旧逻辑抓不到；滑窗内 A 出现 3 次 → LOOP
+        var svc = new DeepAgentService(
+                new ScriptedBrain(act("echo", "A", null), act("echo", "B", null),
+                        act("echo", "A", null), act("echo", "B", null), act("echo", "A", null)),
+                List.of(new EchoAction()), props());
+        var run = svc.run("goal");
+        assertEquals("LOOP", run.stopReason());
+    }
+
+    @Test
+    void scratchpadOverflow_lineAware_dropsOldestWholeLine() {
+        AgentProperties p = props();
+        p.setMaxScratchpadChars(45);   // 无摘要器 → 溢出丢弃最旧整条，不腰斩半行
+        ScriptedBrain brain = new ScriptedBrain(
+                act("echo", "1", "oldest-" + "x".repeat(30)),
+                act("echo", "2", "newest-" + "y".repeat(30)),
+                finish("done"));
+        var svc = new DeepAgentService(brain, List.of(new EchoAction()), p);
+        svc.run("goal");
+        String seen = brain.seenScratchpads.get(2);   // 第 3 次 decide 看到压缩后的 scratchpad
+        assertTrue(seen.contains("newest"), "最新结论完整保留");
+        assertFalse(seen.contains("oldest"), "最旧结论被整条丢弃");
+        for (String line : seen.split("\n")) {
+            assertTrue(line.isBlank() || line.startsWith("- "), "不该腰斩半行: <" + line + ">");
+        }
+    }
+
+    @Test
+    void scratchpadOverflow_withSummarizer_compactsOldestIntoSummary() {
+        AgentProperties p = props();
+        p.setMaxScratchpadChars(30);
+        p.setScratchpadSummary(true);
+        ScratchpadSummarizer summarizer = notes -> "SUM";   // 把挤出的旧结论压成一条
+        ScriptedBrain brain = new ScriptedBrain(
+                act("echo", "1", "A".repeat(10)),
+                act("echo", "2", "B".repeat(10)),
+                act("echo", "3", "C".repeat(10)),
+                finish("done"));
+        var svc = new DeepAgentService(brain, List.of(new EchoAction()), p, summarizer);
+        svc.run("goal");
+        String seen = brain.seenScratchpads.get(3);   // 第 4 次 decide 看到含摘要的 scratchpad
+        assertTrue(seen.contains("早期结论摘要"), "旧结论压成一条摘要 bullet");
+        assertTrue(seen.contains("SUM"), "摘要内容注入");
+        assertTrue(seen.contains("C".repeat(10)), "最新结论仍完整保留");
     }
 
     @Test

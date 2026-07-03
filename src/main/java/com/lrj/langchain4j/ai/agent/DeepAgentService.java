@@ -3,11 +3,15 @@ package com.lrj.langchain4j.ai.agent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.LongSupplier;
+import java.util.function.ToIntFunction;
 
 /**
  * 深度 Agent 编排：开放式 <strong>plan → act → observe</strong> 循环。每步让 {@link AgentBrain}
@@ -15,9 +19,11 @@ import java.util.Map;
  *
  * <p>循环对每步有完全控制权（这正是「深度 Agent」区别于「带工具的 AiService 自动循环」的地方）：
  * <ul>
- *   <li><strong>硬预算</strong> {@code maxSteps} —— 跑满判 {@code MAX_STEPS} 终止，挡 runaway；</li>
- *   <li><strong>循环检测</strong> —— 连续重复同一 (动作,入参) 达 {@code maxRepeats} 判 {@code LOOP} 终止；</li>
- *   <li><strong>工作记忆</strong> scratchpad —— 模型用 note 沉淀结论，跨步重注入（带字符上限截断）；</li>
+ *   <li><strong>三维预算</strong> —— 步数 {@code maxSteps}（{@code MAX_STEPS}）/ 墙钟 {@code maxWallClockMs}
+ *       （{@code TIMEOUT}）/ 近似 token {@code maxTokens}（{@code BUDGET}），任一超限即停，挡 runaway；</li>
+ *   <li><strong>循环检测</strong> —— 滑窗内同一 (动作,入参) 出现达 {@code maxRepeats} 判 {@code LOOP}（含 A→B→A→B 震荡）；</li>
+ *   <li><strong>工作记忆</strong> scratchpad —— 模型用 note 沉淀结论，跨步重注入；溢出按 bullet 行压缩
+ *       （可选 {@link ScratchpadSummarizer} LLM 摘要，否则丢弃最旧整条）；</li>
  *   <li><strong>子 Agent 派生</strong> delegate —— 深度受 {@code maxDepth} 限，挡无限自我派生；</li>
  *   <li><strong>逐步 trace</strong> —— 每步的 thought/action/observation 全留痕，便于调试与 eval。</li>
  * </ul>
@@ -35,15 +41,40 @@ public class DeepAgentService {
 
     private final AgentBrain brain;
     private final AgentProperties props;
+    /** scratchpad 溢出时的 LLM 摘要器；null = 未装配（退化为按行丢弃最旧）。 */
+    private final ScratchpadSummarizer summarizer;
+    /** 墙钟来源（可注入，便于单测确定性推进时间）。 */
+    private final LongSupplier clock;
+    /** 近似 token 估算（可注入，默认字符/4 启发式）。 */
+    private final ToIntFunction<String> tokenEstimator;
     /** name(lowercase) → action。 */
     private final Map<String, AgentAction> actions = new LinkedHashMap<>();
 
     public DeepAgentService(AgentBrain brain, List<AgentAction> actions, AgentProperties props) {
+        this(brain, actions, props, null);
+    }
+
+    public DeepAgentService(AgentBrain brain, List<AgentAction> actions, AgentProperties props,
+                            ScratchpadSummarizer summarizer) {
+        this(brain, actions, props, summarizer, System::currentTimeMillis, DeepAgentService::approxTokens);
+    }
+
+    /** 测试用：注入 clock / estimator，让墙钟与 token 预算可确定性断言。 */
+    DeepAgentService(AgentBrain brain, List<AgentAction> actions, AgentProperties props,
+                     ScratchpadSummarizer summarizer, LongSupplier clock, ToIntFunction<String> tokenEstimator) {
         this.brain = brain;
         this.props = props;
+        this.summarizer = summarizer;
+        this.clock = clock;
+        this.tokenEstimator = tokenEstimator;
         for (AgentAction a : actions) {
             this.actions.put(a.name().toLowerCase(Locale.ROOT), a);
         }
+    }
+
+    /** 近似 token 数：字符/4 启发式（非精确计费，只作循环内安全上限）。 */
+    static int approxTokens(String s) {
+        return s == null || s.isEmpty() ? 0 : (s.length() + 3) / 4;
     }
 
     public Run run(String goal) {
@@ -70,8 +101,12 @@ public class DeepAgentService {
         List<Step> steps = new ArrayList<>();
         StringBuilder scratchpad = new StringBuilder();
         String actionsDesc = describeActions(depth);
-        String lastSig = null;
-        int repeat = 0;
+        // 循环检测滑窗：记最近 window 步的 (动作|入参) 签名；窗口内某签名出现达 maxRepeats 次 → LOOP。
+        // 实际窗口取 max(loopWindow, maxRepeats)，防配置把窗口设得比阈值还小导致永不触发。
+        int loopWindow = Math.max(props.getLoopWindow(), props.getMaxRepeats());
+        Deque<String> recentSigs = new ArrayDeque<>();
+        long deadline = props.getMaxWallClockMs() > 0 ? clock.getAsLong() + props.getMaxWallClockMs() : 0;
+        int tokensUsed = 0;
 
         for (int n = 1; n <= props.getMaxSteps(); n++) {
             // 取消感知：异步 run 被 Future.cancel(true) 取消时 worker 线程被 interrupt。
@@ -80,15 +115,33 @@ public class DeepAgentService {
                 log.info("agent cancelled (interrupted) before step {} (depth={})", n, depth);
                 return new Run(goal, steps, bestEffort(scratchpad), "CANCELLED", depth);
             }
+            // 墙钟预算：单步 LLM/动作偶发慢时，纯步数上限挡不住耗时跑飞。软界——正在跑的步跑完，下一步前才停。
+            if (deadline > 0 && clock.getAsLong() >= deadline) {
+                log.info("agent hit wall-clock budget ({}ms) before step {} (depth={})",
+                        props.getMaxWallClockMs(), n, depth);
+                return new Run(goal, steps, bestEffort(scratchpad), "TIMEOUT", depth);
+            }
+            // token 预算：上下文每步重注入、越滚越大；累计估算超阈就停，别烧到全局配额上限才停。
+            if (props.getMaxTokens() > 0 && tokensUsed >= props.getMaxTokens()) {
+                log.info("agent hit token budget (~{}/{}) before step {} (depth={})",
+                        tokensUsed, props.getMaxTokens(), n, depth);
+                return new Run(goal, steps, bestEffort(scratchpad), "BUDGET", depth);
+            }
+
+            String scratch = scratchpadOrNone(scratchpad);
+            String history = renderHistory(steps);
             AgentDecision d;
             try {
-                d = brain.decide(goal, actionsDesc, scratchpadOrNone(scratchpad), renderHistory(steps));
+                d = brain.decide(goal, actionsDesc, scratch, history);
             } catch (Exception e) {
                 // brain 调用/解析失败：不让整个 run 崩，记一步并终止
                 log.warn("agent brain failed at step {} (depth={}): {}", n, depth, e.toString());
                 steps.add(new Step(n, "", "", "", "(brain error: " + e.getMessage() + ")"));
                 return new Run(goal, steps, bestEffort(scratchpad), "ERROR", depth);
             }
+            tokensUsed += tokenEstimator.applyAsInt(goal) + tokenEstimator.applyAsInt(actionsDesc)
+                    + tokenEstimator.applyAsInt(scratch) + tokenEstimator.applyAsInt(history)
+                    + tokenEstimator.applyAsInt(decisionText(d));
 
             String action = d.action() == null ? "" : d.action().trim();
             appendNote(scratchpad, d.note());
@@ -98,23 +151,32 @@ public class DeepAgentService {
                 return new Run(goal, steps, safe(d.finalAnswer()), "DONE", depth);
             }
 
-            // 循环检测：连续重复同一 (动作,入参)
+            // 循环检测：窗口内同一 (动作,入参) 出现达 maxRepeats 次（含震荡 A→B→A→B）
             String sig = action.toLowerCase(Locale.ROOT) + "|" + safe(d.actionInput());
-            repeat = sig.equals(lastSig) ? repeat + 1 : 1;
-            lastSig = sig;
-            if (repeat >= props.getMaxRepeats()) {
+            recentSigs.addLast(sig);
+            while (recentSigs.size() > loopWindow) recentSigs.removeFirst();
+            long occ = recentSigs.stream().filter(sig::equals).count();
+            if (occ >= props.getMaxRepeats()) {
                 steps.add(new Step(n, safe(d.thought()), action, safe(d.actionInput()),
-                        "(stopped: repeated the same action " + repeat + "x without progress)"));
+                        "(stopped: action repeated " + occ + "x within last " + recentSigs.size()
+                                + " steps without progress)"));
                 log.info("agent stopped on repeat-loop at step {} (depth={})", n, depth);
                 return new Run(goal, steps, bestEffort(scratchpad), "LOOP", depth);
             }
 
             String observation = dispatch(action, safe(d.actionInput()), depth);
+            tokensUsed += tokenEstimator.applyAsInt(observation);
             steps.add(new Step(n, safe(d.thought()), action, safe(d.actionInput()), observation));
         }
 
         log.info("agent hit max-steps ({}) without finishing (depth={})", props.getMaxSteps(), depth);
         return new Run(goal, steps, bestEffort(scratchpad), "MAX_STEPS", depth);
+    }
+
+    /** 决策文本化（用于 token 估算）。 */
+    private static String decisionText(AgentDecision d) {
+        return safe(d.thought()) + safe(d.action()) + safe(d.actionInput())
+                + safe(d.note()) + safe(d.finalAnswer());
     }
 
     private String dispatch(String action, String input, int depth) {
@@ -183,8 +245,58 @@ public class DeepAgentService {
         scratchpad.append("- ").append(note.trim());
         int cap = props.getMaxScratchpadChars();
         if (cap > 0 && scratchpad.length() > cap) {
-            // 截断最旧的部分（保留尾部最新结论）
-            scratchpad.delete(0, scratchpad.length() - cap);
+            compactScratchpad(scratchpad, cap);
+        }
+    }
+
+    /**
+     * scratchpad 溢出压缩：按 bullet 行保留尾部最新的、把被挤出的最旧结论
+     * （装配了 {@link ScratchpadSummarizer} 则 LLM 摘成一条、否则整条丢弃）。
+     * 相比旧版盲砍字符前缀，不再腰斩半行；末尾再做一次 line-aware 硬保护确保 ≤ cap。
+     */
+    private void compactScratchpad(StringBuilder scratchpad, int cap) {
+        String[] lines = scratchpad.toString().split("\n", -1);
+        // 有摘要器时给摘要 bullet 留 1/4 空间，避免压完又超 cap
+        int headroom = summarizer != null ? Math.max(1, cap - cap / 4) : cap;
+
+        Deque<String> kept = new ArrayDeque<>();
+        int len = 0, i = lines.length - 1;
+        for (; i >= 0; i--) {
+            int add = lines[i].length() + 1;
+            if (len + add > headroom && !kept.isEmpty()) break;
+            kept.addFirst(lines[i]);
+            len += add;
+        }
+        // lines[0..i] 是被挤出的更旧部分
+        StringBuilder older = new StringBuilder();
+        for (int j = 0; j <= i; j++) {
+            if (older.length() > 0) older.append('\n');
+            older.append(lines[j]);
+        }
+
+        StringBuilder result = new StringBuilder();
+        if (summarizer != null && older.length() > 0) {
+            try {
+                String s = summarizer.summarize(older.toString());
+                if (s != null && !s.isBlank()) {
+                    result.append("- (早期结论摘要) ").append(s.trim());
+                }
+            } catch (Exception e) {
+                log.warn("scratchpad summarize failed, dropping oldest instead: {}", e.toString());
+            }
+        }
+        for (String k : kept) {
+            if (result.length() > 0) result.append('\n');
+            result.append(k);
+        }
+
+        scratchpad.setLength(0);
+        scratchpad.append(result);
+        // 硬保护：摘要可能偏长导致仍超 cap → 从最旧行整条丢，直到 ≤ cap
+        while (scratchpad.length() > cap) {
+            int nl = scratchpad.indexOf("\n");
+            if (nl < 0) { scratchpad.setLength(cap); break; }
+            scratchpad.delete(0, nl + 1);
         }
     }
 
@@ -206,7 +318,8 @@ public class DeepAgentService {
     /**
      * 一次 run 的结果。
      *
-     * @param stopReason DONE（正常 finish）/ MAX_STEPS（跑满预算）/ LOOP（卡死重复）/ ERROR（brain 异常）/
+     * @param stopReason DONE（正常 finish）/ MAX_STEPS（跑满步数预算）/ TIMEOUT（超墙钟预算）/
+     *                   BUDGET（超近似 token 预算）/ LOOP（卡死重复，含震荡）/ ERROR（brain 异常）/
      *                   CANCELLED（被取消、线程 interrupt）
      */
     public record Run(String goal, List<Step> steps, String finalAnswer, String stopReason, int depth) {}

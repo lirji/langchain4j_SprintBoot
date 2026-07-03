@@ -4,8 +4,10 @@ import com.lrj.langchain4j.ai.agent.AgentAction;
 import com.lrj.langchain4j.ai.agent.AgentBrain;
 import com.lrj.langchain4j.ai.agent.AgentProperties;
 import com.lrj.langchain4j.ai.agent.DeepAgentService;
+import com.lrj.langchain4j.ai.agent.ScratchpadSummarizer;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.service.AiServices;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -36,10 +38,24 @@ public class DeepAgentConfig {
         return AiServices.builder(AgentBrain.class).chatModel(chatModel).build();
     }
 
+    /**
+     * scratchpad 摘要压缩器 —— 仅 {@code app.deep-agent.scratchpad-summary=true} 时装配。
+     * 走独立 temp=0 ChatModel（{@link LlmConfig#buildJudgeChatModel}，压缩是确定性任务、避免工作记忆漂移），
+     * 不注册成 ChatModel Bean，跟 {@code Critic}/{@code Judge}/{@code SummarizingChatMemory} 摘要器同思路。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "app.deep-agent.scratchpad-summary", havingValue = "true")
+    public ScratchpadSummarizer scratchpadSummarizer(LlmConfig llmConfig, LlmConfig.LlmProperties props) {
+        ChatModel coldModel = llmConfig.buildJudgeChatModel(props);
+        return AiServices.builder(ScratchpadSummarizer.class).chatModel(coldModel).build();
+    }
+
     @Bean
     public DeepAgentService deepAgentService(AgentBrain brain,
                                              List<AgentAction> actions,
-                                             AgentProperties props) {
-        return new DeepAgentService(brain, actions, props);
+                                             AgentProperties props,
+                                             ObjectProvider<ScratchpadSummarizer> summarizer) {
+        // 未开 scratchpad-summary 时 provider 为空 → 传 null，溢出退化为 line-aware 丢弃最旧（零 LLM 开销）
+        return new DeepAgentService(brain, actions, props, summarizer.getIfAvailable());
     }
 }
