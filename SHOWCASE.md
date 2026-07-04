@@ -2,7 +2,7 @@
 
 > 这份文档是给**面试官/评审**看的项目导览：30 秒抓住定位，5 分钟看懂架构与能力，10 分钟能聊到技术深度。
 > 想看能力清单去 `CAPABILITIES.md`，想看设计演化去 `CLAUDE.md` / `PROMPT_JOURNEY.md`，想看某模块细节去 `docs/*.md`。
-> 在线交互版（可点击每处看详情）：https://claude.ai/code/artifact/75e43c8c-71fc-4bc8-bc78-79cf9131bb5b
+> 在线交互版（可点击每处看详情）：https://claude.ai/code/artifact/366e86f0-feaf-4ffe-b075-475c1d7fc3d0?via=auto_preview
 > 离线交互版：`SHOWCASE.html`（单文件、双击即开，无需联网。自主度光谱 9 行 + 能力矩阵 6 卡 + 技术亮点 6 卡共 21 处可点击展开详情）
 
 ---
