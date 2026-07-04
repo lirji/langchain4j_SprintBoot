@@ -124,6 +124,37 @@
 
 ---
 
+## 已落地优化 2026-07-04：检索质量 eval（Recall@k）+ per-tenant USD 成本归因
+
+两个"把已有叙事收口"的纵向增值（非新开功能摊子），各带确定性单测：
+
+| # | 部分 | 改了什么 | 文件 |
+| --- | --- | --- | --- |
+| 26 | **检索质量 eval** | 补 `eval-cases.json` passRate（规则+Judge，混检索+生成）没覆盖的**纯召回层**。`RetrievalMetrics`（纯函数：Recall@k/Precision@k/MRR/Hit@k）+ `RetrievalEvaluator`（跑主链 `vectorRetriever`、**不经 LLM**、id 用 `TaggedSourceContentInjector.inferId`、文件级匹配对切分漂移鲁棒）+ 黄金集 `retrieval-cases.json`（8 条靶 `documents/`）+ `POST /eval/retrieval?set=&ingest=`。调 chunking/embedding/rerank 后重跑把召回变化跟生成变化拆开归因——落地了 `recall-verification.md` 反复厘清的经典 Recall@k。9 个单测（`RetrievalMetricsTest`）。详见 `docs/retrieval-eval.md` | `eval/retrieval/*` + `controller/EvalController.java` + `resources/eval/retrieval-cases.json` |
+| 27 | **per-tenant USD 成本** | 补 `token-budget`「按 token 一视同仁、不分模型贵贱」的短板。`CostProperties`（`app.cost.pricing` USD/1M tokens + 最长前缀匹配）+ `CostCalculator`（纯函数，**Anthropic cache 输入拆三档** regularInput/cacheRead/cacheWrite 分别乘价）+ `CostTracker`（per-tenant 日累加，同构 `TokenBudgetTracker`）+ `CostChatModelListener`（走 `List<ChatModelListener>` 自动接入、不改 LlmConfig）+ Micrometer `gen_ai.client.cost.usd` + `GET /actuator/cost`。给 cascade/semantic-cache/prompt-caching 降本叙事收口一个 $ 口径。默认关（本地免费无需）。7 个单测（`CostCalculatorTest`；后续 #29 再补 `InMemoryCostTrackerTest` 6）。详见 `docs/cost-attribution.md` | `cost/*`（`CostProperties`/`CostCalculator`/`CostTracker`/`CostChatModelListener`/`CostConfig`/`CostEndpoint`）+ `application.yml` |
+
+这两项正好清掉下面 B 档"rerank 跑 eval 对比"的量化前提（现在有 Recall@k 可量）、以及 C 档"Token 配额 → cost-based（USD）"的 $ 计量地基（现在有 `CostTracker`，接个 guard filter 即成硬预算）。
+
+验证：`mvn compile` + **347 个单测全过**（330 → +17）。
+
+### 续做：Redis-backed 分布式状态（token 预算样板）
+
+| # | 部分 | 改了什么 | 文件 |
+| --- | --- | --- | --- |
+| 28 | **多副本共享配额** | 项目里一排「限单 JVM，多副本需 Redis」注释一个没做。挑最有代表性、且**多 pod 下是真 correctness bug**（进程内计数各算各的 → 配额放大到副本数倍）的 token 日预算落 Redis 后端样板。`TokenBudgetTracker` 抽成接口（消费方零改动）+ `InMemoryTokenBudgetTracker`（现逻辑 + Clock seam 可测跨日）/ `RedisTokenBudgetTracker`（key `<prefix><date>:<tenantId>` 内嵌日期→跨日自动过期免清理；`consume` 走 Lua `INCRBY`+`PEXPIREAT` 原子；`snapshotAll` 靠 `SCAN`；Redis 抖动不拖垮主链路）。`app.token-budget.store=in-memory\|redis`，`SecurityConfig` 条件装配互斥 Bean（照抄 `app.memory.store`）。复用已在的 `spring-boot-starter-data-redis`，零新依赖。13 个单测。详见 `docs/distributed-state.md` | `security/{TokenBudgetTracker(→interface),InMemoryTokenBudgetTracker,RedisTokenBudgetTracker,SecurityConfig,TokenBudgetProperties}` + `application.yml` |
+
+这条把 C 档"多实例化（Redis-backed state）"从 ⏳ 推进了一大步——token 配额这个**最要命**的进程内状态（多 pod 直接漏配额）已可切 Redis；共享范式抽成 `security/RedisDailyCounters`。
+
+| # | 部分 | 改了什么 | 文件 |
+| --- | --- | --- | --- |
+| 29 | **范式复用到 CostTracker** | 抽 `RedisDailyCounters`（key 布局/租户解析/次日午夜过期共享纯函数）后**顺手复用到第二处**验证可复制：`CostTracker` 抽接口 + `InMemoryCostTracker`（Clock seam）/ `RedisCostTracker`（`INCRBYFLOAT` 原子累加，多副本成本汇总同一份账）+ `app.cost.store=in-memory\|redis`。跑通两遍（token `INCRBY` + cost `INCRBYFLOAT`）证明范式成立 | `security/RedisDailyCounters` + `cost/{CostTracker(→interface),InMemoryCostTracker,RedisCostTracker,CostConfig,CostProperties}` |
+
+至此 Redis-backed 分布式状态有了**可复用件 `RedisDailyCounters` + 两处落地**；剩 `RateLimiterRegistry`/`TaskStore` 等按同范式补。
+
+验证：`mvn compile` + **367 个单测全过**（347 → +20）。
+
+---
+
 ## A. 真该做
 
 **✅ 全部完成于 2026-05-27**。
@@ -172,7 +203,7 @@ prompt injection / 审计日志 / 长任务异步化。详见 `docs/production-h
 | Provider fallback（主 vLLM 挂切云端） | ⏳ | SLA 要求 99.9%+ |
 | API key → Vault / K8s Secret | ⏳ | 跟运维流程对齐时（目前 yml seed key 已经走 env override） |
 | CI 集成（GitHub Actions 跑 eval） | ⏳ | repo 有协作者 + PR 流程时 |
-| 多实例化（Redis-backed state） | ⏳ | 真上多实例 / K8s 多 pod 部署。Token tracker / Document registry / Task store 当前是内存，注释里已写好切 Redis 的扩展点 |
+| 多实例化（Redis-backed state） | 🔶 部分 | **Token tracker 已落 Redis 后端**（`app.token-budget.store=redis`，2026-07-04，见上「续做」#28）——多 pod 最要命的漏配额已可修，且树了可复制范式。Document registry / Task store / RateLimiter / CostTracker 仍内存，注释有扩展点，按同范式补 |
 
 **做不做的判断条件**：剩下的 ⏳ 仍是"等真正需要再加"。每条触发条件明确，等到了再做就行。
 

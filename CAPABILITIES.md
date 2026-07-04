@@ -35,7 +35,7 @@
 
 - Java 21、Spring Boot 3.3.5、Maven（含 `./mvnw` wrapper，无需本机装 Maven）
 - LangChain4j 1.13.1（BOM 统一管理，部分子模块 pin 到 `1.13.1-beta23` / `1.13.1`）
-- 293 个 Java 源文件，`./mvnw compile` 通过；52 个确定性单测类（纯逻辑、不连模型，`./mvnw test` 全绿，331 个测试方法）
+- 308 个 Java 源文件，`./mvnw compile` 通过；57 个确定性单测类（纯逻辑、不连模型，`./mvnw test` 全绿，367 个测试方法）
 - HTTP client 显式锁定为 JDK 实现（`LangChain4jApplication.main()` 里设系统属性，避免与 Spring RestClient SPI 冲突）
 
 ---
@@ -294,6 +294,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 | LLM 调用日志 | `LoggingChatModelListener` | 每次一行 `model / duration_ms / tokens_in/out/total` |
 | Micrometer 指标 | 自实现 `MetricsChatModelListener`（`langchain4j-micrometer` 还没发到 central） | `gen_ai.client.{requests,operation.duration,token.usage,errors}` |
 | **切分质量指标** | `ChunkMetrics`（始终在线，每次入库打点，按 `strategy` tag） | `rag.chunk.size`（尺寸分布 `_count/_sum/_max`）/ `rag.chunk.{total,tiny,oversize}`（碎块·超大块比例）/ `rag.ingest.documents`。换策略/调 max-size 后切分质量可观测，阈值 `app.rag.metrics.{tiny,oversize}-chars` |
+| **per-tenant USD 成本** | `cost` 包（`app.cost.enabled`，默认关）：`CostCalculator` 纯函数按 model 单价（`app.cost.pricing` USD/1M tokens）翻成 $、拆 Anthropic cache 三档；`CostTracker` per-tenant 日累加；`CostChatModelListener` 走 `List<ChatModelListener>` 自动接入 | `gen_ai.client.cost.usd`（counter，按 model/provider tag）+ `GET /actuator/cost`（per-tenant 当日 USD 快照）。详见 `docs/cost-attribution.md` |
 | Prometheus 抓取 | `micrometer-registry-prometheus` | `GET /actuator/prometheus` |
 | Grafana dashboard | `docs/grafana-dashboard.json` | 7 panel（req rate / latency p50p95p99 / token spend / error rate by type / etc），导入即用 |
 | 请求 TraceID | `TraceIdFilter` | MDC + `X-Trace-Id` 响应头，日志 pattern `[%X{traceId:-}]` |
@@ -367,6 +368,12 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 - `app.eval.auto-ingest=true` 时 `/eval/run` 首次会自动 `/rag/ingest`，避免 RAG case 召回空假 fail
 - 默认 `false`（不想被 eval 误改向量库）
 
+### 检索质量评测（Recall@k，不经 LLM）
+- `POST /eval/retrieval?set=&ingest=`：跑黄金集每个 query 的向量召回，算 **Recall@k / Precision@k / MRR / Hit@k**
+- 跟上面 passRate（规则+Judge，混检索+生成两层）**互补**——这条只量 `vectorRetriever` 的**纯召回质量**，调 chunking/embedding/rerank/min-score 后能把召回变化跟生成变化拆开归因
+- `RetrievalMetrics` 纯函数（`RetrievalMetricsTest` 9 case）；id 匹配**文件级为主**对 chunk 切分漂移鲁棒；黄金集 `retrieval-cases.json`（`{id, question, relevantDocIds}`）
+- 详见 `docs/retrieval-eval.md`
+
 ### judgeHint 字段
 仅用于 Judge 看 `(question, answer)` 无法自己推断"正确行为是什么"的 case（例：PII redaction 是合规非偷懒、cite-no-context 是设计意图非拒答）。**禁止用 judgeHint 直接喂答案**。
 
@@ -401,6 +408,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 | GET | `/.well-known/agent-card.json` | A2A 服务发现（免鉴权） |
 | GET | `/tasks/{id}`, `/tasks/{id}/stream` | 异步任务轮询 / SSE（multi-agent / deep-agent async 取结果） |
 | POST | `/eval/run?runs=N&set=` | 跑黄金集（`set` 选集） |
+| POST | `/eval/retrieval?set=&ingest=` | 检索质量评测（Recall@k/Precision@k/MRR/Hit@k，不经 LLM） |
 | POST | `/eval/run-cases?runs=N` | 跑临时集 |
 | POST | `/eval/gate?set=`, `/eval/baseline?set=` | CI 门禁（回归返 422）/ 生成基线 |
 | GET | `/health` | 简易健康 |
@@ -408,6 +416,7 @@ classify → RAG (Assistant) | TOOL (Assistant) | CHAT (BareAssistant, 跳过 RA
 | GET | `/actuator/health/readiness` | K8s readinessProbe 用 |
 | GET | `/actuator/metrics/*` | Micrometer 指标 |
 | GET | `/actuator/prometheus` | Prometheus scrape |
+| GET | `/actuator/cost` | per-tenant 当日 USD 成本快照（需 `app.cost.enabled`） |
 
 ---
 
@@ -483,6 +492,12 @@ app.a2a.enabled:                false
 
 # 生产化基线（多租户 / 限流 / token 配额 / 审计 / 异步）
 app.security.*  /  app.audit.*  /  app.async.*    # 见 docs/production-hardening.md
+app.token-budget.store:         in-memory | redis   # redis = 多副本共享配额（多 pod 才真生效）；见 docs/distributed-state.md
+app.cost.store:                 in-memory | redis   # redis = 多副本成本汇总同一份账（复用 RedisDailyCounters 范式）
+
+# per-tenant USD 成本归因（把 token 用量按 model 单价翻成 $，默认关；见 docs/cost-attribution.md）
+app.cost.enabled:               false
+app.cost.pricing.<model>:       { input, output, cache-read, cache-write }  # USD / 1M tokens
 
 # 评测
 app.eval.auto-ingest:           false
@@ -512,6 +527,9 @@ app.eval.concurrency:           4
 | `docs/production-hardening.md` | 生产化基线 #1–#8（多租户 / 限流 / 配额 / 审计 / 异步 / 推送） |
 | **运维 / 评估** | |
 | `docs/observability.md` | Prometheus / Grafana / Health Check 接入 |
+| `docs/cost-attribution.md` | per-tenant USD 成本归因（token→$ 定价表 + Anthropic cache 拆分 + `/actuator/cost`） |
+| `docs/distributed-state.md` | Redis-backed 分布式状态（token 预算样板：接口抽象 + Lua 原子累加 + key 内嵌日期自动过期） |
+| `docs/retrieval-eval.md` | 检索质量评测（Recall@k/Precision@k/MRR/Hit@k，不经 LLM，`/eval/retrieval`） |
 | `docs/grafana-dashboard.json` | 现成 7-panel dashboard |
 | `docs/roadmap.md` | 待完善项 / ROI 分档 / 决策表 |
 | `docs/recall-verification.md` | 召回验证与召回率计算 |

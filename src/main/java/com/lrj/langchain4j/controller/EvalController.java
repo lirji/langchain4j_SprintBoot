@@ -5,6 +5,8 @@ import com.lrj.langchain4j.eval.BaselineGate;
 import com.lrj.langchain4j.eval.EvalCase;
 import com.lrj.langchain4j.eval.EvalResult;
 import com.lrj.langchain4j.eval.EvaluationRunner;
+import com.lrj.langchain4j.eval.retrieval.RetrievalEvaluator;
+import com.lrj.langchain4j.eval.retrieval.RetrievalReport;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -21,9 +23,11 @@ import java.util.List;
 public class EvalController {
 
     private final EvaluationRunner runner;
+    private final RetrievalEvaluator retrievalEvaluator;
 
-    public EvalController(EvaluationRunner runner) {
+    public EvalController(EvaluationRunner runner, RetrievalEvaluator retrievalEvaluator) {
         this.runner = runner;
+        this.retrievalEvaluator = retrievalEvaluator;
     }
 
     /**
@@ -76,5 +80,21 @@ public class EvalController {
                              @RequestParam(defaultValue = "default") String set,
                              @RequestParam(defaultValue = "0.1") double slack) throws IOException {
         return runner.deriveBaseline(set, runs, slack);
+    }
+
+    /**
+     * 检索质量评测（不经 LLM）：跑黄金集里每个 query 的向量召回，算 Recall@k / Precision@k / MRR / Hit@k。
+     * 跟 {@link #run} 的 passRate（含 LLM 生成质量）互补 —— 这条<strong>只量检索器</strong>，
+     * 调 chunking / embedding / rerank / min-score 后重跑，能把召回变化跟生成变化拆开归因。
+     *
+     * <p>{@code set} 选集（{@code default} → {@code eval/retrieval-cases.json}）；{@code ingest=true}
+     * 先入库一次（默认 false —— 已 ingest 过则不必重复，且避免误改向量库）。
+     */
+    @PostMapping("/retrieval")
+    @PreAuthorize("hasAuthority('SCOPE_eval')")
+    public RetrievalReport.Summary retrieval(@RequestParam(defaultValue = "default") String set,
+                                             @RequestParam(defaultValue = "false") boolean ingest)
+            throws IOException {
+        return retrievalEvaluator.runSet(set, ingest);
     }
 }

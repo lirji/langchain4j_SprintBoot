@@ -1,93 +1,37 @@
 package com.lrj.langchain4j.security;
 
-import org.springframework.stereotype.Component;
-
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.ZoneId;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * 进程内 per-tenant token 预算计数器。日历日重置 —— 比较当前日期跟桶里记录的 day，
- * 不同就 reset 为 0。
+ * per-tenant 日 token 预算计数器的抽象。两种后端：
+ * <ul>
+ *   <li>{@link InMemoryTokenBudgetTracker}（默认，{@code app.token-budget.store=in-memory}）——
+ *       进程内 CHM，重启即丢，<strong>限单 JVM</strong>：多副本各算各的，配额实际被放大到 N 倍。</li>
+ *   <li>{@link RedisTokenBudgetTracker}（{@code app.token-budget.store=redis}）——
+ *       共享计数落 Redis（Lua {@code INCRBY} 原子累加 + {@code PEXPIREAT} 次日午夜自动过期），
+ *       <strong>多 pod 共享同一份配额</strong>，是这套限额在水平扩容下真正生效的前提。</li>
+ * </ul>
  *
- * <p>用 {@link AtomicReference} 持有 immutable {@link Usage} record，{@link AtomicReference#updateAndGet}
- * 保证并发 consume 时的原子性。CHM 本身保证不同 tenant 互不干扰。
- *
- * <p>多实例部署：把 map 换成 Redis（{@code INCRBY tenant:tokens:YYYY-MM-DD} + EXPIREAT 次日 0 点），
- * 业务接口（{@link #consume} / {@link #wouldExceed} / {@link #currentUsed}）保持不变。
+ * <p>消费方（{@link TokenBudgetGuardFilter} 预检 / {@link com.lrj.langchain4j.observability.TokenBudgetChatModelListener}
+ * 回填 / {@link com.lrj.langchain4j.observability.TokenBudgetEndpoint} 快照）只依赖本接口，换后端零改动 ——
+ * 这正是当初 {@code InMemory} 版注释里承诺的"业务接口保持不变"。
  */
-@Component
-public class TokenBudgetTracker {
+public interface TokenBudgetTracker {
 
-    private final TokenBudgetProperties props;
-    private final ZoneId zone;
-    private final ConcurrentMap<String, AtomicReference<Usage>> map = new ConcurrentHashMap<>();
+    /** 当前 tenant 今天已用 token 数（跨日自动归零：新的一天 = 新计数）。 */
+    long currentUsed(String tenantId);
 
-    public TokenBudgetTracker(TokenBudgetProperties props) {
-        this.props = props;
-        this.zone = (props.getTimezone() == null || props.getTimezone().isBlank())
-                ? ZoneId.systemDefault()
-                : ZoneId.of(props.getTimezone());
-    }
+    /** 当前 tenant 是否已用满（>=）今日预算；请求前预检用。 */
+    boolean wouldExceed(String tenantId);
 
-    /** 当前 tenant 今天已用 token 数（自动 reset 若已跨日）。 */
-    public long currentUsed(String tenantId) {
-        return snapshot(tenantId).used;
-    }
+    /** 给当前 tenant 累加 token；listener.onResponse 调。<=0 忽略。 */
+    void consume(String tenantId, long tokens);
 
-    /** 当前 tenant 是否已经用满（>=）今日预算；用于请求前预检。 */
-    public boolean wouldExceed(String tenantId) {
-        return snapshot(tenantId).used >= props.resolveDailyBudget(tenantId);
-    }
+    /** 到次日 0 点的秒数（按配置时区）；429 响应的 Retry-After 用。 */
+    long secondsUntilReset();
 
-    /** 给当前 tenant 累加 token；listener.onResponse 调。 */
-    public void consume(String tenantId, long tokens) {
-        if (tokens <= 0) return;
-        AtomicReference<Usage> ref = ref(tenantId);
-        LocalDate today = LocalDate.now(zone);
-        ref.updateAndGet(u -> u.day.equals(today)
-                ? new Usage(u.used + tokens, u.day)
-                : new Usage(tokens, today));
-    }
+    /** Actuator 端点用：按 tenant 列出今日 used / budget 快照。 */
+    Map<String, Snapshot> snapshotAll();
 
-    /** 到次日 0 点的秒数；429 响应的 Retry-After header 用。 */
-    public long secondsUntilReset() {
-        LocalDateTime now = LocalDateTime.now(zone);
-        LocalDateTime midnight = LocalDateTime.of(now.toLocalDate().plusDays(1), LocalTime.MIDNIGHT);
-        long secs = java.time.Duration.between(now, midnight).getSeconds();
-        return Math.max(1L, secs);
-    }
-
-    /** Actuator 端点用：拷贝一份给运维看（按 tenant 列出今日 used / budget）。 */
-    public Map<String, Snapshot> snapshotAll() {
-        Map<String, Snapshot> out = new java.util.LinkedHashMap<>();
-        LocalDate today = LocalDate.now(zone);
-        for (Map.Entry<String, AtomicReference<Usage>> e : map.entrySet()) {
-            Usage u = e.getValue().get();
-            long used = u.day.equals(today) ? u.used : 0L;
-            long budget = props.resolveDailyBudget(e.getKey());
-            out.put(e.getKey(), new Snapshot(used, budget, today.toString()));
-        }
-        return out;
-    }
-
-    private Usage snapshot(String tenantId) {
-        Usage u = ref(tenantId).get();
-        LocalDate today = LocalDate.now(zone);
-        return u.day.equals(today) ? u : new Usage(0L, today);
-    }
-
-    private AtomicReference<Usage> ref(String tenantId) {
-        return map.computeIfAbsent(tenantId,
-                k -> new AtomicReference<>(new Usage(0L, LocalDate.now(zone))));
-    }
-
-    private record Usage(long used, LocalDate day) {}
-
-    public record Snapshot(long used, long budget, String day) {}
+    record Snapshot(long used, long budget, String day) {}
 }

@@ -1,0 +1,42 @@
+[
+  {
+    "id": "faq-providers",
+    "question": "这个项目支持切换哪些 LLM provider？环境变量分别是什么？",
+    "relevantDocIds": ["project-faq.md"]
+  },
+  {
+    "id": "faq-vector-stores",
+    "question": "app.rag.store 可以切换成哪些向量库？",
+    "relevantDocIds": ["project-faq.md"]
+  },
+  {
+    "id": "faq-chatmemory",
+    "question": "ChatMemory 的滑窗模式 window-mode 有哪几种？默认保留多少条消息？",
+    "relevantDocIds": ["project-faq.md"]
+  },
+  {
+    "id": "faq-embedding-model",
+    "question": "不管 chat provider 换成哪家，embedding 用的是什么模型？",
+    "relevantDocIds": ["project-faq.md"]
+  },
+  {
+    "id": "eval-judge-design",
+    "question": "eval harness 里 Judge 为什么要用 temperature=0 的独立模型？客观字段怎么判？",
+    "relevantDocIds": ["eval-spec.md"]
+  },
+  {
+    "id": "eval-parallel",
+    "question": "评测的并行执行为什么不复用 multiAgentExecutor 线程池？",
+    "relevantDocIds": ["eval-spec.md"]
+  },
+  {
+    "id": "graph-team-structure",
+    "question": "示例语料里的团队是怎么组织的？谁向谁汇报？",
+    "relevantDocIds": ["graphrag-demo.md"]
+  },
+  {
+    "id": "graph-warehouse-region",
+    "question": "仓库分布在哪些大区？订单是怎么处理的？",
+    "relevantDocIds": ["graphrag-demo.md"]
+  }
+]

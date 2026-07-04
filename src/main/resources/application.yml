@@ -94,7 +94,12 @@ app:
     # 日 token 预算 —— 跟 rate-limit 是两个维度：限流挡突发，token-budget 控成本
     # 覆盖 chat / stream / eval family（会触发 LLM 调用）；ingest 走 embedding 暂不计入
     enabled: true
-    # 日历日重置以哪个时区为准。建议显式配，避免随 server timezone 漂
+    # 计数后端：in-memory（默认，进程内、限单 JVM）| redis（多副本共享计数，多 pod 部署配额才真正生效）
+    # 切 redis 需 spring.data.redis.* 可用。key = <key-prefix><date>:<tenantId>，date 内嵌 → 跨日自动过期、无需清理
+    store: in-memory
+    redis:
+      key-prefix: "token:budget:"
+    # 日历日重置以哪个时区为准。建议显式配，避免随 server timezone 漂（redis 后端的 key 日期同用此时区）
     timezone: Asia/Shanghai
     daily-tokens:
       default: 100000   # 默认每天 10 万 token / tenant —— 大概 ~50 次 multi-agent 调用
@@ -102,6 +107,31 @@ app:
       #   tenantA: 500000
     # anonymous 兜底租户的预算倍率。0.05 表示 anonymous 只享受 default 的 5%
     anonymous-multiplier: 0.05
+
+  cost:
+    # per-tenant USD 成本归因 —— 把 token 用量按 model 单价翻成 $，补 token-budget"不分贵贱"的短板。
+    # 默认关：本地 ollama 免费，无需核算。用云 provider（openai/anthropic/deepseek）时开。
+    # 日历日重置复用 app.token-budget.timezone（同一基准）。详见 docs/cost-attribution.md。
+    enabled: false
+    # 累加后端：in-memory（默认，进程内）| redis（多副本成本汇总同一份账）。切 redis 需 spring.data.redis.*
+    # key = <key-prefix><date>:<tenantId>，date 内嵌 → 跨日自动过期。日历日基准复用 app.token-budget.timezone
+    store: in-memory
+    redis:
+      key-prefix: "cost:usd:"
+    currency: USD
+    # 表中未命中的 model 兜底单价（本地免费模型留 0，就不会打点/累计）
+    default:
+      input: 0.0
+      output: 0.0
+    # 单位：USD / 1,000,000 tokens。key 支持精确名或前缀（gpt-4o-mini 能匹配 gpt-4o-mini-2024-07-18）。
+    # cache-read/cache-write 仅 Anthropic prompt caching 用得上，不配则回退 input 价。
+    pricing:
+      gpt-4o-mini:      { input: 0.15,  output: 0.60 }
+      gpt-4o:           { input: 2.50,  output: 10.00 }
+      claude-haiku-4-5: { input: 1.00,  output: 5.00,  cache-read: 0.10, cache-write: 1.25 }
+      claude-sonnet-4:  { input: 3.00,  output: 15.00, cache-read: 0.30, cache-write: 3.75 }
+      deepseek-chat:    { input: 0.27,  output: 1.10 }
+      gemini-2.0-flash: { input: 0.10,  output: 0.40 }
 
   llm:
     # ollama | openai | anthropic | gemini | deepseek | vllm
@@ -758,8 +788,8 @@ management:
   endpoints:
     web:
       exposure:
-        # tokenbudget：自定义 endpoint，per-tenant 当日 token 用量快照（运维 dashboard 用）
-        include: health,info,metrics,prometheus,tokenbudget
+        # tokenbudget：per-tenant 当日 token 用量快照；cost：per-tenant 当日 USD 成本快照（app.cost.enabled=true 时）
+        include: health,info,metrics,prometheus,tokenbudget,cost
   endpoint:
     health:
       # always 让 K8s probe / 运维直接看到每个 component 详情；actuator 端口通常只对内网开放

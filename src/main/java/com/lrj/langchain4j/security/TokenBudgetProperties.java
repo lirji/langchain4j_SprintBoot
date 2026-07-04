@@ -32,22 +32,42 @@ public class TokenBudgetProperties {
 
     private boolean enabled = true;
 
+    /**
+     * 计数后端：{@code in-memory}（默认，进程内、限单 JVM）/ {@code redis}（多副本共享计数，
+     * 多 pod 部署下配额才真正生效）。切 redis 需 {@code spring.data.redis.*} 可用。
+     */
+    private String store = "in-memory";
+
     /** 日历日重置依据的时区。未设 → ZoneId.systemDefault()。建议显式配避免随服务器时区漂移。 */
     private String timezone;
 
     private DailyTokens dailyTokens = new DailyTokens();
+
+    /** Redis 后端配置（仅 {@code store=redis} 用到）。 */
+    private Redis redis = new Redis();
 
     /** anonymous 兜底租户的预算倍率，避免关闭 auth 时无限烧 token。 */
     private double anonymousMultiplier = 0.05;
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
+    public String getStore() { return store; }
+    public void setStore(String store) { this.store = store; }
     public String getTimezone() { return timezone; }
     public void setTimezone(String timezone) { this.timezone = timezone; }
     public DailyTokens getDailyTokens() { return dailyTokens; }
     public void setDailyTokens(DailyTokens dailyTokens) { this.dailyTokens = dailyTokens; }
+    public Redis getRedis() { return redis; }
+    public void setRedis(Redis redis) { this.redis = redis; }
     public double getAnonymousMultiplier() { return anonymousMultiplier; }
     public void setAnonymousMultiplier(double anonymousMultiplier) { this.anonymousMultiplier = anonymousMultiplier; }
+
+    public static class Redis {
+        /** key 前缀。实际 key 为 {@code <prefix><date>:<tenantId>}，date 内嵌使跨日 key 自然区隔 + 自动过期。 */
+        private String keyPrefix = "token:budget:";
+        public String getKeyPrefix() { return keyPrefix; }
+        public void setKeyPrefix(String keyPrefix) { this.keyPrefix = keyPrefix; }
+    }
 
     public long resolveDailyBudget(String tenantId) {
         Long override = dailyTokens.getOverrides().get(tenantId);

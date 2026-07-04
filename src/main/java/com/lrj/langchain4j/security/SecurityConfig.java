@@ -9,11 +9,29 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 @Configuration
 @EnableMethodSecurity
 @EnableConfigurationProperties({SecurityProperties.class, RateLimitProperties.class, TokenBudgetProperties.class})
 public class SecurityConfig {
+
+    /**
+     * token 预算计数器后端：{@code in-memory}（默认，单 JVM）/ {@code redis}（多副本共享，
+     * 见 {@link RedisTokenBudgetTracker}）。两 Bean 同类型互斥（{@code @ConditionalOnProperty}），
+     * 消费方按接口 {@link TokenBudgetTracker} 注入、换后端零改动。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "app.token-budget.store", havingValue = "in-memory", matchIfMissing = true)
+    public TokenBudgetTracker inMemoryTokenBudgetTracker(TokenBudgetProperties props) {
+        return new InMemoryTokenBudgetTracker(props);
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = "app.token-budget.store", havingValue = "redis")
+    public TokenBudgetTracker redisTokenBudgetTracker(StringRedisTemplate redis, TokenBudgetProperties props) {
+        return new RedisTokenBudgetTracker(redis, props, props.getRedis().getKeyPrefix());
+    }
 
     @Bean
     public ApiKeyAuthFilter apiKeyAuthFilter(SecurityProperties props, com.lrj.langchain4j.audit.AuditLogger audit) {
@@ -59,6 +77,7 @@ public class SecurityConfig {
                                 "/actuator/info",
                                 "/actuator/prometheus",
                                 "/actuator/tokenbudget",
+                                "/actuator/cost",
                                 "/health",
                                 // 飞书事件订阅 / 卡片回调：不带 X-Api-Key，用飞书自带验签解密（FeishuController）
                                 "/channel/feishu/**",
