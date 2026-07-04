@@ -6,9 +6,11 @@
 
 | 文档 | 内容 |
 | --- | --- |
+| **`SHOWCASE.md`** | **⭐ 面试/评审导览：30 秒定位 → 架构图 → 六大技术亮点 → Demo 脚本 → 预设问答（先看这个）** |
 | `CLAUDE.md` | 本仓库给 AI 协作者用的总览（含技术栈/扩展点/注意事项） |
 | `docs/scenarios.md` | 业务场景落地总览（知识库问答 / 智能客服，各场景状态与接入入口） |
 | `docs/workflow-patterns.md` | Agentic Workflow 模式全覆盖（Anthropic 5 种 workflow + agent ↔ 代码映射） |
+| `docs/retrieval-memory-interview.md` | 检索与记忆面试速答稿（Embedding / Memory / RAG / 召回率，13 题速答） |
 | `PROMPT_JOURNEY.md` | Prompt 工程 + eval harness + 生产化的完整演化日志 |
 | `docs/roadmap.md` | 待完善项 / ROI 分档 / 决策表 |
 | `docs/observability.md` | Prometheus / Grafana / Health Check 接入 |
