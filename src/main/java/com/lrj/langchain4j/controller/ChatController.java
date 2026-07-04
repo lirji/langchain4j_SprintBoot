@@ -12,6 +12,7 @@ import com.lrj.langchain4j.ai.reflexion.ReflexiveService;
 import com.lrj.langchain4j.ai.routing.QueryRouterService;
 import com.lrj.langchain4j.async.AsyncTask;
 import com.lrj.langchain4j.async.AsyncTaskService;
+import com.lrj.langchain4j.cache.semantic.SemanticCache;
 import com.lrj.langchain4j.config.ResolvedAssistantStyle;
 import com.lrj.langchain4j.rag.RagIngestionService;
 import com.lrj.langchain4j.security.TenantContext;
@@ -32,6 +33,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -51,6 +53,8 @@ public class ChatController {
     private final ObjectProvider<McpAssistant> mcpAssistantProvider;
     private final ObjectProvider<QueryRouterService> queryRouterProvider;
     private final AsyncTaskService asyncTasks;
+    // 语义响应缓存（app.cache.semantic.enabled，默认关）：软依赖，关闭时 getIfAvailable() 返回 null，/chat 行为不变
+    private final ObjectProvider<SemanticCache> semanticCacheProvider;
 
     public ChatController(Assistant assistant,
                           ResolvedAssistantStyle assistantProps,
@@ -62,7 +66,8 @@ public class ChatController {
                           MultiAgentService multiAgentService,
                           ObjectProvider<McpAssistant> mcpAssistantProvider,
                           ObjectProvider<QueryRouterService> queryRouterProvider,
-                          AsyncTaskService asyncTasks) {
+                          AsyncTaskService asyncTasks,
+                          ObjectProvider<SemanticCache> semanticCacheProvider) {
         this.assistant = assistant;
         this.assistantProps = assistantProps;
         this.groundingService = groundingService;
@@ -74,6 +79,7 @@ public class ChatController {
         this.mcpAssistantProvider = mcpAssistantProvider;
         this.queryRouterProvider = queryRouterProvider;
         this.asyncTasks = asyncTasks;
+        this.semanticCacheProvider = semanticCacheProvider;
     }
 
     /**
@@ -89,6 +95,16 @@ public class ChatController {
                                     @RequestBody Map<String, String> body) {
         String scoped = scopedChatId(chatId);
         String message = body.getOrDefault("message", "");
+
+        // 语义缓存命中即 0 LLM token 短路（按租户桶找 cosine>=阈值 的历史问答）。关闭时 cache==null，直通。
+        SemanticCache cache = semanticCacheProvider.getIfAvailable();
+        if (cache != null) {
+            Optional<String> cached = cache.lookup(message);
+            if (cached.isPresent()) {
+                return Map.of("chatId", chatId, "reply", cached.get(), "cached", "true");
+            }
+        }
+
         // Function 重载：grounding REGENERATE 模式下 hint 携带纠正指令，拼进 message 触发真正的纠正重生成
         // （WARN/REFUSE 模式 hint 恒为空串，等价于原来的单次调用）。
         String reply = groundingService.applyToFreshAnswer(hint -> assistant.chat(scoped,
@@ -97,6 +113,10 @@ public class ChatController {
                 assistantProps.getCitationPolicy(),
                 assistantProps.getExtra(),
                 message + hint));
+
+        if (cache != null) {
+            cache.put(message, reply);
+        }
         return Map.of("chatId", chatId, "reply", reply);
     }
 

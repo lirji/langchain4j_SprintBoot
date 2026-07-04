@@ -45,6 +45,15 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <!-- OpenTelemetry GenAI 分布式追踪（app.observability.otel，默认关）。显式 import BOM 锁版本，
+                 robust to Spring Boot 升级。用 OTLP HTTP exporter，不引 io.grpc，避开为 Milvus 钉死的 grpc 1.59.1 冲突。 -->
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-bom</artifactId>
+                <version>1.37.0</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -80,6 +89,27 @@
         <dependency>
             <groupId>io.micrometer</groupId>
             <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
+        <!-- OpenTelemetry GenAI 分布式追踪（app.observability.otel.enabled，默认关）。
+             版本由上面 opentelemetry-bom 管理；OTLP HTTP exporter（OkHttp，不引 grpc）。 -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+        </dependency>
+        <!-- 测试：InMemorySpanExporter 断言导出的 span，不连 collector -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-testing</artifactId>
+            <scope>test</scope>
         </dependency>
 
 

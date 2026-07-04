@@ -107,6 +107,15 @@ app:
     # ollama | openai | anthropic | gemini | deepseek | vllm
     # 切 provider 只影响 chat/streaming-chat；embedding 由 app.embedding.provider 独立控制。
     provider: ollama
+    # Model Cascade / 成本路由：便宜模型先答，低置信才升级强模型。默认关。POST /chat/cascade。
+    # cascade 是 app.llm 的直接子键（provider 的兄弟），不要嵌进具体 provider。详见 docs/model-cascade.md。
+    cascade:
+      enabled: false
+      cheap-model:               # 留空则用当前 provider 默认 model-name（ollama 例 qwen2.5:3b）
+      strong-model:              # 留空同上（ollama 例 qwen2.5:14b）
+      min-answer-chars: 8        # 便宜答案短于此 → 判低置信 → 升级
+      self-rating: false         # 启发式外再让便宜模型 temp=0 自评一个 0-1 分
+      confidence-threshold: 0.6  # 仅 self-rating=true：自评 < 此值 → 升级
     ollama:
       base-url: http://localhost:11434
       model-name: llama3.1
@@ -306,6 +315,14 @@ app:
     http:
       url: http://localhost:3001/mcp
     log-events: true
+    # —— MCP Server（反向：把本 app 能力暴露给外部 MCP 客户端 Claude Desktop / Cursor 调入）——
+    # 与上面 app.mcp.*（MCP client，把外部 server 工具桥进来）方向相反。默认关。
+    # 开启后挂 POST /mcp/server（JSON-RPC 2.0：initialize / tools/list / tools/call），需 X-Api-Key。
+    server:
+      enabled: false
+      server-name: langchain4j-app
+      server-version: 1.0.0
+      protocol-version: "2024-11-05"
   a2a:
     # A2A（Agent2Agent）Server。默认关 —— 开启后挂 POST /a2a（JSON-RPC）+ GET /.well-known/agent-card.json
     # 三种调用方式：message/send（chat 同步）、message/stream（chat SSE 流式）、
@@ -322,6 +339,22 @@ app:
     # 异步任务的 push 回推复用 app.async.webhook.*（HMAC secret / timeout / 重试），无需重复配
   rag:
     documents-dir: ./documents
+    # 原生多模态（CLIP）embedding：图片直接 embed 进跨模态向量空间，文本 query ↔ 图片互检索。
+    # 区别于 app.vision 的 caption→text 路径。默认关。POST /rag/image 入库 + POST /rag/image-search 搜图。
+    # 与 chat / 文本 embedding 三向解耦，不注册 EmbeddingModel Bean。详见 docs/multimodal-embedding.md。
+    multimodal-embedding:
+      enabled: false
+      base-url: http://localhost:8000/v1     # OpenAI 兼容 /embeddings：vLLM/TEI 托管 CLIP/jina-clip 或云 jina
+      api-key: ${JINA_API_KEY:}              # 本地通常不校验，留空发 EMPTY；云 jina 填真实 key
+      model-name: jinaai/jina-clip-v2
+      dimension: 1024                        # CLIP 512 / jina-clip-v2 1024；>0 校验返回向量长度，0=不校验
+      image-input-format: data-uri           # data-uri | base64
+      timeout-seconds: 60
+      max-retries: 2
+      max-image-bytes: 10485760              # 单图上限 10MB
+      top-k: 5
+      min-score: 0.0
+      log-requests: false
     # 文档元数据注册表（GET /rag/documents 列表/详情/版本从这里读）的存储后端：
     # in-memory（默认）— 进程内存，重启即丢；单实例/本地够用
     # redis — 持久化，重启/多实例后列表仍在，跟持久化向量库配套（见 application-kb.yml）
@@ -691,6 +724,35 @@ app:
       # 开启后首次需装浏览器二进制：mvn exec:java -Dexec.mainClass=com.microsoft.playwright.CLI \
       #   -Dexec.args="install chromium"（或代码 launch() 时自动下载）。详见 docs/deep-agent.md。
       enabled: false
+    code-exec:
+      # Code Interpreter：模型写 Java 源码 → JShell 沙箱执行 → 回填 stdout/表达式值，做成 AgentAction(code_exec)
+      # 插进深度 Agent 循环。默认关。高风险能力：JShell local 引擎与宿主同 JVM，非真隔离，仅尽力而为的
+      # 源码 denylist + 墙钟超时 + 输出截断兜底。强隔离需外部受限进程/容器（未来项）。详见 docs/code-exec.md。
+      enabled: false
+      timeout-ms: 3000          # 单次执行墙钟超时(ms)
+      max-output-chars: 2000    # 回传模型的输出上限，超出截断
+      max-source-chars: 4000    # 允许提交的源码字符上限，超出拒绝
+      block-unsafe-apis: true   # 静态拦截网络/文件/进程/System.exit/反射逃逸等危险 API
+
+  # 语义响应缓存：embed query → 按租户桶找 cosine>=threshold 的历史问答，命中即 0 LLM token 短路。
+  # 默认关。零新依赖。/chat 经软依赖接入。详见 docs/semantic-cache.md。
+  cache:
+    semantic:
+      enabled: false
+      threshold: 0.95           # cosine 命中阈值 [-1,1]，越高越保守
+      max-entries: 1000         # 每租户缓存条数上限，超出 LRU 淘汰
+      ttl: 2h                   # 单条存活时长（Duration：30m / 2h / 1d）
+
+  # OpenTelemetry GenAI 分布式追踪：每次 chat 调用一棵 gen_ai.* span 树。默认关。
+  # OTLP HTTP exporter（不引 grpc）。补 Micrometer 指标之外的 span 级链路。详见 docs/otel-tracing.md。
+  observability:
+    otel:
+      enabled: false
+      endpoint: http://localhost:4318/v1/traces
+      service-name: langchain4j-app
+      sampler: parentbased_always_on   # parentbased_always_on | always_on | always_off | traceidratio
+      sampler-ratio: 1.0
+      export-timeout-ms: 30000
 
 management:
   endpoints:
