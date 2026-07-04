@@ -35,7 +35,7 @@
 
 - Java 21、Spring Boot 3.3.5、Maven（含 `./mvnw` wrapper，无需本机装 Maven）
 - LangChain4j 1.13.1（BOM 统一管理，部分子模块 pin 到 `1.13.1-beta23` / `1.13.1`）
-- 254 个 Java 源文件，`./mvnw compile` 通过；45 个确定性单测类（纯逻辑、不连模型，`./mvnw test` 全绿）
+- 293 个 Java 源文件，`./mvnw compile` 通过；52 个确定性单测类（纯逻辑、不连模型，`./mvnw test` 全绿，331 个测试方法）
 - HTTP client 显式锁定为 JDK 实现（`LangChain4jApplication.main()` 里设系统属性，避免与 Spring RestClient SPI 冲突）
 
 ---
