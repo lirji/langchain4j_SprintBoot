@@ -1,47 +1,36 @@
 package com.lrj.langchain4j.security;
 
-import io.github.bucket4j.Bandwidth;
-import io.github.bucket4j.Bucket;
-import org.springframework.stereotype.Component;
-
-import java.time.Duration;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-
 /**
- * 进程内 token-bucket 注册表。key 是 {@code tenantId|family}，value 是 {@link Bucket}。
+ * per-(tenant, endpoint family) 限流器的抽象。两种后端（照 {@link TokenBudgetTracker} 范式）：
+ * <ul>
+ *   <li>{@link InMemoryRateLimiterRegistry}（默认，{@code app.rate-limit.store=in-memory}）——
+ *       进程内 Bucket4j token bucket，<strong>限单 JVM</strong>：多副本各持一份桶，
+ *       同一租户的 QPM 实际被放大到副本数倍（限流形同虚设）。</li>
+ *   <li>{@link RedisRateLimiterRegistry}（{@code app.rate-limit.store=redis}）——
+ *       token bucket 状态落 Redis（Lua 原子「补桶 + 消费」一次往返），
+ *       <strong>多 pod 共享同一个桶</strong>，是限流在水平扩容下真正生效的前提。</li>
+ * </ul>
  *
- * <p>用 Bucket4j 的内存桶：每分钟补满 N 个 token、burst capacity 也是 N（不允许超发）。
- * 多实例部署要换成 Bucket4j 的 distributed proxy（Redis / Hazelcast），
- * 把 {@link #buildBucket} 换成 {@code proxyManager.builder().build(key, config)} 即可，
- * filter / properties / 调用方都不动。
- *
- * <p>限额变更（yml 热更）会通过 {@code resolveCurrent()} 拿到，但 Bucket4j 的桶容量是
- * 不可变的，所以当限额变化时直接 {@code computeIfAbsent} 取的旧桶不会 rebuild。
- * 简化处理：把 effective qpm 编进 cache key（{@code tenantId|family|qpm}），qpm 变了就是新桶。
- * 这避免了显式失效逻辑；代价是历史 qpm 桶留在 map 里，但 tenant × family × qpm 基数有限，可忽略。
+ * <p>消费方（{@link RateLimitFilter}）只依赖本接口 + {@link Decision}，换后端零改动 ——
+ * 正是当初 {@code RateLimiterRegistry} / pom 注释里承诺的"切 bucket4j-redis ProxyManager 即可，
+ * filter / properties / 调用方都不动"。这里没走 bucket4j-redis（要引 lettuce ProxyManager 新依赖），
+ * 而是复用已在的 {@code spring-boot-starter-data-redis} 手写 Lua token bucket，跟 token/cost 两处一致地<strong>零新依赖</strong>。
  */
-@Component
-public class RateLimiterRegistry {
+public interface RateLimiterRegistry {
 
-    private final RateLimitProperties props;
-    private final ConcurrentMap<String, Bucket> buckets = new ConcurrentHashMap<>();
+    /**
+     * 尝试为 {@code (tenantId, family)} 消费 1 个 token。
+     * 有效 QPM 由 {@link RateLimitProperties#resolveQpm} 解析（含 anonymous 倍率 + per-tenant override）。
+     */
+    Decision tryConsume(String tenantId, String family);
 
-    public RateLimiterRegistry(RateLimitProperties props) {
-        this.props = props;
-    }
-
-    public Bucket bucketFor(String tenantId, String family) {
-        int qpm = props.resolveQpm(tenantId, family);
-        String key = tenantId + "|" + family + "|" + qpm;
-        return buckets.computeIfAbsent(key, k -> buildBucket(qpm));
-    }
-
-    private static Bucket buildBucket(int qpm) {
-        Bandwidth limit = Bandwidth.builder()
-                .capacity(qpm)
-                .refillGreedy(qpm, Duration.ofMinutes(1))
-                .build();
-        return Bucket.builder().addLimit(limit).build();
-    }
+    /**
+     * 单次限流判定结果。
+     *
+     * @param allowed           是否放行
+     * @param remainingTokens   消费后桶内剩余（用于 {@code X-RateLimit-Remaining}）
+     * @param retryAfterSeconds 被拒时到下一个 token 可用的秒数（{@code >=1}）；放行时为 0
+     * @param limit             本次生效的 QPM（用于 {@code X-RateLimit-Limit}）
+     */
+    record Decision(boolean allowed, long remainingTokens, long retryAfterSeconds, int limit) {}
 }

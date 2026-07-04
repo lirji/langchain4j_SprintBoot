@@ -46,6 +46,12 @@ app:
   rate-limit:
     # token bucket 限流，per-(tenantId, endpoint family)，每分钟刷桶。429 + Retry-After
     enabled: true
+    # 限流器后端：in-memory（默认，进程内、限单 JVM，多副本各持一桶 → 限额被放大到副本数倍）
+    #           | redis（多副本共享同一个桶，Lua 原子 token bucket，多 pod 部署限流才真正生效）
+    # 切 redis 需 spring.data.redis.* 可用。key = <key-prefix><tenant>|<family>|<qpm>，闲置桶靠 PEXPIRE 自动回收
+    store: in-memory
+    redis:
+      key-prefix: "rate:limit:"
     # 单位：每分钟最大请求数。endpoint family 在 RateLimitFilter.familyOf() 里按 URL 路径映射
     defaults:
       chat: 60         # /chat /chat/category /chat/multi-agent /chat/reflexive /chat/auto /chat/mcp /extract/*

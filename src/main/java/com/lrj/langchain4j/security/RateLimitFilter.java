@@ -2,8 +2,6 @@ package com.lrj.langchain4j.security;
 
 import com.lrj.langchain4j.audit.AuditEventType;
 import com.lrj.langchain4j.audit.AuditLogger;
-import io.github.bucket4j.Bucket;
-import io.github.bucket4j.ConsumptionProbe;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletRequest;
@@ -50,15 +48,14 @@ public class RateLimitFilter extends OncePerRequestFilter {
                                     FilterChain chain) throws ServletException, IOException {
         String tenantId = TenantContext.current().tenantId();
         String family = familyOf(request.getServletPath());
-        Bucket bucket = registry.bucketFor(tenantId, family);
+        RateLimiterRegistry.Decision decision = registry.tryConsume(tenantId, family);
 
-        ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
         // 即便允许通过，也回写当前桶剩余 token + 限额，方便客户端做退避
-        response.setHeader("X-RateLimit-Remaining", String.valueOf(Math.max(0, probe.getRemainingTokens())));
-        response.setHeader("X-RateLimit-Limit", String.valueOf(props.resolveQpm(tenantId, family)));
+        response.setHeader("X-RateLimit-Remaining", String.valueOf(decision.remainingTokens()));
+        response.setHeader("X-RateLimit-Limit", String.valueOf(decision.limit()));
 
-        if (!probe.isConsumed()) {
-            long waitSeconds = Math.max(1, probe.getNanosToWaitForRefill() / 1_000_000_000L);
+        if (!decision.allowed()) {
+            long waitSeconds = decision.retryAfterSeconds();
             response.setHeader("Retry-After", String.valueOf(waitSeconds));
             response.setStatus(429);
             response.setContentType("application/json;charset=UTF-8");
@@ -71,7 +68,7 @@ public class RateLimitFilter extends OncePerRequestFilter {
                     "family", family,
                     "path", request.getServletPath(),
                     "retryAfterSeconds", waitSeconds,
-                    "limit", props.resolveQpm(tenantId, family)));
+                    "limit", decision.limit()));
             return;
         }
 

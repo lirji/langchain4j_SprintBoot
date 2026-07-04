@@ -33,6 +33,23 @@ public class SecurityConfig {
         return new RedisTokenBudgetTracker(redis, props, props.getRedis().getKeyPrefix());
     }
 
+    /**
+     * 限流器后端：{@code in-memory}（默认，单 JVM Bucket4j 桶）/ {@code redis}（多副本共享同一个桶，
+     * 见 {@link RedisRateLimiterRegistry}）。两 Bean 同类型互斥（{@code @ConditionalOnProperty}），
+     * {@link RateLimitFilter} 按接口 {@link RateLimiterRegistry} 注入、换后端零改动。
+     */
+    @Bean
+    @ConditionalOnProperty(name = "app.rate-limit.store", havingValue = "in-memory", matchIfMissing = true)
+    public RateLimiterRegistry inMemoryRateLimiterRegistry(RateLimitProperties props) {
+        return new InMemoryRateLimiterRegistry(props);
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = "app.rate-limit.store", havingValue = "redis")
+    public RateLimiterRegistry redisRateLimiterRegistry(StringRedisTemplate redis, RateLimitProperties props) {
+        return new RedisRateLimiterRegistry(redis, props, props.getRedis().getKeyPrefix());
+    }
+
     @Bean
     public ApiKeyAuthFilter apiKeyAuthFilter(SecurityProperties props, com.lrj.langchain4j.audit.AuditLogger audit) {
         return new ApiKeyAuthFilter(props, audit);

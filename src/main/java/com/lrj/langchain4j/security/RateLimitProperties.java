@@ -15,6 +15,7 @@ import java.util.Map;
  * <pre>
  * app.rate-limit:
  *   enabled: true
+ *   store: in-memory         # | redis（多副本共享同一个桶，多 pod 部署限流才真正生效）
  *   defaults:                # 每分钟最大请求数
  *     chat: 60
  *     stream: 20             # 流式占连接，限更紧
@@ -32,6 +33,15 @@ public class RateLimitProperties {
 
     private boolean enabled = true;
 
+    /**
+     * 限流器后端：{@code in-memory}（默认，进程内、限单 JVM）/ {@code redis}（多副本共享同一个桶，
+     * 多 pod 部署下限流才真正生效，见 {@link RedisRateLimiterRegistry}）。切 redis 需 {@code spring.data.redis.*} 可用。
+     */
+    private String store = "in-memory";
+
+    /** Redis 后端配置（仅 {@code store=redis} 用到）。 */
+    private Redis redis = new Redis();
+
     /** family -> QPM。从这里读 baseline。 */
     private Map<String, Integer> defaults = defaultsBootstrap();
 
@@ -43,12 +53,23 @@ public class RateLimitProperties {
 
     public boolean isEnabled() { return enabled; }
     public void setEnabled(boolean enabled) { this.enabled = enabled; }
+    public String getStore() { return store; }
+    public void setStore(String store) { this.store = store; }
+    public Redis getRedis() { return redis; }
+    public void setRedis(Redis redis) { this.redis = redis; }
     public Map<String, Integer> getDefaults() { return defaults; }
     public void setDefaults(Map<String, Integer> defaults) { this.defaults = defaults; }
     public double getAnonymousMultiplier() { return anonymousMultiplier; }
     public void setAnonymousMultiplier(double anonymousMultiplier) { this.anonymousMultiplier = anonymousMultiplier; }
     public Map<String, Map<String, Integer>> getOverrides() { return overrides; }
     public void setOverrides(Map<String, Map<String, Integer>> overrides) { this.overrides = overrides; }
+
+    public static class Redis {
+        /** 桶 key 前缀。实际 key 为 {@code <prefix><tenant>|<family>|<qpm>}（见 {@link RateLimitKeys}）。 */
+        private String keyPrefix = "rate:limit:";
+        public String getKeyPrefix() { return keyPrefix; }
+        public void setKeyPrefix(String keyPrefix) { this.keyPrefix = keyPrefix; }
+    }
 
     private static Map<String, Integer> defaultsBootstrap() {
         Map<String, Integer> m = new LinkedHashMap<>();

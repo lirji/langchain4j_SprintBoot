@@ -69,7 +69,8 @@
             <artifactId>spring-boot-starter-security</artifactId>
         </dependency>
 
-        <!-- 限流：token bucket。先用内存后端；要分布式（多实例）切到 bucket4j-redis ProxyManager 即可 -->
+        <!-- 限流：token bucket 内存后端。分布式（多实例）走 RedisRateLimiterRegistry（Lua token bucket
+             over spring-data-redis，零新依赖），未引 bucket4j-redis ProxyManager。见 docs/distributed-state.md -->
         <dependency>
             <groupId>com.bucket4j</groupId>
             <artifactId>bucket4j-core</artifactId>

@@ -87,11 +87,39 @@ app.cost:
 
 ## 可复制到其余"限单 JVM"处
 
-同一范式（接口抽象 + `store` 开关 + `RedisDailyCounters` + Redis 原子命令 + key 内嵌维度自动过期）
-已复用到两处，其余候选：
+同一范式（接口抽象 + `store` 开关 + Redis 原子命令 + key 内嵌维度自动过期）已复用到三处，其余候选：
 
-- ~~**`CostTracker`**~~（`INCRBYFLOAT`）—— ✅ 本轮已落地（`app.cost.store=redis`），正是范式可复制的验证
-- **`RateLimiterRegistry`** → bucket4j `redis` ProxyManager（pom 注释已指路）
+- ~~**`CostTracker`**~~（`INCRBYFLOAT`）—— ✅ 已落地（`app.cost.store=redis`），范式可复制的第一次验证
+- ~~**`RateLimiterRegistry`**~~ —— ✅ 本轮已落地（`app.rate-limit.store=redis`），见下节
 - **`TaskStore` / A2A push store / workflow outbox** → Redis Hash + `SKIP LOCKED` 语义
 
-各处注释里都标了这条演进路径，本样板把"该怎么落"跑通了两遍（token + cost），`RedisDailyCounters` 已是现成的可复用件。
+各处注释里都标了这条演进路径，本样板把"该怎么落"跑通了三遍（token + cost + rate-limit）。
+
+## 第三处复用：`RateLimiterRegistry`（`security` 包，`app.rate-limit.store=redis`）
+
+限流跟日计数不同——不是「累加到日历日过期」，而是 **token bucket**（贪婪补桶 + 消费）。所以它<strong>不走
+`RedisDailyCounters`</strong>（那是日累加范式），而是把「接口抽象 + `store` 开关 + 零新依赖」这层范式套过来，
+另起一个匹配 token-bucket 语义的共享件 `RateLimitKeys`（桶 key 布局 + retry-after 换算，纯函数可测）。
+
+- **接口** `RateLimiterRegistry`，返回 `Decision(allowed, remainingTokens, retryAfterSeconds, limit)`；
+  `RateLimitFilter` 只依赖接口 + `Decision`，换后端零改动（原本返回 Bucket4j `Bucket`、把 `bucketFor` 暴露给 filter，
+  现收敛成 `tryConsume`——Redis 后端没有本地 Bucket 对象可返）。
+- **`InMemoryRateLimiterRegistry`**（默认）—— 原 Bucket4j 进程内桶，限单 JVM：多副本各持一桶 → QPM 被放大到副本数倍。
+- **`RedisRateLimiterRegistry`**（`store=redis`）—— 桶状态（`tokens` 剩余 + `ts` 上次补桶时刻）存 Redis Hash，
+  每次 `tryConsume` 走一段 **Lua**：`(now-ts)` 贪婪补桶（连续补，对齐 `refillGreedy`）→ 够则扣 1、不够算等待毫秒 →
+  回写 + `PEXPIRE`（约 2× 窗口，闲置桶自动回收）。整段服务端<strong>原子</strong>，多 pod 共享同一个桶、不超发。
+- **key** `<prefix><tenant>|<family>|<qpm>`：qpm 编进 key，yml 热更调限额即换新满桶，无需显式失效（旧 qpm 键靠
+  `PEXPIRE` 自然回收，比进程内版把历史桶永久留 map 里更干净）。
+- **fail-open**：Redis 抖动/不可达时放行——限流是流量整形、不是安全边界，不该因缓存故障把用户全拒（真拦截由 auth 兜底）。
+  这跟 token-budget「读失败按 0 放行」同一取向。
+- **零新依赖**：没走 pom 注释曾指的 `bucket4j-redis` ProxyManager（要引 lettuce ProxyManager 新依赖），
+  而是复用已在的 `spring-boot-starter-data-redis` 手写 Lua，跟 token/cost 两处口径一致。
+- **单测**：`RateLimitKeysTest`（4，纯函数）+ `InMemoryRateLimiterRegistryTest`（5，容量/隔离/anonymous 倍率/qpm 变更即新桶）；
+  Redis Lua 往返属集成，靠真 Redis 起服务验证。
+
+```yaml
+app.rate-limit:
+  store: in-memory        # | redis（多副本共享同一个桶）
+  redis:
+    key-prefix: "rate:limit:"
+```
